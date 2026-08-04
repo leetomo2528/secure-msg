@@ -716,7 +716,8 @@ async function postLogin(): Promise<void> {
     await state.syncBlockRules().catch(() => undefined);
     await state.refreshBlocklist();
     await state.refreshConversations();
-    for (const conv of state.conversations) {
+    // Re-read after refresh: `state` predates the conversation reload.
+    for (const conv of useStore.getState().conversations) {
       await queueConversationSync(conv.cid);
     }
   };
@@ -732,6 +733,12 @@ async function postLogin(): Promise<void> {
     useStore.setState({ error: "실시간 서버 연결 실패 — 자동 재시도 중" });
   });
   socket.on("message_new", async (env: ServerMessage) => {
+    // A conversation created on another device (e.g. the Android gateway
+    // opening a new SMS thread) is not in our list yet — refresh so the
+    // sidebar shows the thread the incoming message belongs to.
+    if (!useStore.getState().conversations.some((c) => c.cid === env.cid)) {
+      await useStore.getState().refreshConversations();
+    }
     // Pull from the last contiguous local cursor. This avoids jumping over
     // older offline messages when the new event is for a later sequence.
     await queueConversationSync(env.cid);

@@ -217,8 +217,16 @@ class SmsBridgeService : Service() {
 
     private suspend fun startBridge() {
         if (relay?.isConnected == true) return
-        if (Telephony.Sms.getDefaultSmsPackage(this) != packageName) {
-            Log.w(TAG, "SecureMsg is not the default SMS app; bridge remains idle")
+        // RoleManager is the source of truth on API 29+; the legacy
+        // Telephony.Sms.getDefaultSmsPackage can disagree on some images.
+        val roleHeld = getSystemService(android.app.role.RoleManager::class.java)
+            .isRoleHeld(android.app.role.RoleManager.ROLE_SMS)
+        if (!roleHeld) {
+            Log.w(
+                TAG,
+                "SecureMsg is not the default SMS app; bridge remains idle " +
+                    "(legacy default=${Telephony.Sms.getDefaultSmsPackage(this)})",
+            )
             stopSelf()
             return
         }

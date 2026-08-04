@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Production relay uses HTTPS only. Cleartext is permitted solely for the
-  loopback address so a device can reach a local dev relay forwarded over
-  `adb reverse` (SIM-less / offline test setups).
+  loopback address (and the emulator's host alias 10.0.2.2) so a device can
+  reach a local dev relay forwarded over `adb reverse` (SIM-less test setups).
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
     </domain-config>
 </network-security-config>

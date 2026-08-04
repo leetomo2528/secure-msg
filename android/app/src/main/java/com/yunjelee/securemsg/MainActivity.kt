@@ -391,7 +391,8 @@ class MainActivity : ComponentActivity() {
         if (password.length > 1024) throw IllegalArgumentException("비밀번호가 너무 깁니다.")
         val parsedUrl = serverUrl.toHttpUrlOrNull()
             ?: throw IllegalArgumentException("올바른 서버 URL을 입력하세요.")
-        if (parsedUrl.scheme != "https" && parsedUrl.host !in setOf("localhost", "127.0.0.1")) {
+        // localhost/127.0.0.1: adb reverse test setups; 10.0.2.2: emulator host alias.
+        if (parsedUrl.scheme != "https" && parsedUrl.host !in setOf("localhost", "127.0.0.1", "10.0.2.2")) {
             throw IllegalArgumentException("원격 서버는 HTTPS 주소를 사용해야 합니다.")
         }
         if (parsedUrl.username.isNotEmpty() || parsedUrl.password.isNotEmpty() ||

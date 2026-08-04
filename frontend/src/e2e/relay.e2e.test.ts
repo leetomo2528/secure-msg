@@ -200,6 +200,40 @@ describe("phone ↔ web relay interlock", () => {
     expect(names).toContain("테스트번호");
   }, 60_000);
 
+  it("brand-new conversation from the gateway appears in the web sidebar", async () => {
+    // Gateway opens a SECOND phone thread the web has never seen.
+    const conv = await fetchJson(`${BASE}/api/conversation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${gwToken}` },
+      body: JSON.stringify({ members: [USERNAME], name: "+821077770002" }),
+    });
+    expect(conv.ok).toBe(true);
+    const members = await fetchJson(`${BASE}/api/conversation/${conv.cid}/members`, {
+      headers: { Authorization: `Bearer ${gwToken}` },
+    });
+    const recipients = (members.members as Array<{ sid: string; pub_key: string }>)
+      .map((m) => ({ sid: m.sid, pub_key: m.pub_key }));
+    const content = JSON.stringify({ v: 1, type: "text", text: "새 스레드 자동 표시 확인" });
+    const envelope = await encryptMessage(content, recipients, gwKeys!);
+    const ack = await new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("ack timeout")), 10_000);
+      gwSocket!.emit(
+        "message_send",
+        { cid: conv.cid, mid: "relay-e2e-newthread-0001", payload: envelope },
+        (response: any) => { clearTimeout(timer); resolve(response); },
+      );
+    });
+    expect(ack.ok).toBe(true);
+
+    // No manual refresh: message_new must trigger the conversation reload.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (useStore.getState().conversations.some((c) => c.name === "+821077770002")) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    expect(useStore.getState().conversations.some((c) => c.name === "+821077770002")).toBe(true);
+  }, 60_000);
+
   afterAll(() => {
     gwSocket?.disconnect();
   });
