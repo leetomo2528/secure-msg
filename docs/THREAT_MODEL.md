@@ -1,0 +1,115 @@
+# SecureMsg 위협 모델
+
+이 문서는 “Android 휴대폰의 통신사 SMS를 웹·여러 기기로 보조 사용한다”는 현재 MVP를 기준으로 한다. 서버를 신뢰하지 않는 운영을 목표로 하지만, 통신사 SMS 구간까지 암호화하는 제품은 아니다.
+
+## 데이터 흐름
+
+```text
+carrier → SmsReceiver/MmsReceiver → local filter → Android SMS/MMS Provider
+                              ├─ blocked_sms (차단 시 종료)
+                              └─ Room relay_outbox → encrypted envelope → relay server → devices
+```
+
+웹에서 보낸 메시지는 반대 방향으로 Android에서 복호화된 뒤 `SmsManager` 또는 framework MMSC API를 통해 통신사로 전달된다.
+
+## 자산과 저장 위치
+
+| 자산 | 저장 위치 | 노출 시 영향 |
+|---|---|---|
+| 수신 SMS/MMS 평문 | Android SMS/MMS Provider, Android Room, 웹 IndexedDB | 해당 기기의 메시지 유출 |
+| 차단 격리 메시지 | Android Room `blocked_sms` | 기기 접근 시 차단 문자·차단 사유 유출 |
+| Android/PWA 기기 개인키 | Android DataStore / 웹 IndexedDB | 해당 기기로 전달된 envelope 복호 가능 |
+| 사용자 비밀번호 | 메모리에서 Argon2id 처리 후 폐기 | 입력 중 탈취 가능성 |
+| 키워드·차단 발신번호 | 각 클라이언트 로컬 DB | 해당 기기 접근 시 필터 의도 노출 |
+| 암호화 메시지 | relay 서버 SQLite | 메타데이터는 노출, 평문은 직접 복호 불가 |
+| 전화번호 대화 라벨 | relay 서버 `conversations.name` | 서버 DB 유출 시 전화번호/대화 관계 노출 |
+
+## 보장하는 것
+
+### 1. 차단된 수신 SMS/MMS가 서버로 전송되지 않음
+
+Android 기본 SMS 앱이 `SMS_DELIVER` 또는 MMS 수신 이벤트를 받은 직후 키워드·발신번호·자동 스팸 판정을 수행한다. 차단된 문자는 `blocked_sms`에만 기록하고 시스템 Provider, 알림, relay 서버로 전달하지 않는다.
+
+단, SecureMsg를 기본 SMS 앱으로 설정하기 전에 도착해 다른 앱이 이미 저장한 문자는 삭제하지 않는다. 기본 앱 역할 승인 이후 수신하는 문자부터 이 경로가 적용된다.
+
+### 2. relay 서버가 허용된 SMS 평문을 읽을 수 없음
+
+클라이언트는 메시지마다 랜덤 message key를 생성하고 `secretbox`로 본문을 암호화한다. 그 키는 각 기기의 X25519 공개키로 감싼다. 서버는 `ct`, `nonce`, 기기별 wrapped key만 저장·중계한다.
+
+서버 운영자가 DB를 덤프해도 해당 기기의 X25519 개인키 없이는 본문을 복호화할 수 없다.
+
+### 3. 여러 기기 키를 분리함
+
+계정은 여러 `sid`를 가질 수 있고, 메시지 envelope에는 수신자 기기마다 별도 wrapped key가 들어간다. 한 기기를 폐기하면 이후 메시지 fan-out 대상에서 제외된다. 폐기된 기기가 과거에 보관한 평문까지 회수하지는 않는다.
+
+통신사 발신 권한을 가진 `android_gateway`는 계정당 1대로 제한한다. 웹/PWA는 여러 대를 등록할 수 있다. 서버 fan-out과 Android Room의 `(cid, seq)` 원자적 발송 영수증을 함께 사용해 relay 재전달이 정상적인 경우 실제 SMS 중복 발신으로 이어지는 것을 막는다. SMS/MMS carrier 결과는 `SENT`·`DELIVERED` callback을 받아 서버의 상태 메타데이터로 동기화한다.
+
+Android는 전화번호 이름을 가진 대화라도 멤버가 게이트웨이 소유자 한 명뿐인 경우에만 통신사 SMS 명령으로 인정한다. 따라서 다른 계정이 사용자를 그룹에 추가하고 전화번호처럼 이름을 지정해도 피해자의 SIM을 발신 게이트웨이로 사용할 수 없다. 이 소유권은 로컬 캐시가 아니라 서버의 최신 멤버 목록으로 다시 확인한다.
+
+### 4. 네트워크 도청에 대한 이중 보호
+
+운영 배포는 Caddy TLS(`wss`)를 사용하고, 그 위에서 클라이언트 E2E envelope를 전송한다. TLS가 종료되는 Caddy/relay 서버도 SMS 본문 평문은 받지 않는다.
+
+## 보장하지 않는 것
+
+### 1. 통신사 SMS 구간의 E2E 보안
+
+`SmsManager`로 발신하거나 통신사에서 수신하는 일반 SMS는 통신사·중계망 정책의 영향을 받는다. SecureMsg가 보호하는 구간은 Android와 relay에 있는 클라이언트 간의 동기화 구간이다.
+
+### 2. 전방 비밀성
+
+현재 envelope 암호화는 Signal Double Ratchet이 아니다. 기기 개인키가 유출되면 해당 기기로 전달된 과거 서버 암호문을 복호화할 수 있다.
+
+### 3. 서버 메타데이터 비노출
+
+서버는 다음을 알 수 있다.
+
+- 계정·기기 수와 마지막 접속 시각
+- 어떤 `cid`에 어떤 계정이 참여하는가
+- 대화 라벨로 저장된 전화번호
+- 메시지 시각·크기·송신 기기
+
+메타데이터 저항성(mixnet/onion routing)은 범위 밖이다.
+
+### 4. 자동 스팸 판정의 정확도
+
+자동 판정은 URL, 금융·도박·홍보 문구, 수신거부 문구를 조합한 로컬 휴리스틱이다. 정상적인 이벤트/금융 알림을 차단할 수 있고, 문구를 변형한 스팸을 놓칠 수 있다. 격리함과 사용자 키워드/발신번호 규칙으로 보정한다.
+
+### 5. 기기별 필터 설정 동기화
+
+현재 키워드와 발신번호 차단 규칙은 서버로 올리지 않고 각 클라이언트에만 저장한다. 따라서 Android에서 설정한 규칙과 웹 브라우저의 웹 필터 규칙은 자동으로 합쳐지지 않는다. 수신 SMS 차단의 권위 있는 판정 지점은 Android 휴대폰이다.
+
+### 6. 서비스 가용성·전송 큐
+
+Oracle 단일 인스턴스와 Android foreground bridge에 의존한다. 수신 SMS/MMS와 서버 히스토리는 재연결 후 회수한다. Android Room `relay_outbox`는 암호화 payload·동일 `mid`·attempt/error·server seq를 보존하고, 서비스가 주기적으로 relay ACK를 재시도한다. 통신사 API 호출 직전/직후 프로세스가 중단되는 구간은 시스템이 결과를 되돌려 조회할 표준 API가 없어 at-least-once 복구로 처리하므로, 이론상 중복 발신 가능성은 남는다.
+
+## 주요 공격 시나리오
+
+### 서버 DB 유출
+
+공격자는 사용자명, bcrypt로 저장된 client hash, 공개키, 전화번호 라벨, envelope, 대화·시간 메타데이터를 얻을 수 있다. 개인키를 얻지 못했다면 허용된 SMS 본문을 직접 복구할 수 없다.
+
+### 악성 relay 서버
+
+relay 서버가 envelope를 임의로 변조하면 클라이언트의 secretbox 검증 또는 X25519 복호화가 실패한다. 다만 서버가 웹 JS 자체를 변조해 사용자의 개인키/평문을 빼내는 공급망 공격은 별도 문제다. 자체 빌드·자체 호스팅·HTTPS·코드 무결성 검증이 필요하다.
+
+JWT 만료 시 서버는 이미 연결된 Socket.IO 세션도 다음 이벤트에서 종료한다. 기기 폐기 역시 각 이벤트에서 DB를 재확인한다. 웹과 Android는 명시적인 인증 거부를 받으면 세션 토큰만 지우고 다시 로그인을 요구한다.
+
+### Android 기기 분실
+
+기기 잠금, File-based encryption, 앱 데이터 보호에 의존한다. Android DataStore와 SMS Provider/Room의 평문은 기기 잠금 해제나 루팅 공격에 노출될 수 있다. 기기 분실 시 웹의 `기기 관리`에서 해당 `sid`를 폐기하고 Android 설치를 제거한다.
+
+### 필터 우회·오탐
+
+공백·유니코드 변형·URL 단축·발신번호 위조로 자동 필터를 우회할 수 있다. 반대로 사용자가 너무 짧은 키워드를 등록하면 정상 SMS가 차단될 수 있으므로, 등록 전 테스트 메시지로 확인한다.
+
+## 향후 개선
+
+- [ ] 암호화된 사용자 설정 envelope를 통한 기기 간 차단 규칙 동기화
+- [ ] Signal Protocol/Double Ratchet 및 메시지 서명
+- [x] Android 내구성 outbox + 동일 mid 기반 서버 ACK 재전송 큐
+- [x] MMS·첨부파일 지원(통신사/OEM별 실제 단말 검증은 필요)
+- [ ] RCS 지원 검토
+- [ ] 전화번호 라벨을 서버에 평문으로 저장하지 않는 thread metadata 설계
+- [ ] PWA PIN/생체 잠금 및 민감 알림 내용 숨김
+- [ ] 다중 서버·백업·감사 로그

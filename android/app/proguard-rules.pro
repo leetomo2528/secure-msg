@@ -1,0 +1,2 @@
+-keep class com.goterl.** { *; }
+-keep class io.socket.** { *; }

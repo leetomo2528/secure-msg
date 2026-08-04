@@ -1,0 +1,18 @@
+:80 {
+	root * /srv
+	file_server
+
+	# SPA fallback — React Router-free, so we just need index.html for /
+	try_files {path} /index.html
+
+	# Mirror the security headers of the root production Caddyfile so the
+	# standalone frontend image is not served without a CSP.
+	header {
+		-Server
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'"
+		Referrer-Policy no-referrer
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+	}
+}

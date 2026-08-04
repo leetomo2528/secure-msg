@@ -1,0 +1,47 @@
+name: secure-msg
+
+services:
+  backend:
+    build: ${SECUREMSG_ROOT:-/home/ubuntu/secure-msg}/server
+    container_name: securemsg-backend
+    restart: unless-stopped
+    environment:
+      SECUREMSG_ENV: production
+      SECUREMSG_JWT_SECRET: ${SECUREMSG_JWT_SECRET}
+      SECUREMSG_DB: /data/securemsg.db
+      SECUREMSG_CORS: https://${SECUREMSG_DOMAIN}
+    volumes:
+      - backend-data:/data
+    expose:
+      - "5000"
+    networks: [securemsg]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: securemsg-caddy
+    restart: unless-stopped
+    environment:
+      SECUREMSG_DOMAIN: ${SECUREMSG_DOMAIN}
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ${SECUREMSG_ROOT:-/home/ubuntu/secure-msg}/deploy/oracle/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${SECUREMSG_ROOT:-/home/ubuntu/secure-msg}/frontend/dist:/srv:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [securemsg]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  backend-data:
+    name: secure-msg_backend-data
+  caddy-data:
+    name: secure-msg_caddy-data
+  caddy-config:
+    name: secure-msg_caddy-config
+
+networks:
+  securemsg:
+    name: secure-msg_securemsg

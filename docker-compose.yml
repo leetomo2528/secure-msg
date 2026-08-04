@@ -1,0 +1,41 @@
+services:
+  backend:
+    build: ./server
+    container_name: securemsg-backend
+    restart: unless-stopped
+    environment:
+      SECUREMSG_ENV: production
+      SECUREMSG_JWT_SECRET: ${SECUREMSG_JWT_SECRET}
+      SECUREMSG_DB: /data/securemsg.db
+      SECUREMSG_CORS: https://${SECUREMSG_DOMAIN}
+    volumes:
+      - backend-data:/data
+    expose:
+      - "5000"
+    networks: [securemsg]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: securemsg-caddy
+    restart: unless-stopped
+    environment:
+      SECUREMSG_DOMAIN: ${SECUREMSG_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend/dist:/srv:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [securemsg]
+    depends_on: [backend]
+
+volumes:
+  backend-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  securemsg:

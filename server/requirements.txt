@@ -1,0 +1,11 @@
+flask==3.1.3
+flask-socketio==5.6.1
+# Transitive deps pinned explicitly: they implement the Socket.IO transports.
+# simple-websocket IS the WebSocket transport for async_mode=threading under
+# gunicorn gthread; unpinned drift could silently break wss in production.
+python-socketio==5.16.3
+python-engineio==4.13.3
+simple-websocket==1.1.0
+pyjwt==2.13.0
+bcrypt==4.2.0
+gunicorn==23.0.0

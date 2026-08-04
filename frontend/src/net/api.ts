@@ -1,0 +1,245 @@
+/**
+ * REST + Socket.IO client wrappers. All endpoints are relative — in dev Vite
+ * proxies to the Flask server; in prod Caddy reverse-proxies.
+ */
+import { io, type Socket } from "socket.io-client";
+import type { Envelope, RecipientDevice } from "../crypto/keys";
+
+const API = "/api";
+const REQUEST_TIMEOUT_MS = 12_000;
+const SOCKET_ACK_TIMEOUT_MS = 10_000;
+
+interface ApiResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+}
+
+export interface LoginResult {
+  ok: boolean;
+  error?: string;
+  uid?: number;
+  username?: string;
+  has_devices?: boolean;
+}
+
+export interface DeviceRegisterResult {
+  ok: boolean;
+  error?: string;
+  sid?: string;
+  token?: string;
+  uid?: number;
+}
+
+export interface ConvMember {
+  user_id: number;
+  device_id: number;
+  sid: string;
+  name: string;
+  pub_key: string;
+}
+
+export interface ServerMessage {
+  id: number;
+  seq: number;
+  cid: string;
+  conv_id: number;
+  sender_id: number;
+  sender_sid: string;
+  sender_pub_key?: string;
+  payload: Envelope;
+  created_at: number;
+  carrier_status?: string;
+  carrier_error?: string | null;
+  carrier_updated_at?: number | null;
+}
+
+export class Api {
+  token: string | null = null;
+  /**
+   * Invoked when an authenticated request gets HTTP 401 (JWT expired or the
+   * device was revoked from another session). The store wires logout() here.
+   * Never fires for unauthenticated bootstrap calls (login/register/device-*),
+   * because those run without a token set.
+   */
+  onUnauthorized: (() => void) | null = null;
+
+  setToken(t: string | null) { this.token = t; }
+
+  private async request<T extends ApiResult>(path: string, init: RequestInit = {}): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API}${path}`, {
+        ...init,
+        signal: controller.signal,
+        headers: {
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          ...init.headers,
+        },
+      });
+      if (response.status === 401 && this.token && this.onUnauthorized) {
+        this.onUnauthorized();
+      }
+      const text = await response.text();
+      let data: ApiResult;
+      try {
+        data = text ? JSON.parse(text) : { ok: response.ok };
+      } catch {
+        return { ok: false, error: `서버 응답 형식 오류 (HTTP ${response.status})` } as T;
+      }
+      if (!response.ok || !data.ok) {
+        return {
+          ...data,
+          ok: false,
+          status: response.status,
+          error: data.error || `요청 실패 (HTTP ${response.status})`,
+        } as T;
+      }
+      return data as T;
+    } catch (error) {
+      const message = error instanceof DOMException && error.name === "AbortError"
+        ? "서버 응답 시간 초과"
+        : "서버에 연결할 수 없습니다";
+      return { ok: false, status: 0, error: message } as T;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private post<T extends ApiResult = any>(path: string, body: unknown): Promise<T> {
+    return this.request<T>(path, { method: "POST", body: JSON.stringify(body) });
+  }
+
+  private get<T extends ApiResult = any>(path: string): Promise<T> {
+    return this.request<T>(path);
+  }
+
+  register(username: string, pwHash: string) {
+    return this.post("/register", { username, pw_hash: pwHash });
+  }
+  login(username: string, pwHash: string): Promise<LoginResult> {
+    return this.post("/login", { username, pw_hash: pwHash });
+  }
+  deviceRegister(username: string, pwHash: string, deviceName: string, pubKey: string, sigPub: string): Promise<DeviceRegisterResult> {
+    return this.post("/device-register", { username, pw_hash: pwHash, device_name: deviceName, pub_key: pubKey, sig_pub: sigPub });
+  }
+  deviceLogin(username: string, pwHash: string, sid: string) {
+    return this.post("/device-login", { username, pw_hash: pwHash, sid });
+  }
+  listDevices() { return this.get("/devices"); }
+  deviceRevoke(sid: string) { return this.post("/device-revoke", { sid }); }
+  createConversation(members: string[], name?: string) {
+    return this.post("/conversation", { members, ...(name ? { name } : {}) });
+  }
+  listConversations() { return this.get("/conversations"); }
+  convMembers(cid: string): Promise<{ ok: boolean; members?: ConvMember[]; error?: string }> {
+    return this.get(`/conversation/${encodeURIComponent(cid)}/members`);
+  }
+  fetchMessages(cid: string, since: number, limit = 200): Promise<{ ok: boolean; messages?: ServerMessage[]; error?: string }> {
+    return this.get(`/conversation/${encodeURIComponent(cid)}/messages?since=${since}&limit=${limit}`);
+  }
+}
+
+export const api = new Api();
+
+// ----- socket -----------------------------------------------------------
+
+let _socket: Socket | null = null;
+let _socketToken: string | null = null;
+
+export function getSocket(token: string): Socket {
+  if (_socket && _socketToken === token) return _socket;
+  if (_socket) {
+    _socket.removeAllListeners();
+    _socket.disconnect();
+  }
+  _socket = io({
+    auth: { token },
+    // Start with long-polling and upgrade when the complete proxy chain permits
+    // WebSocket. Oracle's outer edge may reject an upgrade while polling works.
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 5000,
+  });
+  _socketToken = token;
+  return _socket;
+}
+
+export function disconnectSocket(): void {
+  if (_socket) {
+    _socket.removeAllListeners();
+    _socket.disconnect();
+    _socket = null;
+  }
+  _socketToken = null;
+}
+
+export function waitForSocketConnected(socket: Socket, timeoutMs = 5_000): Promise<boolean> {
+  if (socket.connected) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let finished = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (connected: boolean) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      socket.off("connect", onConnect);
+      socket.off("connect_error", onError);
+      resolve(connected);
+    };
+    const onConnect = () => done(true);
+    const onError = () => done(false);
+    socket.once("connect", onConnect);
+    socket.once("connect_error", onError);
+    timer = setTimeout(() => done(false), timeoutMs);
+    // Close the narrow race where the socket connected between the first
+    // check above and listener registration.
+    if (socket.connected) done(true);
+  });
+}
+
+export async function sendMessage(
+  socket: Socket,
+  cid: string,
+  envelope: Envelope,
+): Promise<{ ok: boolean; seq?: number; id?: number; error?: string }> {
+  const messageId = crypto.randomUUID();
+  let result: { ok: boolean; seq?: number; id?: number; error?: string } = {
+    ok: false,
+    error: "메시지 전송 실패",
+  };
+  // Retry one lost acknowledgement with the same id. The server returns the
+  // original sequence without fanning out a second carrier-bound message.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    result = await emitMessageOnce(socket, cid, messageId, envelope);
+    if (result.ok || result.error !== "메시지 전송 확인 시간 초과") break;
+  }
+  return result;
+}
+
+function emitMessageOnce(
+  socket: Socket,
+  cid: string,
+  messageId: string,
+  envelope: Envelope,
+): Promise<{ ok: boolean; seq?: number; id?: number; error?: string }> {
+  return new Promise((resolve) => {
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      resolve({ ok: false, error: "메시지 전송 확인 시간 초과" });
+    }, SOCKET_ACK_TIMEOUT_MS);
+    socket.emit("message_send", { cid, mid: messageId, payload: envelope }, (ack: any) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve(ack ?? { ok: false, error: "서버 확인 응답 없음" });
+    });
+  });
+}
+
+export type { Envelope, RecipientDevice };
