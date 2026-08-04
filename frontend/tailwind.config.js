@@ -5,18 +5,24 @@ export default {
   theme: {
     extend: {
       colors: {
-        night: "#0a0f16",
-        "night-soft": "#0d1420",
-        card: "#111a28",
-        "card-raised": "#16202f",
-        line: "#1d2939",
+        // Theme tokens (rgb triplets; see src/index.css :root / .dark).
+        // `fg` is the overlay base: white in dark mode, slate-900 in light.
+        night: "rgb(var(--bg) / <alpha-value>)",
+        "night-soft": "rgb(var(--bg-soft) / <alpha-value>)",
+        fg: "rgb(var(--fg) / <alpha-value>)",
+        "tx-1": "rgb(var(--tx-1) / <alpha-value>)",
+        "tx-2": "rgb(var(--tx-2) / <alpha-value>)",
+        "tx-3": "rgb(var(--tx-3) / <alpha-value>)",
+        "tx-4": "rgb(var(--tx-4) / <alpha-value>)",
+        "accent-tx": "rgb(var(--accent-tx) / <alpha-value>)",
+        "danger-tx": "rgb(var(--danger-tx) / <alpha-value>)",
       },
       backgroundImage: {
         "brand-gradient": "linear-gradient(135deg, #2dd4bf 0%, #38bdf8 100%)",
       },
       boxShadow: {
-        glow: "0 0 40px -12px rgba(45, 212, 191, 0.45)",
-        bubble: "0 2px 12px -4px rgba(0, 0, 0, 0.5)",
+        glow: "0 0 40px -12px var(--glow)",
+        bubble: "0 2px 12px -4px var(--shadow-bubble)",
       },
       keyframes: {
         rise: {

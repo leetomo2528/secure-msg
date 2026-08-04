@@ -29,7 +29,7 @@ export default function BlocklistEditor() {
       title="차단 키워드"
       badge={blockKeywords.length}
     >
-      <p className="text-[10px] leading-relaxed text-slate-500">
+      <p className="text-[10px] leading-relaxed text-tx-4">
         복호화된 메시지에 이 문자가 포함되면 숨김 처리됩니다.
         키워드 목록은 이 기기(IndexedDB)에만 저장되고 서버로 전송되지 않습니다.
         Android 기본 SMS 앱의 수신 차단은 휴대폰에서 별도로 적용됩니다.
@@ -45,26 +45,26 @@ export default function BlocklistEditor() {
         />
         <button
           onClick={add}
-          className="shrink-0 rounded-xl bg-teal-400/10 px-3 text-xs font-semibold text-teal-300 ring-1 ring-teal-300/30 transition hover:bg-teal-400/20"
+          className="shrink-0 rounded-xl bg-accent-tx/10 px-3 text-xs font-semibold text-accent-tx ring-1 ring-accent-tx/30 transition hover:bg-accent-tx/20"
         >
           추가
         </button>
       </div>
       <ul className="max-h-32 space-y-1 overflow-y-auto">
         {blockKeywords.map((b) => (
-          <li key={b.id} className="flex items-center justify-between rounded-lg bg-white/[0.04] px-2.5 py-1.5 text-xs text-slate-300">
+          <li key={b.id} className="flex items-center justify-between rounded-lg bg-fg/[0.04] px-2.5 py-1.5 text-xs text-tx-2">
             <span className="truncate">{b.keyword}</span>
             <button
               onClick={() => removeBlock(b.id)}
               aria-label={`"${b.keyword}" 차단 해제`}
-              className="ml-2 rounded px-1 text-slate-500 transition hover:bg-red-500/10 hover:text-red-400"
+              className="ml-2 rounded px-1 text-tx-4 transition hover:bg-red-500/10 hover:text-red-500"
             >
               ×
             </button>
           </li>
         ))}
         {blockKeywords.length === 0 && (
-          <li className="py-1.5 text-center text-[10px] text-slate-500">차단 키워드 없음</li>
+          <li className="py-1.5 text-center text-[10px] text-tx-4">차단 키워드 없음</li>
         )}
       </ul>
     </CollapsibleCard>

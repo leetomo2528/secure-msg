@@ -41,8 +41,8 @@ export default function Onboarding() {
         <div className="space-y-3 text-center">
           <div className="flex justify-center"><BrandMark className="h-14 w-14 rounded-2xl" /></div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-50">Secure Msg</h1>
-            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+            <h1 className="text-2xl font-bold tracking-tight text-tx-1">Secure Msg</h1>
+            <p className="mt-2 text-xs leading-relaxed text-tx-3">
               자가호스팅 E2E 메신저. 전화번호·이메일 없이 임의 아이디만 사용합니다.
               서버 관리자도 메시지를 읽을 수 없습니다.
             </p>
@@ -91,13 +91,13 @@ export default function Onboarding() {
             maxLength={1024}
             required
           />
-          <p className="text-[10px] leading-relaxed text-slate-500">
+          <p className="text-[10px] leading-relaxed text-tx-4">
             비밀번호는 브라우저에서 Argon2id로 해시한 후 서버로 전송됩니다. 서버는 원본 비밀번호를 절대 받지 않습니다.
           </p>
         </div>
 
         {error && (
-          <div className="rounded-xl bg-red-500/10 px-3.5 py-2.5 text-xs text-red-200 ring-1 ring-red-400/30 animate-rise">
+          <div className="rounded-xl bg-red-500/10 px-3.5 py-2.5 text-xs text-danger-tx ring-1 ring-red-400/30 animate-rise">
             {error}
           </div>
         )}
@@ -106,7 +106,7 @@ export default function Onboarding() {
           {busy ? "처리 중…" : mode === "login" ? "로그인" : "가입 및 첫 기기 등록"}
         </button>
 
-        <p className="text-center text-[10px] leading-relaxed text-slate-500">
+        <p className="text-center text-[10px] leading-relaxed text-tx-4">
           가입 시 이 기기의 암호화 키쌍이 브라우저(IndexedDB)에 생성됩니다.
           개인키는 서버로 절대 전송되지 않습니다.
         </p>
@@ -119,7 +119,7 @@ export default function Onboarding() {
               setUsername("");
               setPassword("");
             }}
-            className="mx-auto block text-[10px] text-red-400/70 transition hover:text-red-300"
+            className="mx-auto block text-[10px] text-danger-tx/70 transition hover:text-danger-tx"
           >
             이 브라우저의 로컬 기기 초기화
           </button>

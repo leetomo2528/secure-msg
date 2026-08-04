@@ -9,6 +9,18 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
     <title>Secure Msg</title>
+    <script>
+      // Apply the stored theme before first paint (no flash). src/theme.ts
+      // keeps this logic in sync at runtime.
+      (function () {
+        try {
+          var m = localStorage.getItem("securemsg-theme") || "system";
+          var dark = m === "dark" || (m === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.style.backgroundColor = dark ? "#0a0f16" : "#f3f6fa";
+        } catch (e) { /* default to light tokens */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -11,8 +11,8 @@ export default function ChatList() {
   return (
     <ul className="space-y-1 px-2 py-2">
       {conversations.length === 0 && (
-        <li className="px-4 py-10 text-center text-xs leading-relaxed text-slate-500">
-          아직 대화가 없어요.<br />아래 <span className="text-teal-300/90">+ 새 대화</span>에서 시작하세요.
+        <li className="px-4 py-10 text-center text-xs leading-relaxed text-tx-4">
+          아직 대화가 없어요.<br />아래 <span className="text-accent-tx">+ 새 대화</span>에서 시작하세요.
         </li>
       )}
       {conversations.map((c) => {
@@ -23,20 +23,20 @@ export default function ChatList() {
             <button
               onClick={() => selectConversation(c.cid)}
               className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${
-                active ? "bg-white/[0.07] ring-1 ring-teal-300/20" : "hover:bg-white/[0.04]"
+                active ? "bg-fg/[0.07] ring-1 ring-accent-tx/20" : "hover:bg-fg/[0.04]"
               }`}
             >
               <Avatar label={display} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className={`truncate text-sm font-semibold ${active ? "text-slate-50" : "text-slate-200"}`}>
+                  <span className={`truncate text-sm font-semibold ${active ? "text-tx-1" : "text-tx-2"}`}>
                     {display}
                   </span>
-                  <span className="shrink-0 text-[10px] text-slate-500">
+                  <span className="shrink-0 text-[10px] text-tx-4">
                     {new Date(c.created_at * 1000).toLocaleDateString("ko-KR", { month: "short", day: "numeric" })}
                   </span>
                 </div>
-                <div className="mt-0.5 truncate text-[11px] text-slate-500">
+                <div className="mt-0.5 truncate text-[11px] text-tx-4">
                   {c.name ? "SMS" : `SecureMsg · ${c.members.length}명`}
                 </div>
               </div>

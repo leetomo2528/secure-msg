@@ -49,10 +49,10 @@ export default function NewConversationModal() {
           onClick={() => setOpen(false)}
         >
           <div
-            className="w-full max-w-sm space-y-4 rounded-2xl bg-night-soft p-5 shadow-bubble ring-1 ring-white/10 animate-rise"
+            className="w-full max-w-sm space-y-4 rounded-2xl bg-night-soft p-5 shadow-bubble ring-1 ring-fg/10 animate-rise"
             onClick={(e) => e.stopPropagation()}
           >
-            <h2 className="text-sm font-bold text-slate-100">새 대화 시작</h2>
+            <h2 className="text-sm font-bold text-tx-1">새 대화 시작</h2>
             <Segmented
               options={[
                 { value: "sms", label: "SMS" },
@@ -61,7 +61,7 @@ export default function NewConversationModal() {
               value={mode}
               onChange={(m) => { setMode(m); setErr(null); }}
             />
-            <p className="text-[10px] leading-relaxed text-slate-500">
+            <p className="text-[10px] leading-relaxed text-tx-4">
               {mode === "sms"
                 ? "Android 휴대폰을 통해 발신할 전화번호를 입력하세요. (예: +821012345678)"
                 : "상대방의 SecureMsg 아이디를 쉼표로 구분해 입력하세요."}
@@ -79,7 +79,7 @@ export default function NewConversationModal() {
               placeholder={mode === "sms" ? "+821012345678" : "alice_92, bob_dev"}
               className="field"
             />
-            {err && <p className="text-[10px] text-red-400 animate-rise">{err}</p>}
+            {err && <p className="text-[10px] text-danger-tx animate-rise">{err}</p>}
             <div className="flex gap-2">
               <button
                 onClick={() => setOpen(false)}

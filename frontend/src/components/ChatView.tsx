@@ -71,11 +71,11 @@ export default function ChatView({ cid }: { cid: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 border-b border-white/5 bg-night-soft/70 px-3 py-2.5 backdrop-blur">
+      <div className="flex items-center gap-3 border-b border-fg/5 bg-night-soft/70 px-3 py-2.5 backdrop-blur">
         <button
           type="button"
           onClick={() => useStore.setState({ activeCid: null, activeMessages: [] })}
-          className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-400 ring-1 ring-white/10 transition hover:bg-white/[0.06] hover:text-slate-100 md:hidden"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-tx-3 ring-1 ring-fg/10 transition hover:bg-fg/[0.06] hover:text-tx-1 md:hidden"
           aria-label="대화 목록으로 돌아가기"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -84,8 +84,8 @@ export default function ChatView({ cid }: { cid: string }) {
         </button>
         <Avatar label={title} size="h-8 w-8 text-[11px]" />
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-slate-100">{title}</div>
-          <div className="text-[10px] text-slate-500">
+          <div className="truncate text-sm font-semibold text-tx-1">{title}</div>
+          <div className="text-[10px] text-tx-4">
             {conversation?.name ? "SMS · Android 게이트웨이 경유 발신" : "E2E 암호화 대화"}
           </div>
         </div>
@@ -93,7 +93,7 @@ export default function ChatView({ cid }: { cid: string }) {
 
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto px-4 py-5">
         {activeMessages.length === 0 && (
-          <div className="pt-14 text-center text-xs leading-relaxed text-slate-500">
+          <div className="pt-14 text-center text-xs leading-relaxed text-tx-4">
             메시지가 없습니다.<br />첫 메시지를 보내보세요.
           </div>
         )}
@@ -101,7 +101,7 @@ export default function ChatView({ cid }: { cid: string }) {
           if (m.blocked) {
             return (
               <div key={`${m.cid}:${m.seq}`} className="py-1 text-center">
-                <span className="inline-flex items-center gap-1 rounded-full bg-white/[0.03] px-3 py-1 text-[10px] text-slate-500 ring-1 ring-white/[0.05]">
+                <span className="inline-flex items-center gap-1 rounded-full bg-fg/[0.03] px-3 py-1 text-[10px] text-tx-4 ring-1 ring-fg/[0.05]">
                   ⛔ 차단된 메시지 (seq {m.seq})
                 </span>
               </div>
@@ -114,7 +114,7 @@ export default function ChatView({ cid }: { cid: string }) {
                 className={`max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-bubble ${
                   mine
                     ? "rounded-br-md bg-gradient-to-br from-teal-500 to-sky-600 text-white"
-                    : "rounded-bl-md bg-white/[0.06] text-slate-100 ring-1 ring-white/[0.06]"
+                    : "rounded-bl-md bg-fg/[0.06] text-tx-1 ring-1 ring-fg/[0.06]"
                 }`}
               >
                 {m.content_type === "mms" && m.subject && <div className="mb-1 font-semibold">{m.subject}</div>}
@@ -122,7 +122,7 @@ export default function ChatView({ cid }: { cid: string }) {
                 {m.attachments?.map((attachment, index) => (
                   <AttachmentPreview key={`${m.cid}:${m.seq}:${index}:${attachment.name}`} attachment={attachment} mine={mine} />
                 ))}
-                <div className={`mt-1.5 text-[10px] tabular-nums ${mine ? "text-white/60" : "text-slate-500"}`}>
+                <div className={`mt-1.5 text-[10px] tabular-nums ${mine ? "text-white/60" : "text-tx-4"}`}>
                   {new Date(m.created_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
                   {mine && m.carrier_status && m.carrier_status !== "none" && ` · ${carrierLabel(m.carrier_status)}`}
                 </div>
@@ -132,7 +132,7 @@ export default function ChatView({ cid }: { cid: string }) {
         })}
       </div>
 
-      <form onSubmit={submit} className="space-y-2 border-t border-white/5 bg-night-soft/70 p-3 backdrop-blur">
+      <form onSubmit={submit} className="space-y-2 border-t border-fg/5 bg-night-soft/70 p-3 backdrop-blur">
         {(attachments.length > 0 || subject) && (
           <div className="flex items-center gap-2">
             <input
@@ -142,12 +142,12 @@ export default function ChatView({ cid }: { cid: string }) {
               className="field flex-1 !py-1.5 text-xs"
               maxLength={120}
             />
-            <span className="shrink-0 rounded-full bg-white/[0.04] px-2.5 py-1 text-[10px] text-slate-400 ring-1 ring-white/[0.06]">
+            <span className="shrink-0 rounded-full bg-fg/[0.04] px-2.5 py-1 text-[10px] text-tx-3 ring-1 ring-fg/[0.06]">
               첨부 {attachments.length}개
             </span>
           </div>
         )}
-        {attachmentError && <div className="text-[11px] text-red-400">{attachmentError}</div>}
+        {attachmentError && <div className="text-[11px] text-danger-tx">{attachmentError}</div>}
         {attachments.length > 0 && (
           <div className="flex gap-1.5 overflow-x-auto pb-0.5">
             {attachments.map((attachment, index) => (
@@ -155,7 +155,7 @@ export default function ChatView({ cid }: { cid: string }) {
                 key={`${attachment.name}-${index}`}
                 type="button"
                 onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
-                className="shrink-0 rounded-full bg-white/[0.05] px-3 py-1.5 text-[11px] text-slate-300 ring-1 ring-white/10 transition hover:bg-red-500/10 hover:text-red-300 hover:ring-red-400/30"
+                className="shrink-0 rounded-full bg-fg/[0.05] px-3 py-1.5 text-[11px] text-tx-2 ring-1 ring-fg/10 transition hover:bg-red-500/10 hover:text-red-500 hover:ring-red-400/30"
                 title="첨부 제거"
               >
                 {attachment.name} ×
@@ -163,9 +163,9 @@ export default function ChatView({ cid }: { cid: string }) {
             ))}
           </div>
         )}
-        <div className="flex items-center gap-2 rounded-2xl bg-white/[0.04] px-2 py-1.5 ring-1 ring-white/10 transition focus-within:ring-2 focus-within:ring-teal-300/40">
+        <div className="flex items-center gap-2 rounded-2xl bg-fg/[0.04] px-2 py-1.5 ring-1 ring-fg/10 transition focus-within:ring-2 focus-within:ring-accent-tx/40">
           <label
-            className="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full text-slate-400 transition hover:bg-white/[0.06] hover:text-teal-300"
+            className="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full text-tx-3 transition hover:bg-fg/[0.06] hover:text-accent-tx"
             title="파일 첨부"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -243,7 +243,7 @@ function AttachmentPreview({ attachment, mine }: { attachment: MessageAttachment
       href={url}
       download={attachment.name}
       className={`mt-2 inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs underline underline-offset-2 ${
-        mine ? "text-white/80 hover:text-white" : "text-teal-300 hover:text-teal-200"
+        mine ? "text-white/80 hover:text-white" : "text-accent-tx hover:opacity-80"
       }`}
     >
       📎 {attachment.name}

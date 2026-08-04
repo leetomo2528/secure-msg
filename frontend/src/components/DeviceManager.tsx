@@ -73,26 +73,26 @@ export default function DeviceManager() {
       title="기기 관리"
       badge={open ? devices.length : undefined}
     >
-      <p className="text-[10px] leading-relaxed text-slate-500">
+      <p className="text-[10px] leading-relaxed text-tx-4">
         각 기기는 고유 키쌍을 가집니다. 다른 기기에서 같은 아이디와 비밀번호로 로그인하면 새 기기가 자동으로 추가됩니다.
         폐기된 기기의 키로는 새 메시지를 복호화할 수 없습니다.
       </p>
       <ul className="space-y-1">
         {devices.map((d) => (
-          <li key={d.sid} className="flex items-center justify-between rounded-lg bg-white/[0.04] px-2.5 py-2 text-xs">
+          <li key={d.sid} className="flex items-center justify-between rounded-lg bg-fg/[0.04] px-2.5 py-2 text-xs">
             <div className="min-w-0">
-              <div className="truncate text-slate-200">
+              <div className="truncate text-tx-2">
                 {d.kind === "android_gateway" ? "📱 " : "🌐 "}{d.name}{" "}
-                {d.sid === mySid && <span className="text-teal-300">(현재 기기)</span>}
+                {d.sid === mySid && <span className="text-accent-tx">(현재 기기)</span>}
               </div>
-              <div className="text-[9px] text-slate-500">
+              <div className="text-[9px] text-tx-4">
                 {new Date(d.last_seen * 1000).toLocaleString("ko-KR")}
               </div>
             </div>
             <button
               onClick={() => revoke(d.sid)}
               disabled={busy}
-              className="ml-2 rounded-md px-2 py-1 text-[10px] text-red-300/80 ring-1 ring-red-400/30 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"
+              className="ml-2 rounded-md px-2 py-1 text-[10px] text-danger-tx/80 ring-1 ring-red-400/30 transition hover:bg-red-500/10 hover:text-danger-tx disabled:opacity-40"
             >
               폐기
             </button>
