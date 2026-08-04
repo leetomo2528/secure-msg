@@ -167,3 +167,7 @@ npm run build
 - envelope 암호화는 서버 평문 노출을 막지만 Signal Double Ratchet 수준의 전방 비밀성은 제공하지 않는다.
 
 상세한 자산·위협·보장 범위는 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)를 참고한다.
+
+## 라이선스
+
+[MIT](LICENSE) © leetomo2528
