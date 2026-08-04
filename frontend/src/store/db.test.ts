@@ -4,11 +4,13 @@ import {
   addBlockKeyword,
   listBlockKeywords,
   getCursor,
+  getMeta,
   listMessages,
   putMessage,
   setBlocked,
   setCarrierStatus,
   setCursor,
+  setMeta,
   type MessageRow,
 } from "./db";
 
@@ -93,5 +95,36 @@ describe("blocklist keywords", () => {
 
   it("rejects empty keywords", async () => {
     await expect(addBlockKeyword("   ")).rejects.toThrow();
+  });
+});
+
+describe("meta persistence", () => {
+  // Regression: the `meta` store has an out-of-line key (no keyPath), so
+  // setMeta must pass the key explicitly. Without it, IndexedDB throws
+  // DataError "Data provided to an operation does not meet requirements.",
+  // which broke every web login/register at the device-key persistence step.
+  it("setMeta/getMeta round-trip", async () => {
+    await setMeta({
+      username: "alice",
+      uid: 7,
+      sid: "dev_meta",
+      deviceName: "test-device",
+      keypair: { box: { pk: "bp", sk: "bs" }, sign: { pk: "sp", sk: "ss" } },
+    });
+    const back = await getMeta();
+    expect(back).toMatchObject({ username: "alice", uid: 7, sid: "dev_meta" });
+    expect(back?.keypair.box.sk).toBe("bs");
+  });
+
+  it("setMeta overwrites the previous device meta", async () => {
+    await setMeta({
+      username: "alice", uid: 7, sid: "dev_meta", deviceName: "first",
+      keypair: { box: { pk: "bp", sk: "bs" }, sign: { pk: "sp", sk: "ss" } },
+    });
+    await setMeta({
+      username: "alice", uid: 7, sid: "dev_meta2", deviceName: "second",
+      keypair: { box: { pk: "bp2", sk: "bs2" }, sign: { pk: "sp2", sk: "ss2" } },
+    });
+    expect((await getMeta())?.sid).toBe("dev_meta2");
   });
 });

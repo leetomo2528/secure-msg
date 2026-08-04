@@ -1,5 +1,11 @@
 # 업데이트 내역
 
+## v0.4.3 (2026-08-05) — 웹 수정
+
+- **웹 로그인·가입 마무리 단계 실패 버그 수정**: `meta` IndexedDB 스토어가 out-of-line 키(keyPath 없음)인데 `setMeta`가 키를 생략하고 put해 `DataError: Data provided to an operation does not meet requirements.`가 발생, 모든 웹 로그인/가입이 기기 키 저장 단계에서 실패하던 문제 (frontend/src/store/db.ts). 명시적 키 전달로 수정
+- 회귀 테스트 2개 추가(meta round-trip·덮어쓰기) — 웹 테스트 36개 전부 통과
+- 로그인 실패 반복으로 서버에 쌓인 고아 기기(프라이빗 키 미저장) 3건 정리
+
 ## v0.4.2 (2026-08-05)
 
 - **Android 로그인·가입 불가 버그 수정**: Lazysodium의 String `cryptoPwHash` 오버로드가 결과를 표준 base64(`+`, `/`, `=`)로 인코딩해, base64url만 허용하는 서버(`B64U_RE = [A-Za-z0-9_-]+`)가 `pw_hash must be base64url for 32 bytes`로 거부하던 문제. raw 버퍼 오버로드로 교체 후 웹과 동일하게 url-safe base64(패딩 없음)로 인코딩 (CryptoUtil.kt)

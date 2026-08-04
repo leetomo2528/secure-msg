@@ -104,7 +104,11 @@ export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
 
 export async function setMeta(meta: MetaRow["value"]): Promise<void> {
   const d = await db();
-  await d.put("meta", { key: "current", value: meta });
+  // The `meta` store has NO keyPath (out-of-line keys), so put() requires the
+  // key explicitly. Omitting it makes IndexedDB throw DataError ("Data provided
+  // to an operation does not meet requirements."), which broke every web
+  // login/register at the device-key persistence step.
+  await d.put("meta", { key: "current", value: meta }, "current");
 }
 
 export async function getMeta(): Promise<MetaRow["value"] | null> {
