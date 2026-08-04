@@ -21,8 +21,8 @@ export default defineConfig({
         name: "Secure Msg",
         short_name: "SecureMsg",
         description: "Self-hosted E2E-encrypted messenger. Multi-device sync, keyword blocklist, zero PII.",
-        theme_color: "#0f172a",
-        background_color: "#0f172a",
+        theme_color: "#0a0f16",
+        background_color: "#0a0f16",
         display: "standalone",
         start_url: "/",
         icons: [

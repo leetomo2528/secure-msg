@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useStore } from "../store/useStore";
+import { Segmented } from "./ui";
 
 export default function NewConversationModal() {
   const { newConversation, newSmsConversation, selectConversation } = useStore();
@@ -35,27 +36,32 @@ export default function NewConversationModal() {
     <>
       <button
         onClick={() => setOpen(true)}
-        className="w-full rounded-lg bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 py-2 text-xs hover:bg-cyan-500/30"
+        className="btn-primary w-full !py-2.5 text-xs"
       >
-        + 새 대화
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
+          <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
+        </svg>
+        새 대화
       </button>
       {open && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 px-4" onClick={() => setOpen(false)}>
-          <div className="bg-ink panel border border-slate-700 rounded-xl p-5 w-full max-w-sm space-y-3" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-sm font-semibold text-cyan-300">새 대화 시작</h2>
-            <div className="flex rounded-lg border border-slate-700 overflow-hidden">
-              <button
-                type="button"
-                onClick={() => { setMode("sms"); setErr(null); }}
-                className={`flex-1 py-2 text-xs ${mode === "sms" ? "bg-cyan-500/20 text-cyan-300" : "text-slate-400"}`}
-              >SMS</button>
-              <button
-                type="button"
-                onClick={() => { setMode("chat"); setErr(null); }}
-                className={`flex-1 py-2 text-xs ${mode === "chat" ? "bg-cyan-500/20 text-cyan-300" : "text-slate-400"}`}
-              >SecureMsg 대화</button>
-            </div>
-            <p className="text-[10px] text-slate-500">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm"
+          onClick={() => setOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm space-y-4 rounded-2xl bg-night-soft p-5 shadow-bubble ring-1 ring-white/10 animate-rise"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-sm font-bold text-slate-100">새 대화 시작</h2>
+            <Segmented
+              options={[
+                { value: "sms", label: "SMS" },
+                { value: "chat", label: "SecureMsg 대화" },
+              ]}
+              value={mode}
+              onChange={(m) => { setMode(m); setErr(null); }}
+            />
+            <p className="text-[10px] leading-relaxed text-slate-500">
               {mode === "sms"
                 ? "Android 휴대폰을 통해 발신할 전화번호를 입력하세요. (예: +821012345678)"
                 : "상대방의 SecureMsg 아이디를 쉼표로 구분해 입력하세요."}
@@ -71,20 +77,20 @@ export default function NewConversationModal() {
               }}
               maxLength={1024}
               placeholder={mode === "sms" ? "+821012345678" : "alice_92, bob_dev"}
-              className="w-full rounded-lg border border-slate-700 px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+              className="field"
             />
-            {err && <p className="text-[10px] text-red-400">{err}</p>}
+            {err && <p className="text-[10px] text-red-400 animate-rise">{err}</p>}
             <div className="flex gap-2">
               <button
                 onClick={() => setOpen(false)}
-                className="flex-1 rounded-lg border border-slate-700 text-slate-300 py-2 text-xs"
+                className="btn-ghost flex-1 !py-2 text-xs"
               >
                 취소
               </button>
               <button
                 onClick={submit}
                 disabled={busy}
-                className="flex-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-slate-900 font-medium py-2 text-xs"
+                className="btn-primary flex-1 !py-2 text-xs"
               >
                 {busy ? "생성 중…" : "생성"}
               </button>

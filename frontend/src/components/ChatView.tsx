@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
+import { Avatar } from "./ChatList";
 
 export default function ChatView({ cid }: { cid: string }) {
   const { activeMessages, conversations, sendContent, sid } = useStore();
@@ -12,6 +13,7 @@ export default function ChatView({ cid }: { cid: string }) {
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversation = conversations.find((item) => item.cid === cid);
+  const title = conversation?.name || conversation?.members.join(", ") || "대화";
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -68,46 +70,59 @@ export default function ChatView({ cid }: { cid: string }) {
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="md:hidden flex items-center gap-3 border-b border-slate-800 px-3 py-2">
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-3 border-b border-white/5 bg-night-soft/70 px-3 py-2.5 backdrop-blur">
         <button
           type="button"
           onClick={() => useStore.setState({ activeCid: null, activeMessages: [] })}
-          className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-slate-400 ring-1 ring-white/10 transition hover:bg-white/[0.06] hover:text-slate-100 md:hidden"
           aria-label="대화 목록으로 돌아가기"
         >
-          ← 목록
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path d="M15 5l-7 7 7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
         </button>
-        <div className="min-w-0 truncate text-sm font-medium text-slate-200">
-          {conversation?.name || conversation?.members.join(", ") || "대화"}
+        <Avatar label={title} size="h-8 w-8 text-[11px]" />
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-slate-100">{title}</div>
+          <div className="text-[10px] text-slate-500">
+            {conversation?.name ? "SMS · Android 게이트웨이 경유 발신" : "E2E 암호화 대화"}
+          </div>
         </div>
       </div>
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-2">
+
+      <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto px-4 py-5">
         {activeMessages.length === 0 && (
-          <div className="text-xs text-slate-500 text-center pt-10">
-            메시지가 없습니다. 첫 메시지를 보내보세요.
+          <div className="pt-14 text-center text-xs leading-relaxed text-slate-500">
+            메시지가 없습니다.<br />첫 메시지를 보내보세요.
           </div>
         )}
         {activeMessages.map((m) => {
           if (m.blocked) {
             return (
-              <div key={`${m.cid}:${m.seq}`} className="text-center text-[10px] text-slate-600 py-1">
-                ⛔ 차단된 메시지 (seq {m.seq})
+              <div key={`${m.cid}:${m.seq}`} className="py-1 text-center">
+                <span className="inline-flex items-center gap-1 rounded-full bg-white/[0.03] px-3 py-1 text-[10px] text-slate-500 ring-1 ring-white/[0.05]">
+                  ⛔ 차단된 메시지 (seq {m.seq})
+                </span>
               </div>
             );
           }
           const mine = m.sender_sid === sid;
           return (
-            <div key={`${m.cid}:${m.seq}`} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[75%] rounded-2xl px-3.5 py-2 text-sm whitespace-pre-wrap break-words ${
-                mine ? "bg-cyan-500 text-slate-900" : "bg-slate-800 text-slate-100"
-              }`}>
-                {m.content_type === "mms" && m.subject && <div className="font-semibold mb-1">{m.subject}</div>}
+            <div key={`${m.cid}:${m.seq}`} className={`flex animate-rise ${mine ? "justify-end" : "justify-start"}`}>
+              <div
+                className={`max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-bubble ${
+                  mine
+                    ? "rounded-br-md bg-gradient-to-br from-teal-500 to-sky-600 text-white"
+                    : "rounded-bl-md bg-white/[0.06] text-slate-100 ring-1 ring-white/[0.06]"
+                }`}
+              >
+                {m.content_type === "mms" && m.subject && <div className="mb-1 font-semibold">{m.subject}</div>}
                 {m.plaintext && <div>{m.plaintext}</div>}
                 {m.attachments?.map((attachment, index) => (
                   <AttachmentPreview key={`${m.cid}:${m.seq}:${index}:${attachment.name}`} attachment={attachment} mine={mine} />
                 ))}
-                <div className={`text-[9px] mt-1 ${mine ? "text-slate-700" : "text-slate-500"}`}>
+                <div className={`mt-1.5 text-[10px] tabular-nums ${mine ? "text-white/60" : "text-slate-500"}`}>
                   {new Date(m.created_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
                   {mine && m.carrier_status && m.carrier_status !== "none" && ` · ${carrierLabel(m.carrier_status)}`}
                 </div>
@@ -117,28 +132,30 @@ export default function ChatView({ cid }: { cid: string }) {
         })}
       </div>
 
-      <form onSubmit={submit} className="p-3 border-t border-slate-800 space-y-2">
+      <form onSubmit={submit} className="space-y-2 border-t border-white/5 bg-night-soft/70 p-3 backdrop-blur">
         {(attachments.length > 0 || subject) && (
-          <div className="flex items-center gap-2 text-[10px] text-slate-400">
+          <div className="flex items-center gap-2">
             <input
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
               placeholder="MMS 제목(선택)"
-              className="flex-1 rounded border border-slate-700 bg-slate-800 px-2 py-1 focus:outline-none focus:border-cyan-500"
+              className="field flex-1 !py-1.5 text-xs"
               maxLength={120}
             />
-            <span>{attachments.length}개 첨부</span>
+            <span className="shrink-0 rounded-full bg-white/[0.04] px-2.5 py-1 text-[10px] text-slate-400 ring-1 ring-white/[0.06]">
+              첨부 {attachments.length}개
+            </span>
           </div>
         )}
-        {attachmentError && <div className="text-[10px] text-red-400">{attachmentError}</div>}
+        {attachmentError && <div className="text-[11px] text-red-400">{attachmentError}</div>}
         {attachments.length > 0 && (
-          <div className="flex gap-1 overflow-x-auto">
+          <div className="flex gap-1.5 overflow-x-auto pb-0.5">
             {attachments.map((attachment, index) => (
               <button
                 key={`${attachment.name}-${index}`}
                 type="button"
                 onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
-                className="shrink-0 rounded bg-slate-800 border border-slate-700 px-2 py-1 text-[10px] text-slate-300"
+                className="shrink-0 rounded-full bg-white/[0.05] px-3 py-1.5 text-[11px] text-slate-300 ring-1 ring-white/10 transition hover:bg-red-500/10 hover:text-red-300 hover:ring-red-400/30"
                 title="첨부 제거"
               >
                 {attachment.name} ×
@@ -146,25 +163,45 @@ export default function ChatView({ cid }: { cid: string }) {
             ))}
           </div>
         )}
-        <div className="flex items-center gap-2">
-          <label className="cursor-pointer rounded-full border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-cyan-500">
-            첨부
+        <div className="flex items-center gap-2 rounded-2xl bg-white/[0.04] px-2 py-1.5 ring-1 ring-white/10 transition focus-within:ring-2 focus-within:ring-teal-300/40">
+          <label
+            className="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full text-slate-400 transition hover:bg-white/[0.06] hover:text-teal-300"
+            title="파일 첨부"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M20 11.5l-8.2 8.2a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"
+                stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"
+              />
+            </svg>
             <input type="file" multiple className="hidden" onChange={chooseFiles} />
           </label>
-        <input
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder={attachments.length > 0 ? "MMS 설명(선택)…" : "메시지 입력…"}
-          className="flex-1 rounded-full bg-slate-800 border border-slate-700 px-4 py-2.5 text-sm focus:outline-none focus:border-cyan-500"
-          maxLength={20_000}
-        />
-        <button
-          type="submit"
-          disabled={sending || (!text.trim() && attachments.length === 0 && !subject.trim())}
-          className="rounded-full bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-slate-900 font-medium px-4 py-2.5 text-sm"
-        >
-          {sending ? "전송 중…" : "전송"}
-        </button>
+          <input
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={attachments.length > 0 ? "MMS 설명(선택)…" : "메시지 입력…"}
+            className="min-w-0 flex-1 bg-transparent py-2 text-sm focus:outline-none"
+            maxLength={20_000}
+          />
+          <button
+            type="submit"
+            disabled={sending || (!text.trim() && attachments.length === 0 && !subject.trim())}
+            aria-label={sending ? "전송 중" : "전송"}
+            title={sending ? "전송 중…" : "전송"}
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-brand-gradient text-slate-950 shadow-glow transition hover:brightness-110 active:scale-95 disabled:opacity-40 disabled:shadow-none"
+          >
+            {sending ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" className="animate-spin" aria-hidden>
+                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" opacity="0.25" />
+                <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+              </svg>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
+                <path d="M3.5 11.2L20 4l-4.8 16.5-3.9-6.3-7.8-3z" fill="currentColor" opacity="0.35" />
+                <path d="M20 4L11.3 14.2M20 4l-7.8 16.5-3.9-6.3L3.5 11.2 20 4z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+              </svg>
+            )}
+          </button>
         </div>
       </form>
     </div>
@@ -196,8 +233,8 @@ function AttachmentPreview({ attachment, mine }: { attachment: MessageAttachment
   const url = dataUrl(attachment);
   if (/^image\/[A-Za-z0-9!#$&^_.+-]+$/.test(attachment.content_type)) {
     return (
-      <a href={url} download={attachment.name} className="block mt-2">
-        <img src={url} alt={attachment.name} className="max-h-56 max-w-full rounded-lg" loading="lazy" />
+      <a href={url} download={attachment.name} className="mt-2 block">
+        <img src={url} alt={attachment.name} className="max-h-56 max-w-full rounded-xl" loading="lazy" />
       </a>
     );
   }
@@ -205,7 +242,9 @@ function AttachmentPreview({ attachment, mine }: { attachment: MessageAttachment
     <a
       href={url}
       download={attachment.name}
-      className={`block mt-2 underline text-xs ${mine ? "text-slate-700" : "text-cyan-300"}`}
+      className={`mt-2 inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs underline underline-offset-2 ${
+        mine ? "text-white/80 hover:text-white" : "text-teal-300 hover:text-teal-200"
+      }`}
     >
       📎 {attachment.name}
     </a>

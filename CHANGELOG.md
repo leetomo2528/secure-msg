@@ -1,5 +1,15 @@
 # 업데이트 내역
 
+## v0.4.4 (2026-08-05) — 웹 UI 리디자인
+
+- 전체 웹 UI 재디자인: 납작한 slate+원색 cyan 테마를 깊이 있는 다크 팔레트(night #0a0f16 계열) + teal→sky 그라디언트 브랜드로 교체
+  - 새 로고 마크(방패+메시지)·그라디언트 CTA·글로우 포커스, 대화 목록 이니셜 그라디언트 아바타
+  - 채팅 버블: 내 메시지 그라디언트 버블·상대 메시지 반투명 링 버블, 말풍선 비대칭 라운드, 전송 버튼 아이콘화(전송 중 스피너)
+  - 온보딩: 상단 라디얼 글로우, 세그먼트 탭 필 스타일, 입력 필드 링 포커스
+  - 사이드바 패널(차단 키워드·기기 관리) 공통 접이식 카드(`ui.tsx` CollapsibleCard/Segmented)로 통일
+  - 앱/PWA 아이콘 신규 제작(SVG + 192/512 PNG), theme-color 통일
+- 로직 무변경(스타일·마크업만), headless Chromium으로 데스크톱/모바일 전 화면 스크린샷 검증, 테스트 41개·빌드 통과 후 Oracle 배포
+
 ## v0.4.3 (2026-08-05) — 웹 수정
 
 - **웹 로그인·가입 마무리 단계 실패 버그 수정**: `meta` IndexedDB 스토어가 out-of-line 키(keyPath 없음)인데 `setMeta`가 키를 생략하고 put해 `DataError: Data provided to an operation does not meet requirements.`가 발생, 모든 웹 로그인/가입이 기기 키 저장 단계에서 실패하던 문제 (frontend/src/store/db.ts). 명시적 키 전달로 수정
