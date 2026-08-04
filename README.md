@@ -151,6 +151,8 @@ npm test -- --run
 npm run build
 ```
 
+웹 테스트에는 **인증 E2E**(`src/e2e/auth.e2e.test.ts`)가 포함된다. 실제 로컬 Flask relay 서버를 띄워 회원가입·기기 등록·재로그인·새 브라우저 로그인·잘못된 비밀번호·중복 가입을 실 HTTP + 실 Argon2id 해시 + IndexedDB 저장까지 전 구간 검증한다. `server/.venv`가 설치되어 있어야 한다.
+
 ## 현재 범위와 제한
 
 - 통신사 연동은 Android 31 이상을 대상으로 한다. iOS는 임의 SMS 앱이 통신사 SMS 수신을 가로채는 동일한 경로를 제공하지 않으므로 별도 구현이 필요하다.

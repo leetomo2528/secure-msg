@@ -5,6 +5,7 @@
 - **웹 로그인·가입 마무리 단계 실패 버그 수정**: `meta` IndexedDB 스토어가 out-of-line 키(keyPath 없음)인데 `setMeta`가 키를 생략하고 put해 `DataError: Data provided to an operation does not meet requirements.`가 발생, 모든 웹 로그인/가입이 기기 키 저장 단계에서 실패하던 문제 (frontend/src/store/db.ts). 명시적 키 전달로 수정
 - 회귀 테스트 2개 추가(meta round-trip·덮어쓰기) — 웹 테스트 36개 전부 통과
 - 로그인 실패 반복으로 서버에 쌓인 고아 기기(프라이빗 키 미저장) 3건 정리
+- **인증 E2E 테스트 추가** (`frontend/src/e2e/auth.e2e.test.ts`): 실제 로컬 Flask relay를 자식으로 띄우고 회원가입→기기 저장→재로그인→새 브라우저 로그인→잘못된 비밀번호→중복 가입 전체를 실 HTTP·실 Argon2id·실 IndexedDB로 검증. 목 기반 단위 테스트가 놓친 계층 간 버그(라이브러리 빌드·와이어 포맷·브라우저 저장소 시맨틱)를 앞으로 이 단계에서 차단
 
 ## v0.4.2 (2026-08-05)
 

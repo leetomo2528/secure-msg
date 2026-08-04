@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "@types/node": "^26.1.2",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
