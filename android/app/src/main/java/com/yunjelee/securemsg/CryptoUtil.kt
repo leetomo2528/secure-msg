@@ -13,14 +13,17 @@ import java.util.Locale
 
 object CryptoUtil {
 
+    /** Argon2id output length the relay server expects (base64url, no padding). */
+    const val PW_HASH_BYTES = 32
+
     private val sodium: LazySodiumAndroid by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         LazySodiumAndroid(SodiumAndroid())
     }
 
-    private fun b64u(bytes: ByteArray): String =
+    internal fun b64u(bytes: ByteArray): String =
         Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
-    private fun unb64u(s: String): ByteArray =
+    internal fun unb64u(s: String): ByteArray =
         Base64.getUrlDecoder().decode(s)
 
     data class DeviceKeypair(
@@ -49,14 +52,24 @@ object CryptoUtil {
 
     fun hashPassword(password: String, saltB64: String): String {
         val salt = unb64u(saltB64)
-        return sodium.cryptoPwHash(
-            password,
-            32,
-            salt,
-            PwHash.OPSLIMIT_INTERACTIVE,
-            PwHash.MEMLIMIT_INTERACTIVE,
-            PwHash.Alg.PWHASH_ALG_ARGON2ID13,
-        )
+        // NOTE: Lazysodium's String overload base64-encodes with android.util.Base64
+        // NO_WRAP — that is STANDARD base64 ('+','/','=') , which the relay server
+        // rejects ("pw_hash must be base64url for 32 bytes"). Hash into a raw
+        // buffer and encode as url-safe base64 without padding, matching the web
+        // client (libsodium b64u) byte-for-byte.
+        val out = ByteArray(PW_HASH_BYTES)
+        val pwBytes = password.toByteArray(Charsets.UTF_8)
+        check(
+            sodium.cryptoPwHash(
+                out, out.size,
+                pwBytes, pwBytes.size,
+                salt,
+                PwHash.OPSLIMIT_INTERACTIVE,
+                PwHash.MEMLIMIT_INTERACTIVE,
+                PwHash.Alg.PWHASH_ALG_ARGON2ID13,
+            )
+        ) { "password hashing failed" }
+        return b64u(out)
     }
 
     fun saltForUser(username: String): String {

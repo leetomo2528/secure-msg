@@ -1,5 +1,11 @@
 # 업데이트 내역
 
+## v0.4.2 (2026-08-05)
+
+- **Android 로그인·가입 불가 버그 수정**: Lazysodium의 String `cryptoPwHash` 오버로드가 결과를 표준 base64(`+`, `/`, `=`)로 인코딩해, base64url만 허용하는 서버(`B64U_RE = [A-Za-z0-9_-]+`)가 `pw_hash must be base64url for 32 bytes`로 거부하던 문제. raw 버퍼 오버로드로 교체 후 웹과 동일하게 url-safe base64(패딩 없음)로 인코딩 (CryptoUtil.kt)
+- 인코딩 계약 회귀 테스트 추가(CryptoEncodingTest): 32바이트 → 43자 url-safe, `+`/`/`/`=` 불가, 라운드트립 — Android 테스트 25개 전부 통과
+- Android versionCode 7 / versionName 0.4.2
+
 ## v0.4.1 (2026-08-05)
 
 - 비밀번호 정책 명시: **총 8자 이상, 영문·숫자·특수문자 자유롭게 조합 가능** (문자 종류·조합 제한 없음). 웹/Android 입력 라벨·오류 메시지 갱신
