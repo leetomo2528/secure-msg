@@ -30,6 +30,11 @@ object BlocklistSync {
     fun load(context: Context = SecureMsgApp.instance): SharedRules {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY, null) ?: return SharedRules(emptyList(), emptyList(), emptyMap())
+        return parseRules(raw)
+    }
+
+    /** Pure parser (unit-testable without Android context). */
+    fun parseRules(raw: String): SharedRules {
         return try {
             val obj = JSONObject(raw)
             val keywords = mutableListOf<String>()
@@ -49,7 +54,6 @@ object BlocklistSync {
             }
             SharedRules(keywords, senders, ids)
         } catch (e: Exception) {
-            Log.w(TAG, "failed to parse cached shared rules", e)
             SharedRules(emptyList(), emptyList(), emptyMap())
         }
     }

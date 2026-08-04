@@ -47,15 +47,8 @@ object BlocklistManager {
     }
 
     /** Digit-based match so +82-10-… and 010… forms of the same number hit. */
-    private fun senderMatches(incoming: String, blocked: String): Boolean {
-        val a = incoming.replace(Regex("[^0-9*#]"), "")
-        val b = blocked.replace(Regex("[^0-9*#]"), "")
-        if (a.isEmpty() || b.isEmpty()) return false
-        if (a == b) return true
-        val tailA = a.takeLast(9)
-        val tailB = b.takeLast(9)
-        return tailA.length >= 9 && tailB.length >= 9 && tailA == tailB
-    }
+    fun senderMatches(incoming: String, blocked: String): Boolean =
+        SenderMatcher.matches(incoming, blocked)
 
     suspend fun shouldBlock(plaintext: String, db: AppDatabase): Boolean {
         return evaluate("", plaintext, db).blocked

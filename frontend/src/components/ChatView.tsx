@@ -46,7 +46,8 @@ export default function ChatView({ cid }: { cid: string }) {
     setExportMenu(false);
     const rows = activeMessages.filter((m) => !m.blocked);
     const stamp = new Date().toISOString().slice(0, 10);
-    const base = `securemsg-${title.replace(/[^\w+\-]/g, "_")}-${stamp}`;
+    // Keep unicode letters/digits (Korean names) in the filename.
+    const base = `securemsg-${title.replace(/[^\p{L}\p{N}_+\-]/gu, "_")}-${stamp}`;
     if (format === "json") {
       const payload = rows.map((m: MessageRow) => ({
         seq: m.seq,
