@@ -91,6 +91,24 @@ def init_schema() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_android_gateway_per_user "
             "ON devices(user_id) WHERE kind = 'android_gateway'"
         )
+        # Cross-device shared block rules (v0.6.0). Values are user-entered
+        # filter strings, synced per user; each device still applies them
+        # locally to plaintext after decryption.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS block_rules (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type       TEXT    NOT NULL CHECK(type IN ('keyword', 'sender')),
+                value      TEXT    NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE (user_id, type, value)
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_block_rules_user ON block_rules(user_id)"
+        )
 
 
 def now() -> int:
@@ -521,3 +539,67 @@ def set_cursor(device_id: int, conv_id: int, last_seq: int) -> None:
             "last_seq = MAX(delivery_cursors.last_seq, excluded.last_seq)",
             (device_id, conv_id, last_seq),
         )
+
+
+# ----- shared block rules (cross-device sync) ---------------------------
+
+
+def list_block_rules(user_id: int) -> list[dict[str, Any]]:
+    with conn_ctx() as c:
+        rows = c.execute(
+            "SELECT id, type, value, created_at FROM block_rules "
+            "WHERE user_id = ? ORDER BY created_at ASC, id ASC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def add_block_rule(user_id: int, rule_type: str, value: str) -> dict[str, Any]:
+    """Insert-or-keep a rule; always returns the canonical stored row."""
+    with conn_ctx() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO block_rules(user_id, type, value, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, rule_type, value, now()),
+        )
+        row = c.execute(
+            "SELECT id, type, value, created_at FROM block_rules "
+            "WHERE user_id = ? AND type = ? AND value = ?",
+            (user_id, rule_type, value),
+        ).fetchone()
+        return dict(row)
+
+
+def remove_block_rule(user_id: int, rule_id: int) -> bool:
+    with conn_ctx() as c:
+        cur = c.execute(
+            "DELETE FROM block_rules WHERE id = ? AND user_id = ?",
+            (rule_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+# ----- conversation rename ----------------------------------------------
+
+
+def update_conversation_name(conv_id: int, name: str) -> None:
+    with conn_ctx() as c:
+        c.execute("UPDATE conversations SET name = ? WHERE id = ?", (name, conv_id))
+
+
+def list_member_user_ids(conv_id: int) -> list[int]:
+    with conn_ctx() as c:
+        rows = c.execute(
+            "SELECT user_id FROM conversation_members WHERE conv_id = ?",
+            (conv_id,),
+        ).fetchall()
+        return [int(r["user_id"]) for r in rows]
+
+
+def list_user_device_sids(user_id: int) -> list[str]:
+    with conn_ctx() as c:
+        rows = c.execute(
+            "SELECT sid FROM devices WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        return [str(r["sid"]) for r in rows]

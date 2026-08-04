@@ -14,6 +14,7 @@ import store
 from auth import _err, _ok, auth_required
 from flask import Blueprint, g, jsonify, request
 from rate_limit import check as rate_limit
+from sockets import emit_to_conv_members
 
 bp = Blueprint("conv", __name__, url_prefix="/api")
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
@@ -73,6 +74,36 @@ def create_conversation():
         )
     conv_id = store.create_conversation_with_members(cid, name, unique_user_ids)
     return _ok(cid=cid, conv_id=conv_id, members=members, name=name, created=True)
+
+
+@bp.post("/conversation/rename")
+@auth_required
+def rename_conversation():
+    """Body: { cid, name } -> { cid, name }. Members only. Fan-out notifies
+    all member devices to refresh the conversation label."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _err("JSON object required", 400)
+    retry_after = rate_limit("conversation-rename", g.auth["sid"], 30, 60)
+    if retry_after:
+        response = jsonify({"ok": False, "error": "too many requests"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+    cid = body.get("cid")
+    raw_name = body.get("name", "")
+    if not isinstance(cid, str) or not cid:
+        return _err("cid required", 400)
+    if not isinstance(raw_name, str):
+        return _err("name must be a string", 400)
+    name = raw_name.strip()[:100]
+    conv = store.get_conversation_by_cid(cid)
+    if not conv:
+        return _err("conversation not found", 404)
+    if g.auth["uid"] not in store.list_member_user_ids(conv["id"]):
+        return _err("forbidden", 403)
+    store.update_conversation_name(conv["id"], name)
+    emit_to_conv_members(conv["id"], "conv_updated", {"cid": cid, "name": name})
+    return _ok(cid=cid, name=name)
 
 
 @bp.get("/conversations")

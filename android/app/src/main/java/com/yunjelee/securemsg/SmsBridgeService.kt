@@ -248,6 +248,7 @@ class SmsBridgeService : Service() {
                 startOutboxLoop()
                 scope.launch {
                     try {
+                        BlocklistSync.sync(this@SmsBridgeService, relayApi)
                         syncFromServer()
                         incomingMutex.withLock {
                             importRecentInbox()
@@ -272,6 +273,30 @@ class SmsBridgeService : Service() {
                 }
             }
             client.onMessageNew = { env -> handleRelayMessage(env) }
+            client.onBlocklistUpdated = {
+                // Another device changed the shared block rules.
+                scope.launch {
+                    try {
+                        BlocklistSync.sync(this@SmsBridgeService, relayApi)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "blocklist sync failed", e)
+                    }
+                }
+            }
+            client.onConvUpdated = { data ->
+                val cid = data.optString("cid")
+                val name = data.optString("name")
+                if (cid.isNotBlank()) {
+                    scope.launch {
+                        try {
+                            AppDatabase.get(this@SmsBridgeService)
+                                .threadDao().updateNameByCid(cid, name)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "conv rename apply failed", e)
+                        }
+                    }
+                }
+            }
         }
         relay!!.connect(loaded.token)
         Log.i(TAG, "Bridge started for ${loaded.username}")

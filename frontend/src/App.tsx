@@ -7,6 +7,7 @@ import BlocklistEditor from "./components/BlocklistEditor";
 import DeviceManager from "./components/DeviceManager";
 import NewConversationModal from "./components/NewConversationModal";
 import BrandMark from "./components/BrandMark";
+import NotifyToggle from "./components/NotifyToggle";
 import { getThemeMode, setThemeMode, subscribeTheme, type ThemeMode } from "./theme";
 
 export default function App() {
@@ -57,6 +58,7 @@ export default function App() {
         <ChatList />
         <div className="mt-auto space-y-2 border-t border-fg/5 p-3">
           <NewConversationModal />
+          <NotifyToggle />
           <BlocklistEditor />
           <DeviceManager />
         </div>

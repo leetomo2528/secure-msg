@@ -66,6 +66,12 @@ export interface BlockRow {
   created_at: number;
 }
 
+export interface SenderRow {
+  id: string;
+  sender: string;
+  created_at: number;
+}
+
 interface SecureMsgDB extends DBSchema {
   meta: { key: "current"; value: MetaRow };
   devices: { key: string; value: DeviceRow; indexes: { "by-user": number } };
@@ -76,24 +82,31 @@ interface SecureMsgDB extends DBSchema {
   };
   cursors: { key: string; value: CursorRow };
   blocklist: { key: string; value: BlockRow; indexes: { "by-keyword": string } };
+  blockedSenders: { key: string; value: SenderRow; indexes: { "by-sender": string } };
 }
 
 let _db: Promise<IDBPDatabase<SecureMsgDB>> | null = null;
 
 export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
   if (!_db) {
-    _db = openDB<SecureMsgDB>("secure-msg", 1, {
-      upgrade(d) {
-        d.createObjectStore("meta");
-        const devices = d.createObjectStore("devices", { keyPath: "sid" });
-        devices.createIndex("by-user", "user_id");
-        const messages = d.createObjectStore("messages", { keyPath: "id" });
-        // We use a synthetic key `cid:seq` to dedupe. Store id = `${cid}:${seq}`.
-        messages.createIndex("by-cid", "cid");
-        messages.createIndex("by-cid-seq", ["cid", "seq"]);
-        d.createObjectStore("cursors", { keyPath: "cid" });
-        const block = d.createObjectStore("blocklist", { keyPath: "id" });
-        block.createIndex("by-keyword", "keyword");
+    _db = openDB<SecureMsgDB>("secure-msg", 2, {
+      upgrade(d, oldVersion) {
+        if (oldVersion < 1) {
+          d.createObjectStore("meta");
+          const devices = d.createObjectStore("devices", { keyPath: "sid" });
+          devices.createIndex("by-user", "user_id");
+          const messages = d.createObjectStore("messages", { keyPath: "id" });
+          // We use a synthetic key `cid:seq` to dedupe. Store id = `${cid}:${seq}`.
+          messages.createIndex("by-cid", "cid");
+          messages.createIndex("by-cid-seq", ["cid", "seq"]);
+          d.createObjectStore("cursors", { keyPath: "cid" });
+          const block = d.createObjectStore("blocklist", { keyPath: "id" });
+          block.createIndex("by-keyword", "keyword");
+        }
+        if (oldVersion < 2) {
+          const senders = d.createObjectStore("blockedSenders", { keyPath: "id" });
+          senders.createIndex("by-sender", "sender");
+        }
       },
     });
   }
@@ -313,4 +326,72 @@ export async function removeBlockKeyword(id: string): Promise<void> {
 export async function listBlockKeywords(): Promise<BlockRow[]> {
   const d = await db();
   return await d.getAll("blocklist");
+}
+
+/** Insert/overwrite a keyword row with an explicit id (server-synced rows
+ * use `srv:<server_id>` so removals can be mapped back to the server). */
+export async function putBlockKeywordRow(row: BlockRow): Promise<void> {
+  const d = await db();
+  await d.put("blocklist", row);
+}
+
+export async function clearBlockKeywords(): Promise<void> {
+  const d = await db();
+  await d.clear("blocklist");
+}
+
+// ----- blocked senders (shared, synced via server) -----------------------
+
+export async function addBlockedSender(sender: string): Promise<SenderRow> {
+  const d = await db();
+  const normalized = sender.trim();
+  if (!normalized) throw new Error("sender is empty");
+  const tx = d.transaction("blockedSenders", "readwrite");
+  const existing = await tx.store.index("by-sender").get(normalized);
+  if (existing) return existing;
+  const row: SenderRow = {
+    id: crypto.randomUUID(),
+    sender: normalized,
+    created_at: Date.now(),
+  };
+  await tx.store.put(row);
+  await tx.done;
+  return row;
+}
+
+export async function removeBlockedSender(id: string): Promise<void> {
+  const d = await db();
+  await d.delete("blockedSenders", id);
+}
+
+export async function listBlockedSenders(): Promise<SenderRow[]> {
+  const d = await db();
+  return await d.getAll("blockedSenders");
+}
+
+export async function putBlockedSenderRow(row: SenderRow): Promise<void> {
+  const d = await db();
+  await d.put("blockedSenders", row);
+}
+
+export async function clearBlockedSenders(): Promise<void> {
+  const d = await db();
+  await d.clear("blockedSenders");
+}
+
+// ----- message search -----------------------------------------------------
+
+/** Case-insensitive substring search over stored decrypted messages.
+ * Returns newest-first, capped at `limit` rows. */
+export async function searchMessages(query: string, limit = 50): Promise<MessageRow[]> {
+  const q = query.trim().normalize("NFKC").toLowerCase();
+  if (!q) return [];
+  const all = await listAllMessages();
+  const hits = all.filter((m) => {
+    if (m.blocked) return false;
+    const hay = `${m.plaintext}\n${m.subject ?? ""}`.normalize("NFKC").toLowerCase();
+    return hay.includes(q);
+  });
+  hits.sort((a, b) => b.created_at - a.created_at);
+  return hits.slice(0, limit);
 }

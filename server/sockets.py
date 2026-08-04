@@ -33,8 +33,35 @@ from rate_limit import check as rate_limit
 log = logging.getLogger("securemsg.sockets")
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 
+_socketio_ref: SocketIO | None = None
+
+
+def emit_to_user_devices(
+    user_id: int, event: str, data: dict, exclude_sid: str | None = None
+) -> None:
+    """Fan an event out to every connected device of a user except one.
+
+    Used by REST mutations (shared block rules, conversation rename) so the
+    other devices of the same account refresh without waiting for a poll.
+    """
+    if _socketio_ref is None:
+        return
+    for sid in store.list_user_device_sids(user_id):
+        if sid == exclude_sid:
+            continue
+        _socketio_ref.emit(event, data, to=f"device:{sid}")
+
+
+def emit_to_conv_members(conv_id: int, event: str, data: dict) -> None:
+    if _socketio_ref is None:
+        return
+    for user_id in store.list_member_user_ids(conv_id):
+        emit_to_user_devices(user_id, event, data)
+
 
 def attach_socketio(app, socketio: SocketIO) -> None:
+    global _socketio_ref
+    _socketio_ref = socketio
     clients: dict[str, tuple[int, str, int, int]] = {}
 
     def current_client() -> tuple[int, str, int] | None:

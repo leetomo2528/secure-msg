@@ -184,6 +184,89 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun serverUrl(): String =
+        getSharedPreferences("securemsg_config", MODE_PRIVATE)
+            .getString("server_url", "https://msg.yunjelee.com") ?: "https://msg.yunjelee.com"
+
+    /** Push local block rules to the relay and refresh the shared cache (IO). */
+    private suspend fun pushBlockRulesToServer() {
+        try {
+            val saved = Credentials.load(this@MainActivity) ?: return
+            val api = RelayApi(serverUrl()).also { it.token = saved.token }
+            BlocklistSync.sync(this@MainActivity, api)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "block rule push failed", e)
+        }
+    }
+
+    /** Remove a rule server-side after local deletion (IO). */
+    private suspend fun removeBlockRuleOnServer(type: String, value: String) {
+        try {
+            val saved = Credentials.load(this@MainActivity) ?: return
+            val api = RelayApi(serverUrl()).also { it.token = saved.token }
+            BlocklistSync.removeShared(this@MainActivity, api, type, value)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "block rule remove failed", e)
+        }
+    }
+
+    /** Debug-only: inject a fake incoming SMS through the real receive
+     * pipeline (block check -> provider write -> notification -> bridge
+     * relay), so SIM-less devices can verify phone->web interlock. */
+    private fun simulateIncomingSms() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val ctx = this@MainActivity
+                val sender = "+821000000001"
+                val body = "SecureMsg 수신 시뮬레이션 " +
+                    java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.KOREA)
+                        .format(java.util.Date())
+                val db = AppDatabase.get(ctx)
+                val decision = BlocklistManager.evaluate(sender, body, db)
+                if (decision.blocked) {
+                    db.blockedSmsDao().insert(
+                        BlockedSms(
+                            phoneNumber = sender, body = body,
+                            reason = decision.reason, receivedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(
+                            ctx, "차단 규칙에 걸려 격리됨: ${decision.reason}",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                    return@launch
+                }
+                val receivedAt = System.currentTimeMillis()
+                val providerId = SmsProvider.insertIncoming(ctx, sender, body, receivedAt)
+                SmsNotifier.notifyIncoming(ctx, sender, body, receivedAt)
+                val intent = Intent(ctx, SmsBridgeService::class.java).apply {
+                    action = SmsBridgeService.ACTION_INCOMING_SMS
+                    putExtra(SmsBridgeService.EXTRA_PHONE, sender)
+                    putExtra(SmsBridgeService.EXTRA_BODY, body)
+                    putExtra(SmsBridgeService.EXTRA_PROVIDER_ID, providerId ?: -1L)
+                    putExtra(SmsBridgeService.EXTRA_RECEIVED_AT, receivedAt)
+                }
+                androidx.core.content.ContextCompat.startForegroundService(ctx, intent)
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(
+                        ctx, "시뮬레이션 SMS 주입 완료 — 웹에서 확인하세요",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "SMS simulation failed", e)
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(
+                        this@MainActivity, "시뮬레이션 실패: ${e.message}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
     @Composable
     private fun LoginScreen(
         rememberedUsername: String?,
@@ -621,7 +704,7 @@ class MainActivity : ComponentActivity() {
                         fontWeight = FontWeight.Medium,
                     )
                     Text(
-                        "문자 내용은 이 기기에서 복호화한 뒤 검사하며 서버에는 평문으로 보내지 않습니다.",
+                        "키워드·발신번호는 모든 기기에 동기화됩니다. 문자 내용은 이 기기에서 복호화한 뒤 검사하며 서버에는 평문으로 보내지 않습니다.",
                         color = Color(0xFF64748B),
                         fontSize = 11.sp,
                     )
@@ -639,6 +722,7 @@ class MainActivity : ComponentActivity() {
                             if (keyword.isNotEmpty()) {
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     db.blocklistDao().insert(BlockKeyword(keyword = keyword))
+                                    pushBlockRulesToServer()
                                     withContext(Dispatchers.Main) { newKw = "" }
                                 }
                             }
@@ -654,6 +738,7 @@ class MainActivity : ComponentActivity() {
                             TextButton(onClick = {
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     db.blocklistDao().delete(keyword)
+                                    removeBlockRuleOnServer("keyword", keyword.keyword)
                                 }
                             }) { Text("삭제", color = Color(0xFFEF4444)) }
                         }
@@ -684,6 +769,7 @@ class MainActivity : ComponentActivity() {
                             if (Regex("^\\+?[0-9*#]{3,24}$").matches(number)) {
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     db.blockedSenderDao().insert(BlockedSender(number))
+                                    pushBlockRulesToServer()
                                     withContext(Dispatchers.Main) { newBlockedPhone = "" }
                                 }
                             } else {
@@ -701,9 +787,30 @@ class MainActivity : ComponentActivity() {
                             TextButton(onClick = {
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     db.blockedSenderDao().delete(sender)
+                                    removeBlockRuleOnServer("sender", sender.phoneNumber)
                                 }
                             }) { Text("삭제", color = Color(0xFFEF4444)) }
                         }
+                    }
+
+                    if (BuildConfig.DEBUG) {
+                        HorizontalDivider(color = Color(0xFF1E293B))
+                        Text(
+                            "개발자 도구",
+                            color = Color(0xFFE2E8F0),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            "SIM 없이 수신 경로를 검증합니다. 차단 판정 → 시스템 SMS 기록 → 알림 → 서버 relay까지 실제 코드 경로로 주입합니다.",
+                            color = Color(0xFF64748B),
+                            fontSize = 11.sp,
+                        )
+                        Button(
+                            onClick = { simulateIncomingSms() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF164E63)),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("SMS 수신 시뮬레이션 (+821000000001)") }
                     }
 
                     HorizontalDivider(color = Color(0xFF1E293B))

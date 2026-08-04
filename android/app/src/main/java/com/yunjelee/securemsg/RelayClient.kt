@@ -18,6 +18,8 @@ class RelayClient(val baseUrl: String) {
     var onConnect: (() -> Unit)? = null
     var onDisconnect: (() -> Unit)? = null
     var onConnectError: ((message: String) -> Unit)? = null
+    var onBlocklistUpdated: (() -> Unit)? = null
+    var onConvUpdated: ((data: JSONObject) -> Unit)? = null
     var token: String? = null
 
     fun connect(token: String) {
@@ -54,6 +56,14 @@ class RelayClient(val baseUrl: String) {
         socket?.on("message_new", Emitter.Listener { args ->
             if (args.isNotEmpty() && args[0] is JSONObject) {
                 onMessageNew?.invoke(args[0] as JSONObject)
+            }
+        })
+        socket?.on("blocklist_updated", Emitter.Listener {
+            onBlocklistUpdated?.invoke()
+        })
+        socket?.on("conv_updated", Emitter.Listener { args ->
+            if (args.isNotEmpty() && args[0] is JSONObject) {
+                onConvUpdated?.invoke(args[0] as JSONObject)
             }
         })
         socket?.connect()

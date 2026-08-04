@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
+import type { MessageRow } from "../store/db";
 import { Avatar } from "./ChatList";
 
 export default function ChatView({ cid }: { cid: string }) {
@@ -14,6 +15,69 @@ export default function ChatView({ cid }: { cid: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversation = conversations.find((item) => item.cid === cid);
   const title = conversation?.name || conversation?.members.join(", ") || "대화";
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [exportMenu, setExportMenu] = useState(false);
+  const renameConversation = useStore((s) => s.renameConversation);
+
+  const startRename = () => {
+    setNameDraft(conversation?.name ?? "");
+    setRenaming(true);
+  };
+
+  const commitRename = async () => {
+    setRenaming(false);
+    const next = nameDraft.trim().slice(0, 100);
+    if (!next || next === conversation?.name) return;
+    await renameConversation(cid, next);
+  };
+
+  const download = (filename: string, mime: string, content: string) => {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportMessages = (format: "csv" | "json") => {
+    setExportMenu(false);
+    const rows = activeMessages.filter((m) => !m.blocked);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const base = `securemsg-${title.replace(/[^\w+\-]/g, "_")}-${stamp}`;
+    if (format === "json") {
+      const payload = rows.map((m: MessageRow) => ({
+        seq: m.seq,
+        mine: m.sender_sid === sid,
+        text: m.plaintext,
+        subject: m.subject ?? undefined,
+        content_type: m.content_type ?? "text",
+        carrier_status: m.carrier_status,
+        created_at: new Date(m.created_at).toISOString(),
+      }));
+      download(`${base}.json`, "application/json", JSON.stringify({
+        conversation: title, exported_at: new Date().toISOString(), count: payload.length,
+        messages: payload,
+      }, null, 2));
+      return;
+    }
+    const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    const lines = [
+      ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
+      ...rows.map((m: MessageRow) => [
+        String(m.seq),
+        m.sender_sid === sid ? "sent" : "received",
+        esc(m.subject ?? ""),
+        esc(m.plaintext),
+        m.carrier_status ?? "",
+        new Date(m.created_at).toISOString(),
+      ].join(",")),
+    ];
+    // BOM so Excel reads UTF-8 (Korean) correctly.
+    download(`${base}.csv`, "text/csv;charset=utf-8", "\uFEFF" + lines.join("\n"));
+  };
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -84,9 +148,65 @@ export default function ChatView({ cid }: { cid: string }) {
         </button>
         <Avatar label={title} size="h-8 w-8 text-[11px]" />
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-tx-1">{title}</div>
+          {renaming ? (
+            <input
+              autoFocus
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={() => void commitRename()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); void commitRename(); }
+                if (e.key === "Escape") setRenaming(false);
+              }}
+              maxLength={100}
+              className="w-48 rounded-lg bg-fg/[0.05] px-2 py-1 text-sm font-semibold text-tx-1 ring-1 ring-accent-tx/40 focus:outline-none"
+              aria-label="대화 이름 변경"
+            />
+          ) : (
+            <div className="truncate text-sm font-semibold text-tx-1">{title}</div>
+          )}
           <div className="text-[10px] text-tx-4">
             {conversation?.name ? "SMS · Android 게이트웨이 경유 발신" : "E2E 암호화 대화"}
+          </div>
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            onClick={startRename}
+            title="대화 이름 변경"
+            aria-label="대화 이름 변경"
+            className="grid h-8 w-8 place-items-center rounded-lg text-tx-4 ring-1 ring-fg/10 transition hover:bg-fg/[0.06] hover:text-tx-1"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path d="M4 20l4.5-.9L20 7.6a2 2 0 0 0-2.8-2.8L5.7 16.3 4 20z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+            </svg>
+          </button>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setExportMenu((v) => !v)}
+              title="대화 내보내기"
+              aria-label="대화 내보내기"
+              className="grid h-8 w-8 place-items-center rounded-lg text-tx-4 ring-1 ring-fg/10 transition hover:bg-fg/[0.06] hover:text-tx-1"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
+                <path d="M12 4v10m0 0l-4-4m4 4l4-4M5 19h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {exportMenu && (
+              <div className="absolute right-0 top-9 z-30 w-36 overflow-hidden rounded-xl bg-night-soft shadow-bubble ring-1 ring-fg/10 animate-rise">
+                <button
+                  type="button"
+                  onClick={() => exportMessages("csv")}
+                  className="block w-full px-3 py-2 text-left text-xs text-tx-2 transition hover:bg-fg/[0.06]"
+                >CSV로 내보내기</button>
+                <button
+                  type="button"
+                  onClick={() => exportMessages("json")}
+                  className="block w-full px-3 py-2 text-left text-xs text-tx-2 transition hover:bg-fg/[0.06]"
+                >JSON으로 내보내기</button>
+              </div>
+            )}
           </div>
         </div>
       </div>

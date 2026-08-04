@@ -659,6 +659,159 @@ class ServerSmokeTest(unittest.TestCase):
         first_socket.disconnect()
         second_socket.disconnect()
 
+    # ----- shared block rules (cross-device sync) -----------------------
+
+    def add_rule(self, rule_type, value, headers=None):
+        return self.client.post(
+            "/api/blocklist",
+            headers=headers or self.headers,
+            json={"type": rule_type, "value": value},
+        )
+
+    def test_blocklist_add_list_remove_roundtrip(self):
+        added = self.add_rule("keyword", "광고")
+        self.assertEqual(added.status_code, 200, added.json)
+        rule_id = added.json["rule"]["id"]
+        added_sender = self.add_rule("sender", "+821012345678")
+        self.assertEqual(added_sender.status_code, 200, added_sender.json)
+
+        listed = self.client.get("/api/blocklist", headers=self.headers)
+        self.assertEqual(listed.status_code, 200, listed.json)
+        rules = listed.json["rules"]
+        self.assertEqual(len(rules), 2)
+        self.assertIn("keyword", {r["type"] for r in rules})
+        self.assertIn("sender", {r["type"] for r in rules})
+
+        removed = self.client.post(
+            "/api/blocklist/remove", headers=self.headers, json={"id": rule_id}
+        )
+        self.assertEqual(removed.status_code, 200, removed.json)
+        remaining = self.client.get("/api/blocklist", headers=self.headers).json["rules"]
+        self.assertEqual([r["type"] for r in remaining], ["sender"])
+
+    def test_blocklist_add_is_idempotent(self):
+        first = self.add_rule("keyword", "스팸")
+        second = self.add_rule("keyword", "스팸")
+        self.assertEqual(first.json["rule"]["id"], second.json["rule"]["id"])
+        rules = self.client.get("/api/blocklist", headers=self.headers).json["rules"]
+        self.assertEqual(len([r for r in rules if r["value"] == "스팸"]), 1)
+
+    def test_blocklist_rejects_invalid(self):
+        self.assertEqual(self.add_rule("bogus", "x").status_code, 400)
+        self.assertEqual(self.add_rule("keyword", "").status_code, 400)
+        self.assertEqual(self.add_rule("keyword", "x" * 121).status_code, 400)
+        self.assertEqual(self.add_rule("sender", "not-a-phone").status_code, 400)
+
+    def test_blocklist_is_per_user(self):
+        self.add_rule("keyword", "비밀")
+        other = self.client.post(
+            "/api/register",
+            json={"username": "blockpeer_" + self.username[-6:], "pw_hash": self.pw_hash},
+        )
+        self.assertEqual(other.status_code, 200, other.json)
+        other_device = self.client.post(
+            "/api/device-register",
+            json={
+                "username": other.json["username"],
+                "pw_hash": self.pw_hash,
+                "device_name": "peer",
+                "pub_key": "E" * 43,
+                "sig_pub": "F" * 43,
+            },
+        )
+        other_headers = {"Authorization": f"Bearer {other_device.json['token']}"}
+        peer_rules = self.client.get("/api/blocklist", headers=other_headers).json["rules"]
+        self.assertEqual(peer_rules, [])
+
+    def test_blocklist_add_fans_out_to_other_devices(self):
+        second = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "second",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            },
+        )
+        self.assertEqual(second.status_code, 200, second.json)
+        origin_socket = socketio.test_client(app, auth={"token": self.token})
+        other_socket = socketio.test_client(app, auth={"token": second.json["token"]})
+
+        added = self.add_rule("keyword", "홍보")
+        self.assertEqual(added.status_code, 200, added.json)
+
+        other_events = [
+            e for e in other_socket.get_received() if e["name"] == "blocklist_updated"
+        ]
+        origin_events = [
+            e for e in origin_socket.get_received() if e["name"] == "blocklist_updated"
+        ]
+        self.assertEqual(len(other_events), 1, other_events)
+        self.assertEqual(other_events[0]["args"][0]["action"], "add")
+        self.assertEqual(other_events[0]["args"][0]["rule"]["value"], "홍보")
+        # The device that made the change must not be notified about itself.
+        self.assertEqual(origin_events, [])
+        origin_socket.disconnect()
+        other_socket.disconnect()
+
+    # ----- conversation rename ------------------------------------------
+
+    def test_rename_conversation_updates_and_fans_out(self):
+        created = self.create_conversation("+821055556666")
+        second = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "second",
+                "pub_key": "G" * 43,
+                "sig_pub": "H" * 43,
+            },
+        )
+        self.assertEqual(second.status_code, 200, second.json)
+        other_socket = socketio.test_client(app, auth={"token": second.json["token"]})
+
+        renamed = self.client.post(
+            "/api/conversation/rename",
+            headers=self.headers,
+            json={"cid": created["cid"], "name": "엄마"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.json)
+
+        listed = self.client.get("/api/conversations", headers=self.headers).json
+        self.assertEqual(listed["conversations"][0]["name"], "엄마")
+
+        events = [e for e in other_socket.get_received() if e["name"] == "conv_updated"]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["args"][0]["cid"], created["cid"])
+        self.assertEqual(events[0]["args"][0]["name"], "엄마")
+        other_socket.disconnect()
+
+    def test_rename_forbidden_for_non_member(self):
+        created = self.create_conversation("+821077778888")
+        other = self.client.post(
+            "/api/register",
+            json={"username": "renamer_" + self.username[-6:], "pw_hash": self.pw_hash},
+        )
+        other_device = self.client.post(
+            "/api/device-register",
+            json={
+                "username": other.json["username"],
+                "pw_hash": self.pw_hash,
+                "device_name": "peer",
+                "pub_key": "I" * 43,
+                "sig_pub": "J" * 43,
+            },
+        )
+        other_headers = {"Authorization": f"Bearer {other_device.json['token']}"}
+        renamed = self.client.post(
+            "/api/conversation/rename",
+            headers=other_headers,
+            json={"cid": created["cid"], "name": "hack"},
+        )
+        self.assertEqual(renamed.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -160,6 +160,9 @@ interface ThreadDao {
 
     @Query("UPDATE sms_threads SET lastSeq = MAX(lastSeq, :seq) WHERE cid = :cid")
     suspend fun advanceLastSeq(cid: String, seq: Int)
+
+    @Query("UPDATE sms_threads SET contactName = :name WHERE cid = :cid")
+    suspend fun updateNameByCid(cid: String, name: String)
 }
 
 @Dao
@@ -240,6 +243,9 @@ interface BlockedSmsDao {
 interface BlockedSenderDao {
     @Query("SELECT * FROM blocked_senders ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<BlockedSender>>
+
+    @Query("SELECT * FROM blocked_senders")
+    suspend fun getAll(): List<BlockedSender>
 
     @Query("SELECT EXISTS(SELECT 1 FROM blocked_senders WHERE phoneNumber = :phone)")
     suspend fun contains(phone: String): Boolean

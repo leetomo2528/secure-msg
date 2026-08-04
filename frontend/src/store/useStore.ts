@@ -15,6 +15,7 @@ import {
   sendMessage,
   type ServerMessage,
   type ConvMember,
+  type BlockRule,
 } from "../net/api";
 import {
   initCrypto,
@@ -46,12 +47,31 @@ import {
   addBlockKeyword,
   removeBlockKeyword,
   listBlockKeywords,
+  putBlockKeywordRow,
+  clearBlockKeywords,
+  addBlockedSender,
+  removeBlockedSender,
+  listBlockedSenders,
+  putBlockedSenderRow,
+  clearBlockedSenders,
   type MessageRow,
   type BlockRow,
+  type SenderRow,
   type MessageAttachment,
 } from "./db";
 import { applyBlock, matchBlockKeywords } from "./blocklist";
 import { normalizePhone, ownedSmsPhone } from "./conversationPolicy";
+
+const NOTIFY_PREF_KEY = "securemsg-notify";
+
+function readNotifyPref(): boolean {
+  try {
+    return typeof localStorage !== "undefined"
+      && localStorage.getItem(NOTIFY_PREF_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export interface Conversation {
   cid: string;
@@ -81,6 +101,8 @@ interface State {
   activeCid: string | null;
   activeMessages: MessageRow[];
   blockKeywords: BlockRow[];
+  blockedSenders: SenderRow[];
+  notifyEnabled: boolean;
   deviceCache: Map<string, ConvMember>; // sid -> member info
   error: string | null;
 
@@ -100,7 +122,12 @@ interface State {
   sendContent: (cid: string, content: RelayContent) => Promise<boolean>;
   addBlock: (kw: string) => Promise<void>;
   removeBlock: (id: string) => Promise<void>;
+  addBlockedSenderRule: (sender: string) => Promise<void>;
+  removeBlockedSenderRule: (id: string) => Promise<void>;
   refreshBlocklist: () => Promise<void>;
+  syncBlockRules: () => Promise<void>;
+  renameConversation: (cid: string, name: string) => Promise<boolean>;
+  setNotifyEnabled: (enabled: boolean) => Promise<void>;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -115,6 +142,8 @@ export const useStore = create<State>((set, get) => ({
   activeCid: null,
   activeMessages: [],
   blockKeywords: [],
+  blockedSenders: [],
+  notifyEnabled: readNotifyPref(),
   deviceCache: new Map(),
   error: null,
 
@@ -343,8 +372,20 @@ export const useStore = create<State>((set, get) => ({
     if (!me.sid || !me.keypair) return;
     const mySid = me.sid;
     const myKeypair = me.keypair;
+    // Sender blocking: an SMS thread's carrier messages arrive via the Android
+    // gateway device. If the thread's phone number is blocked, hide them.
+    const conv = useStore.getState().conversations.find((c) => c.cid === cid);
+    const smsPhone = conv ? ownedSmsPhone(conv, useStore.getState().username) : null;
+    const senderBlocked = smsPhone != null
+      && matchesBlockedSender(smsPhone, await listBlockedSenders());
+    const gatewaySids = new Set(
+      mr.members.filter((m) => m.kind === "android_gateway").map((m) => m.sid),
+    );
     const pageSize = 200;
     let cursor = await getCursor(cid);
+    const startCursor = cursor;
+    let notifyBody: string | null = null;
+    let notifyIsIncoming = false;
     while (true) {
       // Abort if the user logged out or switched accounts mid-sync; otherwise
       // decrypted rows would be written back after clearSessionData().
@@ -369,11 +410,19 @@ export const useStore = create<State>((set, get) => ({
         );
         if (plaintext == null) continue;
         const content = decodeRelayContent(plaintext);
-        const shouldShow = await applyBlock(
+        let shouldShow = await applyBlock(
           cid,
           sm.seq,
           [content.subject, content.text].filter(Boolean).join("\n"),
         );
+        if (shouldShow && senderBlocked && gatewaySids.has(sm.sender_sid)) {
+          await setBlocked(cid, sm.seq, true);
+          shouldShow = false;
+        }
+        if (shouldShow && sm.seq > startCursor && sm.sender_sid !== mySid) {
+          notifyBody = content.text || content.subject || "(첨부파일)";
+          notifyIsIncoming = true;
+        }
         await putMessage({
           id: "", seq: sm.seq, cid, sender_id: sm.sender_id,
           sender_sid: sm.sender_sid, plaintext: content.text, created_at: sm.created_at * 1000,
@@ -396,6 +445,9 @@ export const useStore = create<State>((set, get) => ({
     // user may have switched conversations while pages were being pulled.
     if (useStore.getState().activeCid === cid) {
       set({ activeMessages: await listMessages(cid) });
+    }
+    if (notifyIsIncoming && notifyBody != null) {
+      maybeNotify(conv?.name || "새 메시지", notifyBody, gatewaySids.size > 0);
     }
   },
 
@@ -508,24 +560,144 @@ export const useStore = create<State>((set, get) => ({
   },
 
   addBlock: async (kw) => {
-    await addBlockKeyword(kw);
+    // Apply locally first (instant UI), then share with the other devices.
+    const row = await addBlockKeyword(kw);
     await get().refreshBlocklist();
     await reapplyBlocklist();
+    const r = await api.addBlockRule("keyword", row.keyword);
+    if (r.ok && r.rule) {
+      await removeBlockKeyword(row.id);
+      await putBlockKeywordRow(ruleToKeywordRow(r.rule));
+      await get().refreshBlocklist();
+    } // offline/failed: keep the local row; syncBlockRules pushes it later
   },
 
   removeBlock: async (id) => {
+    if (id.startsWith("srv:")) {
+      const r = await api.removeBlockRule(Number(id.slice(4)));
+      if (!r.ok) {
+        set({ error: r.error || "차단 키워드를 삭제하지 못했습니다" });
+        return;
+      }
+    }
     await removeBlockKeyword(id);
     await get().refreshBlocklist();
     await reapplyBlocklist();
   },
 
+  addBlockedSenderRule: async (sender) => {
+    const row = await addBlockedSender(sender);
+    await get().refreshBlocklist();
+    await reapplyBlocklist();
+    const r = await api.addBlockRule("sender", row.sender);
+    if (r.ok && r.rule) {
+      await removeBlockedSender(row.id);
+      await putBlockedSenderRow(ruleToSenderRow(r.rule));
+      await get().refreshBlocklist();
+    }
+  },
+
+  removeBlockedSenderRule: async (id) => {
+    if (id.startsWith("srv:")) {
+      const r = await api.removeBlockRule(Number(id.slice(4)));
+      if (!r.ok) {
+        set({ error: r.error || "차단 번호를 삭제하지 못했습니다" });
+        return;
+      }
+    }
+    await removeBlockedSender(id);
+    await get().refreshBlocklist();
+    await reapplyBlocklist();
+  },
+
   refreshBlocklist: async () => {
-    set({ blockKeywords: await listBlockKeywords() });
+    set({
+      blockKeywords: await listBlockKeywords(),
+      blockedSenders: await listBlockedSenders(),
+    });
+  },
+
+  /** Reconcile local block rules with the server (server wins). Pushes any
+   * local-only rules first, then replaces local copies with the server set. */
+  syncBlockRules: async () => {
+    if (!api.token) return;
+    const list = await api.listBlockRules();
+    if (!list.ok || !list.rules) return; // offline: keep local rules as-is
+    const serverKeywords = new Map<string, BlockRule>(
+      list.rules.filter((r) => r.type === "keyword").map((r) => [r.value, r]),
+    );
+    const serverSenders = new Map<string, BlockRule>(
+      list.rules.filter((r) => r.type === "sender").map((r) => [r.value, r]),
+    );
+    for (const row of await listBlockKeywords()) {
+      if (row.id.startsWith("srv:")) continue;
+      const r = await api.addBlockRule("keyword", row.keyword);
+      if (r.ok && r.rule) serverKeywords.set(r.rule.value, r.rule);
+    }
+    for (const row of await listBlockedSenders()) {
+      if (row.id.startsWith("srv:")) continue;
+      const r = await api.addBlockRule("sender", row.sender);
+      if (r.ok && r.rule) serverSenders.set(r.rule.value, r.rule);
+    }
+    await clearBlockKeywords();
+    for (const rule of serverKeywords.values()) {
+      await putBlockKeywordRow(ruleToKeywordRow(rule));
+    }
+    await clearBlockedSenders();
+    for (const rule of serverSenders.values()) {
+      await putBlockedSenderRow(ruleToSenderRow(rule));
+    }
+    await get().refreshBlocklist();
+  },
+
+  renameConversation: async (cid, name) => {
+    const r = await api.renameConversation(cid, name);
+    if (!r.ok) {
+      set({ error: r.error || "대화 이름을 변경하지 못했습니다" });
+      return false;
+    }
+    set({
+      conversations: get().conversations.map((c) =>
+        c.cid === cid ? { ...c, name } : c,
+      ),
+    });
+    return true;
+  },
+
+  setNotifyEnabled: async (enabled) => {
+    if (!enabled) {
+      try { localStorage.removeItem(NOTIFY_PREF_KEY); } catch { /* ignore */ }
+      set({ notifyEnabled: false });
+      return;
+    }
+    if (typeof Notification === "undefined") {
+      set({ error: "이 브라우저는 데스크톱 알림을 지원하지 않습니다" });
+      return;
+    }
+    let permission = Notification.permission;
+    if (permission === "default") permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      set({ error: "알림 권한이 거부되어 있습니다" });
+      return;
+    }
+    try { localStorage.setItem(NOTIFY_PREF_KEY, "1"); } catch { /* ignore */ }
+    set({ notifyEnabled: true });
   },
 }));
 
+function ruleToKeywordRow(rule: BlockRule): BlockRow {
+  return { id: `srv:${rule.id}`, keyword: rule.value, created_at: rule.created_at * 1000 };
+}
+
+function ruleToSenderRow(rule: BlockRule): SenderRow {
+  return { id: `srv:${rule.id}`, sender: rule.value, created_at: rule.created_at * 1000 };
+}
+
 async function postLogin(): Promise<void> {
   const me = useStore.getState();
+  await me.refreshBlocklist();
+  // Pull shared block rules from the server (and push any local-only ones).
+  await me.syncBlockRules().catch(() => undefined);
   await me.refreshBlocklist();
   await me.refreshConversations();
   if (!api.token) return;
@@ -536,9 +708,14 @@ async function postLogin(): Promise<void> {
   socket.off("message_new");
   socket.off("message_status");
   socket.off("typing");
+  socket.off("blocklist_updated");
+  socket.off("conv_updated");
   const syncAll = async () => {
     const state = useStore.getState();
     useStore.setState({ error: null });
+    await state.syncBlockRules().catch(() => undefined);
+    await state.refreshBlocklist();
+    await state.refreshConversations();
     for (const conv of state.conversations) {
       await queueConversationSync(conv.cid);
     }
@@ -581,6 +758,16 @@ async function postLogin(): Promise<void> {
     // Surface typing state via a separate lightweight subscription.
     // no-op; UI can subscribe via socket directly if needed.
   });
+  socket.on("blocklist_updated", async () => {
+    // Another device of the same account changed the shared block rules.
+    const state = useStore.getState();
+    await state.syncBlockRules().catch(() => undefined);
+    await state.refreshBlocklist();
+    await reapplyBlocklist();
+  });
+  socket.on("conv_updated", async () => {
+    await useStore.getState().refreshConversations();
+  });
   if (socket.connected) await syncAll();
 }
 
@@ -600,18 +787,56 @@ function queueConversationSync(cid: string): Promise<void> {
 
 async function reapplyBlocklist(): Promise<void> {
   const keywords = await listBlockKeywords();
+  const senders = await listBlockedSenders();
+  const username = useStore.getState().username;
+  const senderBlockByCid = new Map<string, boolean>();
+  for (const conv of useStore.getState().conversations) {
+    const phone = ownedSmsPhone(conv, username);
+    if (phone && matchesBlockedSender(phone, senders)) senderBlockByCid.set(conv.cid, true);
+  }
   const messages = await listAllMessages();
   for (const message of messages) {
     const result = matchBlockKeywords(
       [message.subject, message.plaintext].filter(Boolean).join("\n"),
       keywords,
     );
-    if (Boolean(message.blocked) !== result.blocked) {
-      await setBlocked(message.cid, message.seq, result.blocked);
+    const blocked = result.blocked || (senderBlockByCid.get(message.cid) ?? false);
+    if (Boolean(message.blocked) !== blocked) {
+      await setBlocked(message.cid, message.seq, blocked);
     }
   }
   const cid = useStore.getState().activeCid;
   if (cid) useStore.setState({ activeMessages: await listMessages(cid) });
+}
+
+/** Compare phone numbers by digits only (handles +82 vs 0082 vs separators). */
+function matchesBlockedSender(phone: string, senders: SenderRow[]): boolean {
+  const digits = phone.replace(/[^\d*#]/g, "");
+  for (const row of senders) {
+    const blockedDigits = row.sender.replace(/[^\d*#]/g, "");
+    if (!blockedDigits) continue;
+    if (digits === blockedDigits
+      || digits.endsWith(blockedDigits.replace(/^\+/, ""))
+      || blockedDigits.replace(/^00/, "").replace(/^\+/, "") === digits.replace(/^00/, "")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Desktop notification for a freshly arrived incoming message. */
+function maybeNotify(title: string, body: string, _isSms: boolean): void {
+  const state = useStore.getState();
+  if (!state.notifyEnabled) return;
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  if (typeof document !== "undefined" && document.visibilityState === "visible"
+      && document.hasFocus()) {
+    return; // user is already looking at the app
+  }
+  try {
+    const n = new Notification(title, { body, tag: `securemsg-${title}` });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch { /* notification construction can fail on some platforms */ }
 }
 
 function errorText(error: unknown): string {

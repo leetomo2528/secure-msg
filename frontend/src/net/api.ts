@@ -37,6 +37,23 @@ export interface ConvMember {
   sid: string;
   name: string;
   pub_key: string;
+  kind?: "web" | "android_gateway";
+}
+
+export type BlockRuleType = "keyword" | "sender";
+
+export interface BlockRule {
+  id: number;
+  type: BlockRuleType;
+  value: string;
+  created_at: number;
+}
+
+export interface BlocklistResult {
+  ok: boolean;
+  rules?: BlockRule[];
+  rule?: BlockRule;
+  error?: string;
 }
 
 export interface ServerMessage {
@@ -130,6 +147,16 @@ export class Api {
   }
   listDevices() { return this.get("/devices"); }
   deviceRevoke(sid: string) { return this.post("/device-revoke", { sid }); }
+  listBlockRules(): Promise<BlocklistResult> { return this.get("/blocklist"); }
+  addBlockRule(type: BlockRuleType, value: string): Promise<BlocklistResult> {
+    return this.post("/blocklist", { type, value });
+  }
+  removeBlockRule(id: number): Promise<BlocklistResult> {
+    return this.post("/blocklist/remove", { id });
+  }
+  renameConversation(cid: string, name: string): Promise<{ ok: boolean; cid?: string; name?: string; error?: string }> {
+    return this.post("/conversation/rename", { cid, name });
+  }
   createConversation(members: string[], name?: string) {
     return this.post("/conversation", { members, ...(name ? { name } : {}) });
   }
@@ -148,6 +175,12 @@ export const api = new Api();
 
 let _socket: Socket | null = null;
 let _socketToken: string | null = null;
+let _socketBase: string | undefined;
+
+/** Test/deploy override. Browsers derive the origin automatically. */
+export function setSocketBase(base: string | undefined): void {
+  _socketBase = base;
+}
 
 export function getSocket(token: string): Socket {
   if (_socket && _socketToken === token) return _socket;
@@ -155,7 +188,7 @@ export function getSocket(token: string): Socket {
     _socket.removeAllListeners();
     _socket.disconnect();
   }
-  _socket = io({
+  const options = {
     auth: { token },
     // Start with long-polling and upgrade when the complete proxy chain permits
     // WebSocket. Oracle's outer edge may reject an upgrade while polling works.
@@ -163,7 +196,8 @@ export function getSocket(token: string): Socket {
     reconnectionAttempts: Infinity,
     reconnectionDelay: 500,
     reconnectionDelayMax: 5000,
-  });
+  };
+  _socket = _socketBase ? io(_socketBase, options) : io(options);
   _socketToken = token;
   return _socket;
 }

@@ -19,6 +19,7 @@ import secrets
 import config
 import store
 from auth import bp as auth_bp
+from blocklist import bp as blocklist_bp
 from conversations import bp as conv_bp
 from flask import Flask
 from flask_socketio import SocketIO
@@ -61,6 +62,7 @@ def create_app() -> tuple[Flask, SocketIO]:
     store.init_schema()
     app.register_blueprint(auth_bp)
     app.register_blueprint(conv_bp)
+    app.register_blueprint(blocklist_bp)
     attach_socketio(app, socketio)
 
     @app.get("/health")

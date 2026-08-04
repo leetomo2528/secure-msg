@@ -91,6 +91,14 @@ class RelayApi(val baseUrl: String) {
     fun fetchMessages(cid: String, since: Int): JSONObject =
         get("/api/conversation/$cid/messages?since=$since&limit=500")
 
+    fun listBlockRules(): JSONObject = get("/api/blocklist")
+
+    fun addBlockRule(type: String, value: String): JSONObject =
+        post("/api/blocklist", JSONObject().put("type", type).put("value", value))
+
+    fun removeBlockRule(id: Long): JSONObject =
+        post("/api/blocklist/remove", JSONObject().put("id", id))
+
     companion object {
         private val HTTP = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)

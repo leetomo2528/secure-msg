@@ -1,6 +1,8 @@
 -- secure-msg server schema (SQLite)
 -- Server stores ONLY: opaque usernames, device public keys, encrypted envelopes.
--- Private keys, plaintext, and blocklist NEVER touch the server.
+-- Private keys and plaintext NEVER touch the server. Since v0.6 the server
+-- also stores user-entered block RULES (keyword/sender strings) so they can
+-- sync across devices — filter strings only, never message content.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
