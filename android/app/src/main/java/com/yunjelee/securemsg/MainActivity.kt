@@ -31,13 +31,31 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+sealed interface UpdateUiState {
+    data object Idle : UpdateUiState
+    data object Checking : UpdateUiState
+    data class Available(val info: UpdateInfo) : UpdateUiState
+    data class Downloading(val info: UpdateInfo, val pct: Int) : UpdateUiState
+    data class Ready(val info: UpdateInfo, val file: File) : UpdateUiState
+    data class NeedsPermission(val info: UpdateInfo, val file: File) : UpdateUiState
+    data class Failed(val message: String, val info: UpdateInfo?) : UpdateUiState
+}
 
 class MainActivity : ComponentActivity() {
 
     private var smsRoleHeld by mutableStateOf(false)
     private var smsPermissionsGranted by mutableStateOf(false)
+
+    // In-app self-update (game-style: detect → download → install prompt)
+    private val updater by lazy { AppUpdater(applicationContext, AppUpdater.buildHttp()) }
+    private var updateState by mutableStateOf<UpdateUiState>(UpdateUiState.Idle)
+    private var updateMessage by mutableStateOf<String?>(null)
+    private var autoUpdateEnabled by mutableStateOf(true)
+    private var pendingInstallFile: File? = null
 
     private val permsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -95,6 +113,106 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
+        autoUpdateEnabled = updater.autoCheckEnabled()
+        // The user may have just toggled "install unknown apps" in system settings.
+        val pending = pendingInstallFile
+        if (pending != null && updater.canInstallPackages()) {
+            pendingInstallFile = null
+            startActivity(updater.installIntent(pending))
+        }
+    }
+
+    private fun checkForUpdates(manual: Boolean) {
+        val state = updateState
+        if (state is UpdateUiState.Checking || state is UpdateUiState.Downloading) return
+        updateState = UpdateUiState.Checking
+        if (manual) updateMessage = "GitHub 릴리스 확인 중…"
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = updater.check()
+            withContext(Dispatchers.Main) {
+                when (result) {
+                    is UpdateCheckResult.Available -> {
+                        updateMessage = "새 버전 v${result.info.versionName} 사용 가능합니다."
+                        updateState = UpdateUiState.Available(result.info)
+                    }
+                    is UpdateCheckResult.UpToDate -> {
+                        updateMessage = "최신 버전입니다 (v${BuildConfig.VERSION_NAME})."
+                        updateState = UpdateUiState.Idle
+                    }
+                    is UpdateCheckResult.Failed -> {
+                        updateMessage = "업데이트 확인 실패: ${result.message}"
+                        updateState = if (manual) {
+                            UpdateUiState.Failed(result.message, null)
+                        } else {
+                            UpdateUiState.Idle
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startDownload(info: UpdateInfo) {
+        updateState = UpdateUiState.Downloading(info, 0)
+        updateMessage = null
+        lifecycleScope.launch {
+            try {
+                val file = updater.download(info) { pct ->
+                    withContext(Dispatchers.Main) {
+                        updateState = UpdateUiState.Downloading(info, pct)
+                    }
+                }
+                withContext(Dispatchers.Main) { startInstall(info, file) }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    updateMessage = "다운로드 실패: ${e.message}"
+                    updateState = UpdateUiState.Failed("다운로드 실패: ${e.message}", info)
+                }
+            }
+        }
+    }
+
+    private fun startInstall(info: UpdateInfo, file: File) {
+        updateState = UpdateUiState.Ready(info, file)
+        if (updater.canInstallPackages()) {
+            startActivity(updater.installIntent(file))
+        } else {
+            pendingInstallFile = file
+            updateState = UpdateUiState.NeedsPermission(info, file)
+            updateMessage = "'이 앱의 설치 허용'을 켜면 자동으로 설치가 이어집니다."
+            try {
+                startActivity(updater.unknownSourcesSettingsIntent())
+            } catch (_: Exception) {
+                updateMessage = "설정 → 앱 → SecureMsg → '알 수 없는 앱 설치'를 허용해 주세요."
+            }
+        }
+    }
+
+    /**
+     * Debug-build hook: fetch the latest release and treat it as newer so the
+     * whole download → FileProvider → package-installer path can be exercised
+     * end-to-end even when the running build is already up to date.
+     */
+    private fun testUpdateFlow() {
+        val state = updateState
+        if (state is UpdateUiState.Checking || state is UpdateUiState.Downloading) return
+        updateState = UpdateUiState.Checking
+        lifecycleScope.launch(Dispatchers.IO) {
+            val result = updater.check(ignoreVersion = true)
+            withContext(Dispatchers.Main) {
+                when (result) {
+                    is UpdateCheckResult.Available -> startDownload(result.info)
+                    is UpdateCheckResult.Failed -> {
+                        updateMessage = "업데이트 테스트 실패: ${result.message}"
+                        updateState = UpdateUiState.Idle
+                    }
+                    is UpdateCheckResult.UpToDate -> {
+                        updateMessage = "GitHub 릴리스에 APK 자산이 없습니다."
+                        updateState = UpdateUiState.Idle
+                    }
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -102,6 +220,8 @@ class MainActivity : ComponentActivity() {
 
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
+
+        lifecycleScope.launch(Dispatchers.IO) { updater.cleanupDownloads() }
 
         setContent { App() }
     }
@@ -512,11 +632,26 @@ class MainActivity : ComponentActivity() {
                 ?: threads.firstOrNull { it.phoneNumber == current.phoneNumber }
         }
 
+        // Game-style self-update: look for a new release once per 12h window.
+        LaunchedEffect(Unit) {
+            if (updater.shouldAutoCheck()) checkForUpdates(manual = false)
+        }
+
         Column(
             Modifier.fillMaxSize().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(status, color = Color(0xFF22D3EE), fontSize = 12.sp)
+            UpdateBanner(
+                state = updateState,
+                onUpdate = { startDownload(it) },
+                onInstall = { info, file -> startInstall(info, file) },
+                onRetry = { info -> if (info != null) startDownload(info) },
+                onDismiss = { info ->
+                    updater.dismiss(info.tag)
+                    updateState = UpdateUiState.Idle
+                },
+            )
             if (!smsRoleHeld) {
                 Text(
                     "자동 차단과 SMS 발신을 사용하려면 SecureMsg를 기본 SMS 앱으로 설정하세요.",
@@ -812,6 +947,11 @@ class MainActivity : ComponentActivity() {
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF164E63)),
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("SMS 수신 시뮬레이션 (+821000000001)") }
+                        Button(
+                            onClick = { testUpdateFlow() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF164E63)),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("업데이트 흐름 테스트 (최신 릴리스 강제 다운로드→설치)") }
                     }
 
                     HorizontalDivider(color = Color(0xFF1E293B))
@@ -846,6 +986,54 @@ class MainActivity : ComponentActivity() {
                     }
 
                     HorizontalDivider(color = Color(0xFF1E293B))
+                    Text(
+                        "앱 업데이트",
+                        color = Color(0xFFE2E8F0),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        "현재 버전 v${BuildConfig.VERSION_NAME} · 새 버전을 자동으로 내려받아 게임처럼 바로 설치합니다.",
+                        color = Color(0xFF64748B),
+                        fontSize = 11.sp,
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "자동 업데이트 확인 (12시간마다)",
+                            color = Color(0xFFCBD5E1),
+                            fontSize = 13.sp,
+                        )
+                        Switch(
+                            checked = autoUpdateEnabled,
+                            onCheckedChange = {
+                                autoUpdateEnabled = it
+                                updater.setAutoCheckEnabled(it)
+                            },
+                        )
+                    }
+                    Button(
+                        onClick = { checkForUpdates(manual = true) },
+                        enabled = updateState !is UpdateUiState.Checking &&
+                            updateState !is UpdateUiState.Downloading,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            when (updateState) {
+                                is UpdateUiState.Checking -> "확인 중…"
+                                is UpdateUiState.Downloading -> "다운로드 중…"
+                                else -> "업데이트 확인"
+                            },
+                        )
+                    }
+                    updateMessage?.let {
+                        Text(it, color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    }
+
+                    HorizontalDivider(color = Color(0xFF1E293B))
                     Button(
                         onClick = {
                             lifecycleScope.launch(Dispatchers.IO) {
@@ -860,6 +1048,82 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(8.dp))
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun UpdateBanner(
+        state: UpdateUiState,
+        onUpdate: (UpdateInfo) -> Unit,
+        onInstall: (UpdateInfo, File) -> Unit,
+        onRetry: (UpdateInfo?) -> Unit,
+        onDismiss: (UpdateInfo) -> Unit,
+    ) {
+        when (state) {
+            is UpdateUiState.Available -> Row(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF164E63))
+                    .padding(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "새 버전 v${state.info.versionName} 출시 (현재 v${BuildConfig.VERSION_NAME})",
+                    color = Color(0xFFE0F2FE),
+                    fontSize = 12.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = { onUpdate(state.info) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0EA5E9)),
+                ) { Text("업데이트", fontSize = 12.sp) }
+                TextButton(onClick = { onDismiss(state.info) }) {
+                    Text("나중에", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                }
+            }
+            is UpdateUiState.Downloading -> Column(
+                Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "업데이트 다운로드 중… ${state.pct}%",
+                    color = Color(0xFF22D3EE),
+                    fontSize = 12.sp,
+                )
+                LinearProgressIndicator(
+                    progress = { state.pct / 100f },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            is UpdateUiState.Ready -> Button(
+                onClick = { onInstall(state.info, state.file) },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("v${state.info.versionName} 지금 설치") }
+            is UpdateUiState.NeedsPermission -> Column(Modifier.fillMaxWidth()) {
+                Text(
+                    "설치 권한이 필요합니다. 방금 열린 설정에서 '이 앱의 설치 허용'을 켜 주세요. 허용하면 자동으로 설치가 이어집니다.",
+                    color = Color(0xFFF59E0B),
+                    fontSize = 12.sp,
+                )
+                TextButton(onClick = { onInstall(state.info, state.file) }) { Text("다시 시도") }
+            }
+            is UpdateUiState.Failed -> if (state.info != null) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        state.message,
+                        color = Color(0xFFEF4444),
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { onRetry(state.info) }) { Text("재시도") }
+                }
+            }
+            else -> {}
         }
     }
 
