@@ -13,8 +13,8 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.7.0"
+        versionCode = 10
+        versionName = "0.8.0"
     }
 
     buildTypes {

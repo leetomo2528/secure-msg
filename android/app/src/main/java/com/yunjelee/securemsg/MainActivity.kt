@@ -11,22 +11,41 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.yunjelee.securemsg.ui.Caption
+import com.yunjelee.securemsg.ui.ChatBubble
+import com.yunjelee.securemsg.ui.SectionTitle
+import com.yunjelee.securemsg.ui.Sm
+import com.yunjelee.securemsg.ui.SmAvatar
+import com.yunjelee.securemsg.ui.SmCard
+import com.yunjelee.securemsg.ui.SmChip
+import com.yunjelee.securemsg.ui.SmGhostButton
+import com.yunjelee.securemsg.ui.SmGradientButton
+import com.yunjelee.securemsg.ui.SmTabs
+import com.yunjelee.securemsg.ui.SmTextField
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -257,8 +276,11 @@ class MainActivity : ComponentActivity() {
         }
 
         if (loading) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+            Box(
+                Modifier.fillMaxSize().background(Sm.bg),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Sm.cyan)
             }
             return
         }
@@ -408,6 +430,10 @@ class MainActivity : ComponentActivity() {
         if (confirmForget) {
             AlertDialog(
                 onDismissRequest = { confirmForget = false },
+                containerColor = Sm.surface,
+                shape = RoundedCornerShape(16.dp),
+                titleContentColor = Sm.text1,
+                textContentColor = Sm.text3,
                 title = { Text("로컬 기기 초기화") },
                 text = { Text("이 휴대폰의 개인키와 로컬 메시지를 삭제합니다. 서버에 남은 기기 등록은 다른 기기에서 폐기해야 합니다.") },
                 confirmButton = {
@@ -416,58 +442,72 @@ class MainActivity : ComponentActivity() {
                         username = ""
                         password = ""
                         onForgetLocalDevice()
-                    }) { Text("삭제") }
+                    }) { Text("삭제", color = Sm.danger) }
                 },
                 dismissButton = {
-                    TextButton(onClick = { confirmForget = false }) { Text("취소") }
+                    TextButton(onClick = { confirmForget = false }) { Text("취소", color = Sm.text3) }
                 },
             )
         }
 
-        Column(
-            Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .imePadding()
-                .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text("SecureMsg SMS Bridge", color = Color(0xFF22D3EE), fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("자가호스팅 E2E SMS 동기화. 전화번호/이메일 없이 임의 아이디만 사용.",
-                color = Color(0xFF64748B), fontSize = 12.sp)
-
-            OutlinedTextField(
-                value = serverUrl, onValueChange = { serverUrl = it.take(2048) },
-                label = { Text("서버 URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                colors = fieldColors(),
-            )
-            OutlinedTextField(
-                value = username,
-                onValueChange = { username = it.take(20).lowercase(Locale.ROOT) },
-                label = { Text("아이디 (3-20자, a-z0-9_)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                colors = fieldColors(),
-            )
-            OutlinedTextField(
-                value = password, onValueChange = { password = it.take(1024) },
-                label = { Text("비밀번호 (8자 이상, 영문·숫자·특수문자 자유롭게)") },
-                singleLine = true,
-                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-                colors = fieldColors(),
-            )
-
-            error?.let {
-                Text(it, color = Color(0xFFEF4444), fontSize = 12.sp,
-                    modifier = Modifier.background(Color(0x33EF4444)).padding(8.dp))
-            }
-
-            Button(
-                onClick = {
-                    if (busy) return@Button
+        Box(Modifier.fillMaxSize().background(Sm.bg)) {
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .imePadding()
+                    .padding(horizontal = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Spacer(Modifier.height(32.dp))
+                Text(
+                    "SecureMsg",
+                    style = TextStyle(
+                        brush = Sm.gradient,
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.5).sp,
+                    ),
+                )
+                Text(
+                    "자가호스팅 E2E SMS 동기화. 전화번호·이메일 없이 임의 아이디만 사용합니다.",
+                    color = Sm.text3, fontSize = 13.sp, lineHeight = 18.sp,
+                )
+                Spacer(Modifier.height(8.dp))
+                SmCard(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    SmTextField(
+                        value = serverUrl, onValueChange = { serverUrl = it.take(2048) },
+                        label = "서버 URL", singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    SmTextField(
+                        value = username,
+                        onValueChange = { username = it.take(20).lowercase(Locale.ROOT) },
+                        label = "아이디 (3-20자, a-z0-9_)", singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    SmTextField(
+                        value = password, onValueChange = { password = it.take(1024) },
+                        label = "비밀번호 (8자 이상, 자유롭게 조합)", singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    error?.let {
+                        Text(
+                            it, color = Sm.danger, fontSize = 12.sp, lineHeight = 16.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Sm.danger.copy(alpha = 0.08f))
+                                .padding(10.dp),
+                        )
+                    }
+                    SmGradientButton(
+                        text = if (busy) "처리 중…" else "로그인 / 회원가입",
+                        enabled = !busy && username.isNotBlank() && password.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = {
+                    if (busy) return@SmGradientButton
                     busy = true; error = null
                     lifecycleScope.launch(Dispatchers.IO) {
                         try {
@@ -488,17 +528,26 @@ class MainActivity : ComponentActivity() {
                             withContext(Dispatchers.Main) { busy = false }
                         }
                     }
-                },
-                enabled = !busy && username.isNotBlank() && password.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(if (busy) "처리 중…" else "로그인 / 회원가입")
-            }
-            if (rememberedUsername != null) {
-                TextButton(
-                    onClick = { confirmForget = true },
+                        },
+                    )
+                    if (rememberedUsername != null) {
+                        Text(
+                            "이 휴대폰의 로컬 기기 초기화",
+                            color = Sm.danger.copy(alpha = 0.9f), fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { confirmForget = true }
+                                .padding(6.dp),
+                        )
+                    }
+                }
+                Text(
+                    "v${BuildConfig.VERSION_NAME}",
+                    color = Sm.text4, fontSize = 11.sp, textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("이 휴대폰의 로컬 기기 초기화", color = Color(0xFFEF4444)) }
+                )
+                Spacer(Modifier.height(16.dp))
             }
         }
     }
@@ -638,10 +687,33 @@ class MainActivity : ComponentActivity() {
         }
 
         Column(
-            Modifier.fillMaxSize().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            Modifier.fillMaxSize().background(Sm.bg).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text(status, color = Color(0xFF22D3EE), fontSize = 12.sp)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "SecureMsg",
+                    style = TextStyle(
+                        brush = Sm.gradient,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.3).sp,
+                    ),
+                )
+                SmChip("v${BuildConfig.VERSION_NAME}", Sm.text4)
+            }
+            SmChip(
+                status,
+                when {
+                    status.startsWith("브리지 사용 준비됨") -> Sm.teal
+                    status == "연결 확인 중…" -> Sm.sky
+                    else -> Sm.warning
+                },
+            )
             UpdateBanner(
                 state = updateState,
                 onUpdate = { startDownload(it) },
@@ -653,36 +725,39 @@ class MainActivity : ComponentActivity() {
                 },
             )
             if (!smsRoleHeld) {
-                Text(
-                    "자동 차단과 SMS 발신을 사용하려면 SecureMsg를 기본 SMS 앱으로 설정하세요.",
-                    color = Color(0xFFF59E0B), fontSize = 12.sp,
-                )
-                Button(onClick = requestSmsRole, modifier = Modifier.fillMaxWidth()) {
-                    Text("기본 SMS 앱으로 설정")
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Sm.warning.copy(alpha = 0.07f))
+                        .border(1.dp, Sm.warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        "자동 차단과 SMS 발신을 사용하려면 SecureMsg를 기본 SMS 앱으로 설정하세요.",
+                        color = Sm.warning, fontSize = 12.sp, lineHeight = 17.sp,
+                    )
+                    SmGradientButton(
+                        text = "기본 SMS 앱으로 설정",
+                        onClick = requestSmsRole,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
             if (smsRoleHeld && !smsPermissionsGranted) {
-                Button(onClick = { requestPerms() }, modifier = Modifier.fillMaxWidth()) {
-                    Text("SMS 권한 요청")
-                }
+                SmGradientButton(
+                    text = "SMS 권한 요청",
+                    onClick = { requestPerms() },
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
 
-            TabRow(
-                selectedTabIndex = selectedSection,
-                containerColor = Color(0xFF0F172A),
-                contentColor = Color(0xFF22D3EE),
-            ) {
-                Tab(
-                    selected = selectedSection == 0,
-                    onClick = { selectedSection = 0 },
-                    text = { Text("메시지") },
-                )
-                Tab(
-                    selected = selectedSection == 1,
-                    onClick = { selectedSection = 1 },
-                    text = { Text("차단·설정") },
-                )
-            }
+            SmTabs(
+                selected = selectedSection,
+                labels = listOf("메시지", "차단·설정"),
+                onSelect = { selectedSection = it },
+            )
 
             if (selectedSection == 0) {
                 Column(
@@ -691,32 +766,30 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val thread = selectedThread
                     if (thread == null) {
-                        Text(
-                            "새 SMS 발신",
-                            color = Color(0xFFE2E8F0),
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        OutlinedTextField(
-                            value = newPhone,
-                            onValueChange = { newPhone = it.take(32) },
-                            label = { Text("전화번호") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = fieldColors(),
-                        )
-                        OutlinedTextField(
-                            value = newMsg,
-                            onValueChange = { newMsg = it.take(20_000) },
-                            label = { Text("메시지") },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = fieldColors(),
-                            minLines = 1,
-                            maxLines = 3,
-                        )
-                        Button(
-                            onClick = {
-                                if (sending || newPhone.isBlank() || newMsg.isBlank()) return@Button
+                        SmCard {
+                            SectionTitle("새 SMS 발신")
+                            SmTextField(
+                                value = newPhone,
+                                onValueChange = { newPhone = it.take(32) },
+                                label = "전화번호",
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            SmTextField(
+                                value = newMsg,
+                                onValueChange = { newMsg = it.take(20_000) },
+                                label = "메시지",
+                                modifier = Modifier.fillMaxWidth(),
+                                minLines = 1,
+                                maxLines = 3,
+                            )
+                            SmGradientButton(
+                                text = if (sending) "발송 중…" else "발송 + 동기화",
+                                enabled = !sending && smsRoleHeld && smsPermissionsGranted &&
+                                    newPhone.isNotBlank() && newMsg.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                if (sending || newPhone.isBlank() || newMsg.isBlank()) return@SmGradientButton
                                 sending = true
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     val sent = sendNewSms(creds, newPhone.trim(), newMsg.trim())
@@ -730,38 +803,47 @@ class MainActivity : ComponentActivity() {
                                         sending = false
                                     }
                                 }
-                            },
-                            enabled = !sending && smsRoleHeld && smsPermissionsGranted &&
-                                newPhone.isNotBlank() && newMsg.isNotBlank(),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) { Text(if (sending) "발송 중…" else "발송 + 동기화") }
-
-                        HorizontalDivider(color = Color(0xFF1E293B))
+                                },
+                            )
+                        }
                         Text(
                             "SMS 스레드 (${threads.size})",
-                            color = Color(0xFFE2E8F0),
+                            color = Sm.text2,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(top = 4.dp),
                         )
                         if (threads.isEmpty()) {
                             Text(
                                 "아직 표시할 문자가 없습니다.",
-                                color = Color(0xFF64748B),
+                                color = Sm.text4,
                                 fontSize = 12.sp,
                             )
                         }
                         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
                             items(threads, key = { it.cid }) { item ->
-                                Text(
-                                    item.contactName ?: item.phoneNumber,
-                                    color = Color(0xFF94A3B8),
-                                    fontSize = 13.sp,
-                                    modifier = Modifier
+                                Row(
+                                    Modifier
                                         .fillMaxWidth()
                                         .clickable { selectedThread = item }
-                                        .padding(vertical = 10.dp),
-                                )
-                                HorizontalDivider(color = Color(0xFF1E293B))
+                                        .padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    SmAvatar(item.contactName ?: item.phoneNumber)
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            item.contactName ?: item.phoneNumber,
+                                            color = Sm.text1, fontSize = 14.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        )
+                                        if (item.contactName != null) {
+                                            Text(item.phoneNumber, color = Sm.text4, fontSize = 11.sp)
+                                        }
+                                    }
+                                    Text("›", color = Sm.text4, fontSize = 18.sp)
+                                }
+                                HorizontalDivider(color = Sm.borderSoft)
                             }
                         }
                     } else {
@@ -770,40 +852,68 @@ class MainActivity : ComponentActivity() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text(thread.phoneNumber, color = Color(0xFF22D3EE), fontSize = 14.sp)
-                            TextButton(onClick = { selectedThread = null; reply = "" }) {
-                                Text("목록")
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                SmAvatar(thread.contactName ?: thread.phoneNumber, size = 34)
+                                Column {
+                                    Text(
+                                        thread.contactName ?: thread.phoneNumber,
+                                        color = Sm.text1, fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    if (thread.contactName != null) {
+                                        Text(thread.phoneNumber, color = Sm.text4, fontSize = 11.sp)
+                                    }
+                                }
                             }
+                            SmGhostButton(
+                                text = "목록",
+                                onClick = { selectedThread = null; reply = "" },
+                                modifier = Modifier.padding(vertical = 0.dp),
+                            )
                         }
                         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
                             items(selectedMessages, key = { it.id }) { message ->
-                                Text(
+                                ChatBubble(
+                                    mine = message.mine,
+                                    blocked = message.blocked,
                                     text = if (message.blocked) {
                                         "차단된 메시지"
                                     } else {
-                                        "${if (message.mine) "나" else "수신"}: ${message.plaintext}" +
-                                            carrierStatusLabel(message.carrierStatus)
+                                        message.plaintext + carrierStatusLabel(message.carrierStatus)
                                     },
-                                    color = if (message.blocked) Color(0xFF64748B) else Color(0xFFCBD5E1),
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.padding(vertical = 5.dp),
                                 )
+                                Spacer(Modifier.height(6.dp))
                             }
                         }
                         Row(
                             Modifier.fillMaxWidth().imePadding(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            OutlinedTextField(
+                            SmTextField(
                                 value = reply,
                                 onValueChange = { reply = it.take(20_000) },
-                                label = { Text("답장") },
+                                label = "답장",
                                 singleLine = true,
                                 modifier = Modifier.weight(1f),
-                                colors = fieldColors(),
                             )
-                            Button(
-                                onClick = {
+                            Box(
+                                modifier = Modifier
+                                    .size(52.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (reply.isNotBlank() && !sending &&
+                                            smsRoleHeld && smsPermissionsGranted
+                                        ) Sm.gradient
+                                        else Brush.linearGradient(listOf(Sm.border, Sm.border)),
+                                    )
+                                    .clickable(
+                                        enabled = reply.isNotBlank() && !sending &&
+                                            smsRoleHeld && smsPermissionsGranted,
+                                    ) {
                                     val text = reply.trim()
                                     if (text.isNotBlank() && !sending) {
                                         sending = true
@@ -817,10 +927,18 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
                                     }
-                                },
-                                enabled = reply.isNotBlank() && !sending &&
-                                    smsRoleHeld && smsPermissionsGranted,
-                            ) { Text(if (sending) "전송 중…" else "전송") }
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    if (sending) "…" else "↑",
+                                    color = if (reply.isNotBlank() && !sending &&
+                                        smsRoleHeld && smsPermissionsGranted
+                                    ) Color(0xFF052530) else Sm.text4,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                     }
                 }
@@ -831,29 +949,22 @@ class MainActivity : ComponentActivity() {
                         .weight(1f)
                         .verticalScroll(rememberScrollState())
                         .imePadding(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text(
-                        "차단 키워드",
-                        color = Color(0xFFE2E8F0),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Text(
-                        "키워드·발신번호는 모든 기기에 동기화됩니다. 문자 내용은 이 기기에서 복호화한 뒤 검사하며 서버에는 평문으로 보내지 않습니다.",
-                        color = Color(0xFF64748B),
-                        fontSize = 11.sp,
-                    )
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = newKw,
-                            onValueChange = { newKw = it.take(120) },
-                            label = { Text("키워드") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                            colors = fieldColors(),
-                        )
-                        Button(onClick = {
+                    SmCard {
+                        SectionTitle("차단 키워드")
+                        Caption("키워드·발신번호는 모든 기기에 동기화됩니다. 문자 내용은 이 기기에서 복호화한 뒤 검사하며 서버에는 평문으로 보내지 않습니다.")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SmTextField(
+                                value = newKw,
+                                onValueChange = { newKw = it.take(120) },
+                                label = "키워드",
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            SmGradientButton(
+                                text = "추가",
+                                onClick = {
                             val keyword = newKw.trim()
                             if (keyword.isNotEmpty()) {
                                 lifecycleScope.launch(Dispatchers.IO) {
@@ -862,45 +973,47 @@ class MainActivity : ComponentActivity() {
                                     withContext(Dispatchers.Main) { newKw = "" }
                                 }
                             }
-                        }) { Text("추가") }
-                    }
-                    blocklist.forEach { keyword ->
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(keyword.keyword, color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                            TextButton(onClick = {
-                                lifecycleScope.launch(Dispatchers.IO) {
-                                    db.blocklistDao().delete(keyword)
-                                    removeBlockRuleOnServer("keyword", keyword.keyword)
-                                }
-                            }) { Text("삭제", color = Color(0xFFEF4444)) }
+                                },
+                            )
+                        }
+                        if (blocklist.isEmpty()) {
+                            Caption("추가된 키워드가 없습니다.")
+                        }
+                        blocklist.forEach { keyword ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Sm.surfaceAlt)
+                                    .padding(start = 12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(keyword.keyword, color = Sm.text2, fontSize = 13.sp)
+                                TextButton(onClick = {
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        db.blocklistDao().delete(keyword)
+                                        removeBlockRuleOnServer("keyword", keyword.keyword)
+                                    }
+                                }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                            }
                         }
                     }
-                    HorizontalDivider(color = Color(0xFF1E293B))
-                    Text(
-                        "발신번호 차단",
-                        color = Color(0xFFE2E8F0),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Text(
-                        "번호 차단은 이 Android 기기에서 수신 단계에 적용됩니다.",
-                        color = Color(0xFF64748B),
-                        fontSize = 11.sp,
-                    )
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = newBlockedPhone,
-                            onValueChange = { newBlockedPhone = it.take(32) },
-                            label = { Text("전화번호") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                            colors = fieldColors(),
-                        )
-                        Button(onClick = {
+
+                    SmCard {
+                        SectionTitle("발신번호 차단")
+                        Caption("번호 차단은 이 Android 기기에서 수신 단계에 적용됩니다.")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SmTextField(
+                                value = newBlockedPhone,
+                                onValueChange = { newBlockedPhone = it.take(32) },
+                                label = "전화번호",
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            SmGradientButton(
+                                text = "차단",
+                                onClick = {
                             val number = PhoneNumberNormalizer.normalize(newBlockedPhone)
                             if (Regex("^\\+?[0-9*#]{3,24}$").matches(number)) {
                                 lifecycleScope.launch(Dispatchers.IO) {
@@ -911,130 +1024,126 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 status = "차단할 전화번호 형식을 확인하세요."
                             }
-                        }) { Text("차단") }
-                    }
-                    blockedSenders.forEach { sender ->
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(sender.phoneNumber, color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                            TextButton(onClick = {
-                                lifecycleScope.launch(Dispatchers.IO) {
-                                    db.blockedSenderDao().delete(sender)
-                                    removeBlockRuleOnServer("sender", sender.phoneNumber)
-                                }
-                            }) { Text("삭제", color = Color(0xFFEF4444)) }
+                                },
+                            )
+                        }
+                        if (blockedSenders.isEmpty()) {
+                            Caption("차단된 번호가 없습니다.")
+                        }
+                        blockedSenders.forEach { sender ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Sm.surfaceAlt)
+                                    .padding(start = 12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(sender.phoneNumber, color = Sm.text2, fontSize = 13.sp)
+                                TextButton(onClick = {
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        db.blockedSenderDao().delete(sender)
+                                        removeBlockRuleOnServer("sender", sender.phoneNumber)
+                                    }
+                                }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                            }
                         }
                     }
 
-                    if (BuildConfig.DEBUG) {
-                        HorizontalDivider(color = Color(0xFF1E293B))
-                        Text(
-                            "개발자 도구",
-                            color = Color(0xFFE2E8F0),
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        Text(
-                            "SIM 없이 수신 경로를 검증합니다. 차단 판정 → 시스템 SMS 기록 → 알림 → 서버 relay까지 실제 코드 경로로 주입합니다.",
-                            color = Color(0xFF64748B),
-                            fontSize = 11.sp,
-                        )
-                        Button(
-                            onClick = { simulateIncomingSms() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF164E63)),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) { Text("SMS 수신 시뮬레이션 (+821000000001)") }
-                        Button(
-                            onClick = { testUpdateFlow() },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF164E63)),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) { Text("업데이트 흐름 테스트 (최신 릴리스 강제 다운로드→설치)") }
-                    }
-
-                    HorizontalDivider(color = Color(0xFF1E293B))
-                    Text(
-                        "격리된 스팸 (${blockedSms.size})",
-                        color = Color(0xFFE2E8F0),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    if (blockedSms.isEmpty()) {
-                        Text("격리된 문자가 없습니다.", color = Color(0xFF64748B), fontSize = 11.sp)
-                    }
-                    blockedSms.take(20).forEach { item ->
+                    SmCard {
+                        SectionTitle("앱 업데이트")
+                        Caption("현재 버전 v${BuildConfig.VERSION_NAME} · 새 버전을 자동으로 내려받아 게임처럼 바로 설치합니다.")
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                "${item.phoneNumber}: ${item.reason}\n${item.body.take(120)}",
-                                color = Color(0xFF94A3B8),
-                                fontSize = 11.sp,
-                                maxLines = 3,
-                                modifier = Modifier.weight(1f),
+                                "자동 업데이트 확인 (12시간마다)",
+                                color = Sm.text2,
+                                fontSize = 13.sp,
                             )
-                            TextButton(onClick = {
-                                lifecycleScope.launch(Dispatchers.IO) {
-                                    db.blockedSmsDao().delete(item)
-                                }
-                            }) { Text("삭제", color = Color(0xFFEF4444)) }
+                            Switch(
+                                checked = autoUpdateEnabled,
+                                onCheckedChange = {
+                                    autoUpdateEnabled = it
+                                    updater.setAutoCheckEnabled(it)
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = Sm.accentDeep,
+                                    uncheckedThumbColor = Sm.text4,
+                                    uncheckedTrackColor = Sm.surfaceAlt,
+                                ),
+                            )
                         }
-                    }
-
-                    HorizontalDivider(color = Color(0xFF1E293B))
-                    Text(
-                        "앱 업데이트",
-                        color = Color(0xFFE2E8F0),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    Text(
-                        "현재 버전 v${BuildConfig.VERSION_NAME} · 새 버전을 자동으로 내려받아 게임처럼 바로 설치합니다.",
-                        color = Color(0xFF64748B),
-                        fontSize = 11.sp,
-                    )
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "자동 업데이트 확인 (12시간마다)",
-                            color = Color(0xFFCBD5E1),
-                            fontSize = 13.sp,
-                        )
-                        Switch(
-                            checked = autoUpdateEnabled,
-                            onCheckedChange = {
-                                autoUpdateEnabled = it
-                                updater.setAutoCheckEnabled(it)
-                            },
-                        )
-                    }
-                    Button(
-                        onClick = { checkForUpdates(manual = true) },
-                        enabled = updateState !is UpdateUiState.Checking &&
-                            updateState !is UpdateUiState.Downloading,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(
-                            when (updateState) {
+                        SmGhostButton(
+                            text = when (updateState) {
                                 is UpdateUiState.Checking -> "확인 중…"
                                 is UpdateUiState.Downloading -> "다운로드 중…"
                                 else -> "업데이트 확인"
                             },
+                            onClick = { checkForUpdates(manual = true) },
+                            modifier = Modifier.fillMaxWidth(),
                         )
-                    }
-                    updateMessage?.let {
-                        Text(it, color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        updateMessage?.let {
+                            Text(it, color = Sm.text3, fontSize = 12.sp)
+                        }
                     }
 
-                    HorizontalDivider(color = Color(0xFF1E293B))
-                    Button(
+                    SmCard {
+                        SectionTitle("격리된 스팸 (${blockedSms.size})")
+                        if (blockedSms.isEmpty()) {
+                            Caption("격리된 문자가 없습니다.")
+                        }
+                        blockedSms.take(20).forEach { item ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Sm.surfaceAlt)
+                                    .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "${item.phoneNumber}: ${item.reason}\n${item.body.take(120)}",
+                                    color = Sm.text3,
+                                    fontSize = 11.sp,
+                                    lineHeight = 15.sp,
+                                    maxLines = 3,
+                                    modifier = Modifier.weight(1f).padding(vertical = 4.dp),
+                                )
+                                TextButton(onClick = {
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        db.blockedSmsDao().delete(item)
+                                    }
+                                }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                            }
+                        }
+                    }
+
+                    if (BuildConfig.DEBUG) {
+                        SmCard {
+                            SectionTitle("개발자 도구")
+                            Caption("SIM 없이 수신 경로를 검증합니다. 차단 판정 → 시스템 SMS 기록 → 알림 → 서버 relay까지 실제 코드 경로로 주입합니다.")
+                            SmGhostButton(
+                                text = "SMS 수신 시뮬레이션 (+821000000001)",
+                                onClick = { simulateIncomingSms() },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            SmGhostButton(
+                                text = "업데이트 흐름 테스트 (최신 릴리스 강제 다운로드→설치)",
+                                onClick = { testUpdateFlow() },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+
+                    SmGhostButton(
+                        text = "로그아웃",
+                        textColor = Sm.danger,
                         onClick = {
                             lifecycleScope.launch(Dispatchers.IO) {
                                 stopService(Intent(this@MainActivity, SmsBridgeService::class.java))
@@ -1042,9 +1151,8 @@ class MainActivity : ComponentActivity() {
                                 withContext(Dispatchers.Main) { onLogout() }
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text("로그아웃") }
+                    )
                     Spacer(Modifier.height(8.dp))
                 }
             }
@@ -1063,64 +1171,85 @@ class MainActivity : ComponentActivity() {
             is UpdateUiState.Available -> Row(
                 Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF164E63))
-                    .padding(10.dp),
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Sm.gradientSoft)
+                    .border(1.dp, Sm.teal.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                    .padding(12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
                     "새 버전 v${state.info.versionName} 출시 (현재 v${BuildConfig.VERSION_NAME})",
-                    color = Color(0xFFE0F2FE),
+                    color = Sm.text1,
                     fontSize = 12.sp,
+                    lineHeight = 16.sp,
                     modifier = Modifier.weight(1f),
                 )
-                Button(
-                    onClick = { onUpdate(state.info) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0EA5E9)),
-                ) { Text("업데이트", fontSize = 12.sp) }
+                SmGradientButton(text = "업데이트", onClick = { onUpdate(state.info) })
                 TextButton(onClick = { onDismiss(state.info) }) {
-                    Text("나중에", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    Text("나중에", color = Sm.text3, fontSize = 12.sp)
                 }
             }
             is UpdateUiState.Downloading -> Column(
-                Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Sm.surface)
+                    .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text(
-                    "업데이트 다운로드 중… ${state.pct}%",
-                    color = Color(0xFF22D3EE),
-                    fontSize = 12.sp,
-                )
+                Text("업데이트 다운로드 중… ${state.pct}%", color = Sm.cyan, fontSize = 12.sp)
                 LinearProgressIndicator(
                     progress = { state.pct / 100f },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
+                    color = Sm.teal,
+                    trackColor = Sm.surfaceAlt,
                 )
             }
-            is UpdateUiState.Ready -> Button(
+            is UpdateUiState.Ready -> SmGradientButton(
+                text = "v${state.info.versionName} 지금 설치",
                 onClick = { onInstall(state.info, state.file) },
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("v${state.info.versionName} 지금 설치") }
-            is UpdateUiState.NeedsPermission -> Column(Modifier.fillMaxWidth()) {
+            )
+            is UpdateUiState.NeedsPermission -> Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Sm.warning.copy(alpha = 0.07f))
+                    .border(1.dp, Sm.warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                    .padding(12.dp),
+            ) {
                 Text(
                     "설치 권한이 필요합니다. 방금 열린 설정에서 '이 앱의 설치 허용'을 켜 주세요. 허용하면 자동으로 설치가 이어집니다.",
-                    color = Color(0xFFF59E0B),
+                    color = Sm.warning,
                     fontSize = 12.sp,
+                    lineHeight = 16.sp,
                 )
-                TextButton(onClick = { onInstall(state.info, state.file) }) { Text("다시 시도") }
+                TextButton(onClick = { onInstall(state.info, state.file) }) {
+                    Text("다시 시도", color = Sm.text2)
+                }
             }
             is UpdateUiState.Failed -> if (state.info != null) {
                 Row(
-                    Modifier.fillMaxWidth(),
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Sm.danger.copy(alpha = 0.06f))
+                        .border(1.dp, Sm.danger.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
+                        .padding(12.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
                         state.message,
-                        color = Color(0xFFEF4444),
+                        color = Sm.danger,
                         fontSize = 12.sp,
                         modifier = Modifier.weight(1f),
                     )
-                    TextButton(onClick = { onRetry(state.info) }) { Text("재시도") }
+                    TextButton(onClick = { onRetry(state.info) }) {
+                        Text("재시도", color = Sm.text2)
+                    }
                 }
             }
             else -> {}
@@ -1162,16 +1291,4 @@ class MainActivity : ComponentActivity() {
         else -> ""
     }
 
-    @Composable
-    private fun fieldColors() = OutlinedTextFieldDefaults.colors(
-        focusedTextColor = Color(0xFFE2E8F0),
-        unfocusedTextColor = Color(0xFFE2E8F0),
-        focusedContainerColor = Color(0xFF0F172A),
-        unfocusedContainerColor = Color(0xFF0F172A),
-        cursorColor = Color(0xFF22D3EE),
-        focusedBorderColor = Color(0xFF22D3EE),
-        unfocusedBorderColor = Color(0xFF334155),
-        focusedLabelColor = Color(0xFF22D3EE),
-        unfocusedLabelColor = Color(0xFF64748B),
-    )
 }
