@@ -10,7 +10,12 @@ class SenderMatcherTest {
         assertTrue(SenderMatcher.matches("01012345678", "01012345678"))
         assertTrue(SenderMatcher.matches("010-1234-5678", "01012345678"))
         assertTrue(SenderMatcher.matches("+821012345678", "010-1234-5678"))
-        assertTrue(SenderMatcher.matches("1012345678", "+82 10 1234 5678"))
+    }
+
+    @Test
+    fun legacyAndCanonicalKoreanRowsMatchInBothDirections() {
+        assertTrue(SenderMatcher.matches("+821012345678", "01012345678"))
+        assertTrue(SenderMatcher.matches("01012345678", "+821012345678"))
     }
 
     @Test
@@ -26,5 +31,17 @@ class SenderMatcherTest {
         assertFalse(SenderMatcher.matches("01012345678", ""))
         // <9 digits on either side: only exact equality counts.
         assertFalse(SenderMatcher.matches("1234", "91234"))
+    }
+
+    @Test
+    fun internationalNumbersWithTheSameNineDigitTailDoNotMatch() {
+        assertFalse(SenderMatcher.matches("+442025550123", "+12025550123"))
+    }
+
+    @Test
+    fun alphanumericSenderIdsMatchExactlyWithNfkcAndCaseFolding() {
+        assertTrue(SenderMatcher.matches("ＢＡＮＫ０１０", "bank010"))
+        assertFalse(SenderMatcher.matches("BANK01012345678", "01012345678"))
+        assertFalse(SenderMatcher.matches("MYBANK", "BANK"))
     }
 }

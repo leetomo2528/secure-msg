@@ -61,6 +61,17 @@ import {
 } from "./db";
 import { applyBlock, matchBlockKeywords } from "./blocklist";
 import { normalizePhone, ownedSmsPhone } from "./conversationPolicy";
+import {
+  decodeRelayContent,
+  errorText,
+  isSafeMimeType,
+  matchesBlockedSender,
+  ruleToKeywordRow,
+  ruleToSenderRow,
+} from "./helpers";
+
+// Re-exported so existing tests/consumers keep importing from this module.
+export { decodeRelayContent };
 
 const NOTIFY_PREF_KEY = "securemsg-notify";
 
@@ -685,14 +696,6 @@ export const useStore = create<State>((set, get) => ({
   },
 }));
 
-function ruleToKeywordRow(rule: BlockRule): BlockRow {
-  return { id: `srv:${rule.id}`, keyword: rule.value, created_at: rule.created_at * 1000 };
-}
-
-function ruleToSenderRow(rule: BlockRule): SenderRow {
-  return { id: `srv:${rule.id}`, sender: rule.value, created_at: rule.created_at * 1000 };
-}
-
 async function postLogin(): Promise<void> {
   const me = useStore.getState();
   await me.refreshBlocklist();
@@ -817,20 +820,6 @@ async function reapplyBlocklist(): Promise<void> {
 }
 
 /** Compare phone numbers by digits only (handles +82 vs 0082 vs separators). */
-function matchesBlockedSender(phone: string, senders: SenderRow[]): boolean {
-  const digits = phone.replace(/[^\d*#]/g, "");
-  for (const row of senders) {
-    const blockedDigits = row.sender.replace(/[^\d*#]/g, "");
-    if (!blockedDigits) continue;
-    if (digits === blockedDigits
-      || digits.endsWith(blockedDigits.replace(/^\+/, ""))
-      || blockedDigits.replace(/^00/, "").replace(/^\+/, "") === digits.replace(/^00/, "")) {
-      return true;
-    }
-  }
-  return false;
-}
-
 /** Desktop notification for a freshly arrived incoming message. */
 function maybeNotify(title: string, body: string, _isSms: boolean): void {
   const state = useStore.getState();
@@ -844,55 +833,4 @@ function maybeNotify(title: string, body: string, _isSms: boolean): void {
     const n = new Notification(title, { body, tag: `securemsg-${title}` });
     n.onclick = () => { window.focus(); n.close(); };
   } catch { /* notification construction can fail on some platforms */ }
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** Exported for unit tests. Parses the decrypted relay JSON with hard limits. */
-export function decodeRelayContent(value: string): RelayContent {
-  try {
-    const parsed = JSON.parse(value) as Partial<RelayContent>;
-    if (parsed.v === 1 && (parsed.type === "text" || parsed.type === "mms")
-      && typeof parsed.text === "string" && parsed.text.length <= 20_000) {
-      let totalBytes = 0;
-      const candidates = Array.isArray(parsed.attachments) ? parsed.attachments.slice(0, 64) : [];
-      const attachments = candidates
-        .filter((item): item is MessageAttachment => {
-          if (!item || typeof item !== "object"
-            || typeof item.name !== "string"
-            || typeof item.content_type !== "string"
-            || !isSafeMimeType(item.content_type)
-            || typeof item.data !== "string"
-            || typeof item.size !== "number"
-            || !Number.isInteger(item.size)
-            || item.size < 0
-            || item.size > 512 * 1024
-            || totalBytes + item.size > 512 * 1024) return false;
-          try {
-            if (unb64u(item.data).byteLength !== item.size) return false;
-          } catch {
-            return false;
-          }
-          totalBytes += item.size;
-          return true;
-        }).slice(0, 8);
-      return {
-        v: 1,
-        type: parsed.type,
-        text: parsed.text,
-        subject: typeof parsed.subject === "string" ? parsed.subject.slice(0, 120) : undefined,
-        attachments,
-      };
-    }
-  } catch {
-    // Legacy SMS rows were encrypted as plain text.
-  }
-  return { v: 1, type: "text", text: value.slice(0, 20_000), attachments: [] };
-}
-
-function isSafeMimeType(value: string): boolean {
-  return /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(value)
-    && value.length <= 120;
 }

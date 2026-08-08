@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only: allow cleartext so the app can reach a local dev relay
+  on the LAN (real phone ↔ same-Wi-Fi dev box) or via adb reverse. The login
+  screen still refuses non-HTTPS URLs for anything outside RFC1918 ranges,
+  so production traffic stays HTTPS-only. Release builds ship the strict
+  config from src/main.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

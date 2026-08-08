@@ -1,11 +1,6 @@
 package com.yunjelee.securemsg
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -62,8 +57,6 @@ class SmsBridgeService : Service() {
         const val EXTRA_BODY = "body"
         const val EXTRA_PROVIDER_ID = "provider_id"
         const val EXTRA_RECEIVED_AT = "received_at"
-        private const val CHANNEL_ID = "securemsg_bridge"
-        private const val NOTIF_ID = 1
         private const val TAG = "SmsBridgeService"
         private const val CLAIM_RETRY_GRACE_MS = 30_000L
     }
@@ -71,7 +64,7 @@ class SmsBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         db = AppDatabase.get(this)
-        createNotificationChannel()
+        BridgeNotifications.createChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -101,10 +94,11 @@ class SmsBridgeService : Service() {
                 )
                 scope.launch {
                     try {
-                        ensureBridgeReady()
                         incomingMutex.withLock {
                             handleIncomingSms(phone, body, providerId, receivedAt)
                         }
+                        ensureBridgeReady()
+                        flushOutbox()
                     } catch (e: Exception) {
                         Log.e(TAG, "Incoming SMS relay failed", e)
                     }
@@ -152,10 +146,11 @@ class SmsBridgeService : Service() {
                 val id = intent.getLongExtra(MmsReceiver.EXTRA_MMS_ID, -1L).takeIf { it > 0 }
                 scope.launch {
                     try {
-                        ensureBridgeReady()
                         incomingMutex.withLock {
                             if (id != null) processIncomingMms(id) else processRecentMms()
                         }
+                        ensureBridgeReady()
+                        flushOutbox()
                     } catch (e: Exception) {
                         Log.e(TAG, "Incoming MMS processing failed", e)
                     }
@@ -298,7 +293,7 @@ class SmsBridgeService : Service() {
                     scope.launch {
                         try {
                             AppDatabase.get(this@SmsBridgeService)
-                                .threadDao().updateNameByCid(cid, name)
+                                .threadDao().updateServerNameByCid(cid, name)
                         } catch (e: Exception) {
                             Log.e(TAG, "conv rename apply failed", e)
                         }
@@ -321,9 +316,7 @@ class SmsBridgeService : Service() {
     }
 
     private fun getServerUrl(): String {
-        val sp = getSharedPreferences("securemsg_config", Context.MODE_PRIVATE)
-        return sp.getString("server_url", "https://msg.yunjelee.com")
-            ?: "https://msg.yunjelee.com"
+        return ServerConfig.url(this)
     }
 
     /** Carrier SMS -> encrypted multi-device relay. */
@@ -333,8 +326,6 @@ class SmsBridgeService : Service() {
         providerId: Long? = null,
         receivedAt: Long = System.currentTimeMillis(),
     ) {
-        val c = creds ?: Credentials.load(this) ?: return
-        val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
         if (phone.isBlank() || body.isBlank()) {
             // A malformed provider row can never be relayed; mark it processed
             // so startup imports stop retrying it forever.
@@ -342,7 +333,9 @@ class SmsBridgeService : Service() {
             return
         }
         if (providerId != null && db.processedSmsDao().contains(providerId)) return
-        if (providerId != null && db.relayOutboxDao().getByProviderId(providerId) != null) {
+        if (providerId != null && db.relayOutboxDao()
+                .getByProviderId(providerId, "incoming_sms") != null
+        ) {
             flushOutbox()
             return
         }
@@ -364,57 +357,15 @@ class SmsBridgeService : Service() {
             return
         }
 
-        if (relay?.isConnected != true) {
-            Log.w(TAG, "Relay is offline; SMS will be retried from provider history")
-            return
-        }
-
         val normalizedPhone = PhoneNumberNormalizer.normalize(phone)
-        val thread = getOrCreateOwnedSmsThread(a, c, normalizedPhone) ?: return
-
-        val membersResp = a.convMembers(thread.cid)
-        if (!membersResp.optBoolean("ok")) return
-        val membersArr = membersResp.optJSONArray("members") ?: JSONArray()
-        val recipients = mutableListOf<CryptoUtil.Recipient>()
-        for (i in 0 until membersArr.length()) {
-            val m = membersArr.optJSONObject(i) ?: continue
-            val sid = m.optString("sid")
-            val pubKey = m.optString("pub_key")
-            if (sid.isBlank() || pubKey.isBlank()) continue
-            recipients += CryptoUtil.Recipient(sid, pubKey)
-            db.deviceCacheDao().upsert(
-                DeviceCache(
-                    sid = sid,
-                    userId = m.optInt("user_id"),
-                    name = m.optString("name"),
-                    pubKey = pubKey,
-                ),
-            )
-        }
-        if (recipients.isEmpty()) {
-            Log.w(TAG, "No relay recipients for incoming SMS; will retry")
-            return
-        }
-
         val content = RelayContentCodec.text(body)
-        val contentJson = RelayContentCodec.encode(content)
-        val payload = CryptoUtil.envelopeToJson(
-            CryptoUtil.encryptMessage(contentJson, recipients, c.keypair),
+        queueIncomingMessage(
+            direction = "incoming_sms",
+            phone = normalizedPhone,
+            content = content,
+            providerId = providerId,
+            receivedAt = receivedAt,
         )
-        db.relayOutboxDao().insert(
-            RelayOutbox(
-                mid = UUID.randomUUID().toString(),
-                cid = thread.cid,
-                payload = payload.toString(),
-                plaintext = contentJson,
-                contentType = content.type,
-                phoneNumber = normalizedPhone,
-                providerId = providerId,
-                direction = "incoming_sms",
-            ),
-        )
-        // The row is durable before the network attempt. If the process dies after
-        // the server accepted it, the same mid receives the original ACK on retry.
         flushOutbox()
     }
 
@@ -426,12 +377,10 @@ class SmsBridgeService : Service() {
 
     private suspend fun processIncomingMms(id: Long) {
         if (db.processedMmsDao().contains(id)) return
-        if (db.relayOutboxDao().getByProviderId(id) != null) {
+        if (db.relayOutboxDao().getByProviderId(id, "incoming_mms") != null) {
             flushOutbox()
             return
         }
-        val c = creds ?: Credentials.load(this) ?: return
-        val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
         val mms = MmsProvider.read(this, id)
         if (mms == null) {
             // Read failure (deleted row/provider error) is permanent for this id;
@@ -461,32 +410,6 @@ class SmsBridgeService : Service() {
             Log.i(TAG, "MMS quarantined id=$id: ${decision.reason}")
             return
         }
-        if (relay?.isConnected != true) return
-
-        val thread = getOrCreateOwnedSmsThread(a, c, phone) ?: return
-        val members = a.convMembers(thread.cid)
-        if (!members.optBoolean("ok")) return
-        val recipients = mutableListOf<CryptoUtil.Recipient>()
-        val membersArr = members.optJSONArray("members") ?: JSONArray()
-        for (i in 0 until membersArr.length()) {
-            val member = membersArr.optJSONObject(i) ?: continue
-            val sid = member.optString("sid")
-            val pubKey = member.optString("pub_key")
-            if (sid.isBlank() || pubKey.isBlank()) continue
-            recipients += CryptoUtil.Recipient(sid, pubKey)
-            db.deviceCacheDao().upsert(
-                DeviceCache(
-                    sid = sid,
-                    userId = member.optInt("user_id"),
-                    name = member.optString("name"),
-                    pubKey = pubKey,
-                ),
-            )
-        }
-        if (recipients.isEmpty()) {
-            Log.w(TAG, "No relay recipients for incoming MMS id=$id; will retry")
-            return
-        }
         val attachments = mms.parts.map {
             RelayAttachment(
                 name = it.name,
@@ -501,25 +424,68 @@ class SmsBridgeService : Service() {
             subject = mms.subject,
             attachments = attachments,
         )
-        val contentJson = RelayContentCodec.encode(content)
-        val payload = CryptoUtil.envelopeToJson(
-            CryptoUtil.encryptMessage(contentJson, recipients, c.keypair),
-        )
-        db.relayOutboxDao().insert(
-            RelayOutbox(
-                mid = UUID.randomUUID().toString(),
-                cid = thread.cid,
-                payload = payload.toString(),
-                plaintext = contentJson,
-                contentType = content.type,
-                subject = content.subject,
-                attachmentsJson = attachmentsJson(content),
-                phoneNumber = phone,
-                providerId = id,
-                direction = "incoming_mms",
-            ),
+        queueIncomingMessage(
+            direction = "incoming_mms",
+            phone = phone,
+            content = content,
+            providerId = id,
+            receivedAt = mms.date,
         )
         flushOutbox()
+    }
+
+    /** Persist presentation and retry state together before any relay dependency. */
+    private suspend fun queueIncomingMessage(
+        direction: String,
+        phone: String,
+        content: RelayContent,
+        providerId: Long?,
+        receivedAt: Long,
+    ): RelayOutbox {
+        val encoded = RelayContentCodec.encode(content)
+        val mid = IncomingMessageIdentity.mid(direction, providerId, phone, receivedAt, encoded)
+        db.relayOutboxDao().getByMid(mid)?.let { return it }
+
+        return db.withTransaction {
+            db.relayOutboxDao().getByMid(mid)?.let { return@withTransaction it }
+            val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
+                cid = "local_${UUID.randomUUID().toString().replace("-", "")}",
+                phoneNumber = phone,
+                serverName = null,
+            ).also { db.threadDao().upsert(it) }
+            db.threadDao().touch(thread.cid, receivedAt)
+            val localMessageId = db.messageDao().insert(
+                MessageRow(
+                    cid = thread.cid,
+                    seq = 0,
+                    senderSid = "",
+                    plaintext = content.text,
+                    createdAt = receivedAt,
+                    mine = false,
+                    contentType = content.type,
+                    subject = content.subject,
+                    attachmentsJson = attachmentsJson(content),
+                ),
+            )
+            val outboxId = db.relayOutboxDao().insert(
+                RelayOutbox(
+                    mid = mid,
+                    cid = thread.cid,
+                    payload = "",
+                    plaintext = encoded,
+                    contentType = content.type,
+                    subject = content.subject,
+                    attachmentsJson = attachmentsJson(content),
+                    phoneNumber = phone,
+                    providerId = providerId,
+                    localMessageId = localMessageId,
+                    direction = direction,
+                    createdAt = receivedAt,
+                ),
+            )
+            db.relayOutboxDao().getByMid(mid)
+                ?: error("missing incoming outbox row id=$outboxId")
+        }
     }
 
     private suspend fun flushOutbox() {
@@ -530,11 +496,9 @@ class SmsBridgeService : Service() {
             for (queuedRow in rows) {
                 val content = RelayContentCodec.decode(queuedRow.plaintext)
                 var row = queuedRow
-                if (row.direction.startsWith("outgoing_") &&
-                    (row.payload.isBlank() || row.cid.startsWith("local_"))
-                ) {
+                if (row.payload.isBlank() || row.cid.startsWith("local_")) {
                     val prepared = try {
-                        prepareOutgoingRelay(row)
+                        prepareRelayOutbox(row)
                     } catch (e: Exception) {
                         Log.w(TAG, "Outgoing relay preparation deferred mid=${row.mid}", e)
                         null
@@ -604,14 +568,14 @@ class SmsBridgeService : Service() {
                 } catch (e: Exception) {
                     JSONObject().put("ok", false).put("error", e.message ?: "relay error")
                 }
-                if (!ack.optBoolean("ok") && row.direction.startsWith("outgoing_") &&
+                if (!ack.optBoolean("ok") &&
                     ack.optString("error") == "payload keys do not match conversation devices"
                 ) {
                     // A browser may have been added/revoked while this durable
                     // row was offline. Re-wrap the same plaintext for the current
                     // device set; the server explicitly rejected the old envelope.
                     val refreshed = try {
-                        prepareOutgoingRelay(row)
+                        prepareRelayOutbox(row)
                     } catch (e: Exception) {
                         Log.w(TAG, "Recipient-key refresh failed mid=${row.mid}", e)
                         null
@@ -639,48 +603,68 @@ class SmsBridgeService : Service() {
                     db.relayOutboxDao().recordAttempt(row.id, "invalid relay sequence")
                     continue
                 }
-                if (row.localMessageId != null) {
-                    db.messageDao().updateRelayResult(
-                        row.localMessageId,
-                        seq,
-                        content.type,
-                        content.subject,
-                        attachmentsJson(content),
-                    )
-                } else {
-                    db.messageDao().insert(
-                        MessageRow(
-                            cid = row.cid,
-                            seq = seq,
-                            senderSid = creds?.sid.orEmpty(),
-                            plaintext = content.text,
-                            createdAt = row.createdAt,
-                            mine = row.direction.startsWith("outgoing_"),
-                            contentType = content.type,
-                            subject = content.subject,
-                            attachmentsJson = attachmentsJson(content),
-                            serverKey = "${row.cid}:$seq",
-                            carrierStatus = if (row.direction.startsWith("outgoing_")) {
-                                row.carrierState
-                            } else {
-                                "none"
-                            },
-                            carrierError = row.lastError,
-                        ),
-                    )
-                }
-                db.threadDao().advanceLastSeq(row.cid, seq)
-                db.relayOutboxDao().markRelaySent(row.id, seq)
-                client.emitDelivered(row.cid, seq)
-                val current = db.relayOutboxDao().getByMid(row.mid)
-                if (row.direction.startsWith("incoming_")) {
-                    if (row.direction == "incoming_mms") {
-                        row.providerId?.let { db.processedMmsDao().insert(ProcessedMms(it)) }
+                val isIncoming = row.direction.startsWith("incoming_")
+                db.withTransaction {
+                    if (row.localMessageId != null) {
+                        val local = db.messageDao().getById(row.localMessageId)
+                        if (local != null && local.cid != row.cid) {
+                            // Recovery for an outbox that was already prepared
+                            // before a process update/crash but whose rendered
+                            // local row still belongs to the stale SMS thread.
+                            // Merge the full local history first so serverKey is
+                            // generated from the authoritative cid below.
+                            db.messageDao().moveConversation(local.cid, row.cid)
+                            db.relayOutboxDao().moveConversation(local.cid, row.cid)
+                            db.threadDao().deleteByCid(local.cid)
+                        }
+                        // A socket echo can be synchronized before this ACK is
+                        // handled. Preserve the locally rendered row and remove
+                        // that acknowledged duplicate before assigning serverKey.
+                        db.messageDao().deleteServerDuplicate(
+                            "${row.cid}:$seq",
+                            row.localMessageId,
+                        )
+                        db.messageDao().updateRelayResult(
+                            row.localMessageId,
+                            seq,
+                            content.type,
+                            content.subject,
+                            attachmentsJson(content),
+                        )
                     } else {
-                        row.providerId?.let { db.processedSmsDao().insert(ProcessedSms(it)) }
+                        db.messageDao().insert(
+                            MessageRow(
+                                cid = row.cid,
+                                seq = seq,
+                                senderSid = creds?.sid.orEmpty(),
+                                plaintext = content.text,
+                                createdAt = row.createdAt,
+                                mine = !isIncoming,
+                                contentType = content.type,
+                                subject = content.subject,
+                                attachmentsJson = attachmentsJson(content),
+                                serverKey = "${row.cid}:$seq",
+                                carrierStatus = if (!isIncoming) row.carrierState else "none",
+                                carrierError = row.lastError,
+                            ),
+                        )
                     }
-                    db.relayOutboxDao().delete(row.id)
-                } else if (current != null && current.carrierState !in setOf("unknown", "not_applicable")) {
+
+                    db.threadDao().advanceLastSeq(row.cid, seq)
+                    db.relayOutboxDao().markRelaySent(row.id, seq)
+                    if (isIncoming) {
+                        if (row.direction == "incoming_mms") {
+                            row.providerId?.let { db.processedMmsDao().insert(ProcessedMms(it)) }
+                        } else {
+                            row.providerId?.let { db.processedSmsDao().insert(ProcessedSms(it)) }
+                        }
+                        db.relayOutboxDao().delete(row.id)
+                    }
+                }
+
+                client.emitDelivered(row.cid, seq)
+                val current = if (isIncoming) null else db.relayOutboxDao().getByMid(row.mid)
+                if (current != null && current.carrierState !in setOf("unknown", "not_applicable")) {
                     syncOutboxCarrierStatus(current, client)
                 }
                 Log.i(TAG, "Relay outbox delivered mid=${row.mid} seq=$seq")
@@ -688,9 +672,8 @@ class SmsBridgeService : Service() {
         }
     }
 
-    /** Resolve/create the server SMS conversation and encrypt a queued local send. */
-    private suspend fun prepareOutgoingRelay(row: RelayOutbox): RelayOutbox? {
-        if (!row.direction.startsWith("outgoing_")) return row
+    /** Resolve/create the server SMS conversation and encrypt queued carrier content. */
+    private suspend fun prepareRelayOutbox(row: RelayOutbox): RelayOutbox? {
         val c = creds ?: Credentials.load(this) ?: return null
         val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
         val phone = PhoneNumberNormalizer.normalize(row.phoneNumber)
@@ -702,9 +685,34 @@ class SmsBridgeService : Service() {
 
         val oldCid = row.cid
         db.withTransaction {
-            db.threadDao().upsert(resolvedThread)
-            if (oldCid.startsWith("local_") && oldCid != resolvedThread.cid) {
-                db.messageDao().moveProvisionalConversation(oldCid, resolvedThread.cid)
+            val oldThread = db.threadDao().get(oldCid)
+            val currentTarget = db.threadDao().get(resolvedThread.cid)
+            val mergedThread = resolvedThread.copy(
+                serverName = resolvedThread.serverName
+                    ?: currentTarget?.serverName
+                    ?: oldThread?.serverName,
+                localContactName = currentTarget?.localContactName
+                    ?: oldThread?.localContactName,
+                lastSeq = maxOf(
+                    resolvedThread.lastSeq,
+                    currentTarget?.lastSeq ?: 0,
+                    oldThread?.lastSeq ?: 0,
+                ),
+                lastActivityAt = maxOf(
+                    resolvedThread.lastActivityAt,
+                    currentTarget?.lastActivityAt ?: 0L,
+                    oldThread?.lastActivityAt ?: 0L,
+                    row.createdAt,
+                ),
+            )
+            db.threadDao().upsert(mergedThread)
+            if (oldCid != resolvedThread.cid) {
+                // The relay may have discarded/recreated a self-only SMS
+                // conversation while this device still has its former real
+                // cid cached. Merge both provisional and stale acknowledged
+                // history so a 010 reply does not open a second +82 thread and
+                // ACK promotion uses the authoritative cid/serverKey.
+                db.messageDao().moveConversation(oldCid, resolvedThread.cid)
                 db.relayOutboxDao().moveConversation(oldCid, resolvedThread.cid)
                 db.threadDao().deleteByCid(oldCid)
             }
@@ -1036,7 +1044,10 @@ class SmsBridgeService : Service() {
             if (row.optString("cid") != cid) continue
             val phone = ownedPhone(row, username) ?: return null
             val existing = db.threadDao().get(cid)
-            return (existing?.copy(phoneNumber = phone) ?: SmsThread(cid, phone, null))
+            return (existing?.copy(
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+            ) ?: SmsThread(cid, phone, serverConversationName(row)))
                 .also { db.threadDao().upsert(it) }
         }
         return null
@@ -1059,7 +1070,10 @@ class SmsBridgeService : Service() {
             val cid = row.optString("cid")
             if (cid.isBlank()) continue
             val existing = db.threadDao().get(cid)
-            return (existing?.copy(phoneNumber = phone) ?: SmsThread(cid, phone, null))
+            return (existing?.copy(
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+            ) ?: SmsThread(cid, phone, serverConversationName(row)))
                 .also { db.threadDao().upsert(it) }
         }
 
@@ -1070,7 +1084,7 @@ class SmsBridgeService : Service() {
         }
         val cid = created.optString("cid")
         if (cid.isBlank()) return null
-        return SmsThread(cid, phone, null).also { db.threadDao().upsert(it) }
+        return SmsThread(cid, phone, phone).also { db.threadDao().upsert(it) }
     }
 
     private fun ownedPhone(row: JSONObject, username: String): String? {
@@ -1083,6 +1097,9 @@ class SmsBridgeService : Service() {
         }
         return SmsConversationPolicy.ownedPhone(row.optString("name"), members, username)
     }
+
+    private fun serverConversationName(row: JSONObject): String? =
+        row.optString("name").trim().takeIf { it.isNotEmpty() }
 
     private suspend fun syncFromServer() {
         syncMutex.withLock {
@@ -1135,7 +1152,10 @@ class SmsBridgeService : Service() {
             if (cid.isNotBlank() && phone != null) {
                 val existing = db.threadDao().get(cid)
                 db.threadDao().upsert(
-                    existing?.copy(phoneNumber = phone) ?: SmsThread(cid, phone, null),
+                    existing?.copy(
+                        phoneNumber = phone,
+                        serverName = serverConversationName(row),
+                    ) ?: SmsThread(cid, phone, serverConversationName(row)),
                 )
                 ownedCids += cid
             }
@@ -1155,43 +1175,16 @@ class SmsBridgeService : Service() {
         Regex("^\\+?[0-9*#]{3,24}$").matches(value)
 
     private fun startForeground() {
-        val notif = buildNotification()
+        val notif = BridgeNotifications.build(this)
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
-                NOTIF_ID,
+                BridgeNotifications.NOTIF_ID,
                 notif,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING,
             )
         } else {
-            startForeground(NOTIF_ID, notif)
+            startForeground(BridgeNotifications.NOTIF_ID, notif)
         }
-    }
-
-    private fun buildNotification(): Notification {
-        val pi = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("SecureMsg SMS Bridge")
-            .setContentText("다기기 SMS 동기화 활성")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentIntent(pi)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun createNotificationChannel() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "SecureMsg Bridge",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply { description = "SMS 동기화 백그라운드 서비스" },
-        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -1,5 +1,40 @@
 # 업데이트 내역
 
+## v0.9.0 (2026-08-08) — GitHub 이슈 4건 해결 + Android 구조 리팩토링
+
+### GitHub 이슈 수정
+
+- **#1 차단 키워드 동기화**
+  - 이전 서버 캐시를 tombstone 기준선으로 사용해 다른 기기에서 삭제한 규칙을 Android가 다시 올리는 “삭제 부활” 문제 해결
+  - 동기화·추가·삭제를 단일 Mutex로 직렬화하고, 명시적 로컬 재추가와 네트워크 실패 재시도를 구분
+  - Android 설정 화면에 다른 기기에서 추가한 키워드·발신번호도 표시하고 직접 삭제 가능
+  - 에뮬레이터+운영 relay에서 서버 삭제 → 앱 재연결 → Room prune → 서버 미부활 전 구간 검증
+- **#2 앱내 업데이트 실패**
+  - `PackageInstaller.Session` 기반 설치와 결과 콜백 추가, Play Protect 차단·사용자 취소·서명 충돌·저장공간 부족별 안내/재시도 UI 제공
+  - `STATUS_PENDING_USER_ACTION` 시스템 설치 확인 Intent 처리 및 콜백 UUID 검증
+  - 다운로드 바이트 수·패키지명·설치된 앱과 APK 서명 인증서 SHA-256 일치 검증
+  - 프로세스 재생성에도 pending 설치 상태 복원, 실패 세션 abandon, legacy installer 반복 실행 방지
+- **#3 휴대폰 연락처 동기화**
+  - 설정에서 명시적으로 실행하는 연락처 이름 동기화 추가 (`READ_CONTACTS`는 실행 시에만 요청)
+  - 번호를 정규화해 기존 SMS 스레드의 로컬 전용 이름에 반영하고 마지막 동기화 시각·번호/일치 개수 표시
+  - 서버 대화명과 로컬 주소록 이름을 Room 컬럼으로 분리해 어느 쪽도 동기화 과정에서 덮어쓰거나 삭제하지 않음
+  - 연락처 이름·번호는 relay/API로 전송하지 않고 Android 기기 내부에서만 처리
+- **#4 상대방 답장 표시 불가**
+  - 한국 로컬 번호(`010`, `02`, `0xx`, `050x`)와 `+82`/`82`/`0082` 표기를 같은 canonical 대화 키로 통일(Android·웹)
+  - 수신 SMS/MMS를 relay 연결/서버 ACK 전에 Room 메시지+내구성 outbox에 원자적으로 저장해 오프라인에서도 즉시 표시
+  - stale/provisional CID를 현재 서버 CID로 병합하고 Socket.IO echo와 ACK 순서 경합 시 중복/UNIQUE 오류 방지
+  - 에뮬레이터에서 `01012340000` 답장이 기존 `+821012340000` 스레드로 합쳐지고 seq 확정·outbox 삭제되는 것까지 실검증
+
+### 리팩토링·품질
+
+- `MainActivity.kt` 1,454줄을 약 550줄로 축소하고 로그인·메인·메시지·설정·업데이트 UI를 `ui/` 파일로 분리
+- 서버 URL 설정과 foreground 알림을 `ServerConfig`·`BridgeNotifications`로 분리, 웹 `useStore` 순수 helper 추출
+- SMS 핵심 권한과 Android 13+ 알림 권한 상태를 분리해 알림 거부가 브리지 장애로 표시되지 않도록 수정
+- Android debug 빌드에서 같은 LAN의 로컬 relay HTTP 테스트 허용(릴리스 빌드는 HTTPS-only 유지)
+- 신규 기능: Android 대화 상대·전화번호 및 대화 내 메시지 로컬 검색(차단 메시지 본문은 검색 결과에서 제외)
+- Android 77개 단위 테스트 + lint + Debug APK 빌드, 웹 61개 테스트 + TypeScript + production build, 서버 32개 테스트 통과
+- versionCode 11 / versionName 0.9.0
+
 ## v0.8.0 (2026-08-05) — Android UI 리디자인: 웹 브랜드 이식
 
 - **앱 전체 디자인을 웹 브랜드(v0.4.4 토큰)로 통일**: 딥 다크 네이비 배경(#0A0F16) + teal→sky 그라디언트 강조 + 텍스트 4단계 위계

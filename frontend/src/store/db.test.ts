@@ -2,7 +2,9 @@ import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
 import {
   addBlockKeyword,
+  addBlockedSender,
   listBlockKeywords,
+  listBlockedSenders,
   getCursor,
   getMeta,
   listMessages,
@@ -95,6 +97,18 @@ describe("blocklist keywords", () => {
 
   it("rejects empty keywords", async () => {
     await expect(addBlockKeyword("   ")).rejects.toThrow();
+  });
+});
+
+describe("blocked senders", () => {
+  it("canonicalizes and dedupes newly added Korean numbers", async () => {
+    const first = await addBlockedSender("010-1234-5678");
+    const second = await addBlockedSender("+82 10 1234 5678");
+    expect(first.sender).toBe("+821012345678");
+    expect(second.id).toBe(first.id);
+    expect((await listBlockedSenders()).filter(
+      (row) => row.sender === "+821012345678",
+    )).toHaveLength(1);
   });
 });
 

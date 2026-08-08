@@ -30,8 +30,9 @@ object OutgoingSmsDispatcher {
         val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
             cid = "local_${UUID.randomUUID().toString().replace("-", "")}",
             phoneNumber = phone,
-            contactName = null,
+            serverName = null,
         ).also { db.threadDao().upsert(it) }
+        db.threadDao().touch(thread.cid, System.currentTimeMillis())
         val content = RelayContentCodec.text(text)
         val contentJson = RelayContentCodec.encode(content)
         val mid = UUID.randomUUID().toString()

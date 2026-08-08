@@ -12,6 +12,7 @@
  */
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import type { DeviceKeypair } from "../crypto/keys";
+import { normalizePhone } from "./conversationPolicy";
 
 interface MetaRow {
   key: "current";
@@ -344,7 +345,9 @@ export async function clearBlockKeywords(): Promise<void> {
 
 export async function addBlockedSender(sender: string): Promise<SenderRow> {
   const d = await db();
-  const normalized = sender.trim();
+  // Canonicalize new rows only; legacy IndexedDB rows remain intact and are
+  // handled compatibly by matchesBlockedSender() at read time.
+  const normalized = normalizePhone(sender);
   if (!normalized) throw new Error("sender is empty");
   const tx = d.transaction("blockedSenders", "readwrite");
   const existing = await tx.store.index("by-sender").get(normalized);

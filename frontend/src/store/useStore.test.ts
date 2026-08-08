@@ -1,6 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { b64u, initCrypto } from "../crypto/keys";
+import { api } from "../net/api";
 import { putMessage, type MessageRow } from "./db";
 import { decodeRelayContent, useStore } from "./useStore";
 
@@ -16,6 +17,43 @@ function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): Message
     ...extra,
   };
 }
+
+describe("Korean SMS conversation identity", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useStore.setState({ username: null, conversations: [], error: null });
+  });
+
+  it("reuses a legacy local-number conversation for a +82 recipient", async () => {
+    const create = vi.spyOn(api, "createConversation");
+    useStore.setState({
+      username: "alice",
+      conversations: [{
+        cid: "legacy_sms",
+        conv_id: 1,
+        name: "01012345678",
+        members: ["alice"],
+        created_at: 1,
+      }],
+    });
+
+    await expect(useStore.getState().newSmsConversation("+821012345678"))
+      .resolves.toBe("legacy_sms");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("creates a new Korean conversation with its canonical +82 name", async () => {
+    const create = vi.spyOn(api, "createConversation")
+      .mockResolvedValue({ ok: true, cid: "new_sms" });
+    vi.spyOn(api, "listConversations")
+      .mockResolvedValue({ ok: true, conversations: [] });
+    useStore.setState({ username: "alice", conversations: [] });
+
+    await expect(useStore.getState().newSmsConversation("010-1234-5678"))
+      .resolves.toBe("new_sms");
+    expect(create).toHaveBeenCalledWith(["alice"], "+821012345678");
+  });
+});
 
 describe("selectConversation race", () => {
   afterEach(() => {

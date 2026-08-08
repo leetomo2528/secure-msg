@@ -11,6 +11,10 @@ class SmsConversationPolicyTest {
             "+821012345678",
             SmsConversationPolicy.ownedPhone("+82 10-1234-5678", listOf("alice"), "alice"),
         )
+        assertEquals(
+            "+821012345678",
+            SmsConversationPolicy.ownedPhone("01012345678", listOf("alice"), "alice"),
+        )
     }
 
     @Test

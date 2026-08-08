@@ -9,9 +9,22 @@ import kotlinx.coroutines.flow.Flow
 data class SmsThread(
     @PrimaryKey val cid: String,
     val phoneNumber: String,
-    val contactName: String?,
+    /** Relay-owned conversation label. Contact sync must never mutate this field. */
+    @ColumnInfo(name = "contactName") val serverName: String?,
     val lastSeq: Int = 0,
-)
+    /** Local ordering key; advances even while a relay sequence is unavailable. */
+    val lastActivityAt: Long = 0L,
+    /** Android address-book name. This value is local-only and is never sent to the relay. */
+    val localContactName: String? = null,
+) {
+    val displayName: String
+        get() = localContactName?.takeIf { it.isNotBlank() }
+            ?: serverName?.takeIf { it.isNotBlank() }
+            ?: phoneNumber
+
+    val showsPhoneSubtitle: Boolean
+        get() = displayName != phoneNumber
+}
 
 @Entity(
     tableName = "messages",
@@ -137,7 +150,7 @@ data class CarrierPartResult(
 
 @Dao
 interface ThreadDao {
-    @Query("SELECT * FROM sms_threads ORDER BY lastSeq DESC")
+    @Query("SELECT * FROM sms_threads ORDER BY lastActivityAt DESC, lastSeq DESC")
     fun observeAll(): Flow<List<SmsThread>>
 
     @Query("SELECT * FROM sms_threads WHERE cid = :cid")
@@ -161,8 +174,14 @@ interface ThreadDao {
     @Query("UPDATE sms_threads SET lastSeq = MAX(lastSeq, :seq) WHERE cid = :cid")
     suspend fun advanceLastSeq(cid: String, seq: Int)
 
+    @Query("UPDATE sms_threads SET lastActivityAt = MAX(lastActivityAt, :at) WHERE cid = :cid")
+    suspend fun touch(cid: String, at: Long)
+
+    @Query("UPDATE sms_threads SET localContactName = :name WHERE cid = :cid")
+    suspend fun updateLocalContactNameByCid(cid: String, name: String?)
+
     @Query("UPDATE sms_threads SET contactName = :name WHERE cid = :cid")
-    suspend fun updateNameByCid(cid: String, name: String)
+    suspend fun updateServerNameByCid(cid: String, name: String?)
 }
 
 @Dao
@@ -188,6 +207,9 @@ interface MessageDao {
         attachmentsJson: String?,
     )
 
+    @Query("DELETE FROM messages WHERE serverKey = :serverKey AND id != :localId")
+    suspend fun deleteServerDuplicate(serverKey: String, localId: Long)
+
     @Query("UPDATE messages SET blocked = :blocked WHERE cid = :cid AND seq = :seq")
     suspend fun setBlocked(cid: String, seq: Int, blocked: Boolean)
 
@@ -210,6 +232,14 @@ interface MessageDao {
 
     @Query("UPDATE messages SET cid = :newCid WHERE cid = :oldCid AND serverKey IS NULL")
     suspend fun moveProvisionalConversation(oldCid: String, newCid: String)
+
+    /**
+     * Merge a stale local SMS thread into the currently authoritative server
+     * conversation. Historical serverKey values intentionally stay unchanged:
+     * they remain valid dedupe identifiers for the old relay conversation.
+     */
+    @Query("UPDATE messages SET cid = :newCid WHERE cid = :oldCid")
+    suspend fun moveConversation(oldCid: String, newCid: String)
 }
 
 @Dao
@@ -315,8 +345,8 @@ interface RelayOutboxDao {
     @Query("SELECT * FROM relay_outbox WHERE mid = :mid LIMIT 1")
     suspend fun getByMid(mid: String): RelayOutbox?
 
-    @Query("SELECT * FROM relay_outbox WHERE providerId = :providerId LIMIT 1")
-    suspend fun getByProviderId(providerId: Long): RelayOutbox?
+    @Query("SELECT * FROM relay_outbox WHERE providerId = :providerId AND direction = :direction LIMIT 1")
+    suspend fun getByProviderId(providerId: Long, direction: String): RelayOutbox?
 
     @Insert
     suspend fun insert(row: RelayOutbox): Long
@@ -387,7 +417,7 @@ interface CarrierPartResultDao {
         ProcessedMms::class,
         CarrierPartResult::class,
     ],
-    version = 6,
+    version = 8,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -415,6 +445,8 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_3_4,
                     MIGRATION_4_5,
                     MIGRATION_5_6,
+                    MIGRATION_6_7,
+                    MIGRATION_7_8,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -551,6 +583,28 @@ abstract class AppDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS index_relay_outbox_relayState_createdAt " +
                         "ON relay_outbox(relayState, createdAt)"
                 )
+            }
+        }
+
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE sms_threads ADD COLUMN lastActivityAt " +
+                        "INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "UPDATE sms_threads SET lastActivityAt = COALESCE(" +
+                        "(SELECT MAX(createdAt) FROM messages " +
+                        "WHERE messages.cid = sms_threads.cid), 0)",
+                )
+            }
+        }
+
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Preserve contactName as the relay-owned label. Address-book
+                // synchronization starts with an independent, local-only slot.
+                db.execSQL("ALTER TABLE sms_threads ADD COLUMN localContactName TEXT")
             }
         }
     }

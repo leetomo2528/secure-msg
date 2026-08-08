@@ -51,6 +51,8 @@ secure-msg/
 │   └── app/src/main/java/com/yunjelee/securemsg/
 │       ├── SmsReceiver.kt          # 기본 SMS 수신·차단·Provider 저장
 │       ├── SmsBridgeService.kt     # 웹/기기 간 암호화 relay와 carrier bridge
+│       ├── ContactSync.kt          # 연락처 이름 로컬 매칭(서버 전송 없음)
+│       ├── PhoneNumberNormalizer.kt # 한국 번호 +82 canonical identity
 │       ├── SpamClassifier.kt       # 오프라인 자동 스팸 점수 판정
 │       ├── BlocklistManager.kt     # 키워드/발신번호/자동 스팸 정책
 │       ├── SmsProvider.kt          # 시스템 SMS Provider 입출력
@@ -60,7 +62,8 @@ secure-msg/
 │       ├── RelayContent.kt          # text/MMS envelope 내부 포맷
 │       ├── CarrierStatusReceiver.kt # SMS/MMS SENT·DELIVERED 결과
 │       ├── Database.kt             # Room: 스레드·격리함·처리 이력
-│       └── MainActivity.kt         # 로그인·권한·기본 SMS 역할·설정
+│       ├── MainActivity.kt         # 권한·기본 SMS 역할·업데이트·화면 호스트
+│       └── ui/                     # 로그인·메시지·설정·업데이트 Compose 화면
 ├── frontend/                       # React + TypeScript + Vite PWA
 │   └── src/
 │       ├── store/useStore.ts       # 로그인·암복호화·동기화 orchestration
@@ -117,7 +120,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 2. `기본 SMS 앱으로 설정`을 눌러 시스템 역할 승인
 3. 이어서 표시되는 SMS·MMS·알림 권한 허용
 4. Android 앱의 `차단 키워드`와 `발신번호 차단` 설정
-5. 브리지 foreground 알림이 유지되는지 확인
+5. 필요하면 `차단·설정 → 연락처 이름 동기화`를 눌러 연락처 이름을 기기 내부 대화 목록에 반영
+6. 브리지 foreground 알림이 유지되는지 확인
 
 기본 SMS 앱 역할을 승인하지 않으면 Android는 SMS를 읽을 수 있어도 다른 SMS 앱의 수신·알림을 차단할 수 없다. 따라서 “문자가 들어오면 실제로 자동 차단”하는 기능은 역할 승인 후에만 유효하다.
 
@@ -130,7 +134,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 3. `업데이트`를 누르면 진행률 표시줄과 함께 APK를 내려받고, 완료 시 시스템 설치 화면이 자동으로 열린다.
 4. 최초 1회 시스템 설정에서 `이 앱의 설치 허용`(알 수 없는 앱 설치)을 켜면, 이후부터는 권한 확인 후 설치가 자동으로 이어진다.
 
-- APK는 GitHub 릴리스의 공식 자산을 HTTPS로 내려받으며, 설치 전 시스템 패키지 설치기가 서명 일치를 검증한다.
+- APK는 GitHub 릴리스의 공식 자산을 HTTPS로 내려받고, 앱이 자산 크기·패키지명·현재 설치본과 APK 서명 인증서 SHA-256 일치를 먼저 검증한 뒤 시스템 패키지 설치기로 넘긴다.
+- Play Protect가 사이드로드 APK를 차단하거나 사용자가 취소하면 앱으로 결과가 돌아와 원인별 안내를 표시한다. 차단 시 시스템 세부정보에서 설치를 허용하거나 GitHub 릴리스에서 APK를 직접 설치할 수 있다.
 - 업데이트가 성립하려면 서명 키가 같아야 하므로, 릴리스는 계속 이 Mac의 디버그 키스토어(`~/.android/debug.keystore`)로 서명된 APK를 사용한다. 키스토어를 잃어버리면 기존 설치를 덮어쓸 수 없으니 주의.
 - 릴리스 방법: `gh release create v<version> android/app/build/outputs/apk/debug/app-debug.apk` — 이 자산이 곧 업데이트 공급 소스다.
 
@@ -171,6 +176,7 @@ npm run build
 - 통신사 연동은 Android 31 이상을 대상으로 한다. iOS는 임의 SMS 앱이 통신사 SMS 수신을 가로채는 동일한 경로를 제공하지 않으므로 별도 구현이 필요하다.
 - 계정당 통신사 SMS 게이트웨이는 Android 1대로 제한한다. 여러 브라우저/PWA 기기는 추가할 수 있지만, 서로 다른 SIM의 Android 여러 대가 같은 문자를 중복 발신하지 않도록 두 번째 Android 게이트웨이 등록은 거부한다.
 - 통신사 발신으로 해석되는 대화는 전화번호 이름을 가진 **본인 단독 대화**로 제한한다. 다른 사용자가 포함된 그룹 대화는 이름이 전화번호처럼 보여도 Android가 통신사 발신 명령으로 처리하지 않는다. 동일 번호의 단독 대화 생성은 서버에서 원자적으로 재사용한다.
+- 한국 전화번호 대화 키는 `+82` 형식으로 정규화한다. `010 + 7/8자리`, `02 + 7/8자리`, 그 밖의 `0xx + 7/8자리`, `050x + 8자리` 로컬 번호와 유효 길이의 `82`/`0082` 표기는 같은 대화로 본다. 짧은 대표번호·`*`/`#` 서비스 코드와 다른 국가의 국제번호는 한국 번호로 바꾸지 않는다. 기존 DB 라벨은 마이그레이션하지 않고 읽을 때 비교 키만 정규화한다.
 - MMS 텍스트·제목·첨부파일(최대 8개, 전체 512KB)은 구현되어 있다. Android 기본 SMS 앱 역할과
   통신사 APN/MMSC 설정이 필요하며, raw PDU 처리 차이 때문에 실제 발신·수신은 기기/SIM별로 검증해야 한다.
   웹의 MMS 첨부파일은 암호화 envelope에 포함되고, 서버는 파일 평문을 보지 못한다.
@@ -183,6 +189,7 @@ npm run build
 
 ## v0.6 신규 기능
 
+- (v0.9) **GitHub 이슈 4건 해결 + Android 검색**: 차단 규칙 삭제 부활 방지, 안전한 인앱 설치 결과 처리, 로컬 연락처 이름 동기화, `010`↔`+82` 답장 스레드 통합·오프라인 즉시 표시, 대화·메시지 로컬 검색
 - (v0.8) **Android UI 리디자인**: 웹 브랜드(딥 다크 + teal→sky 그라디언트)를 앱 전체에 이식 — 카드 레이아웃, 챗 버블, 그라디언트 버튼·아바타
 - (v0.7) **Android 인앱 자동 업데이트**: 새 릴리스를 앱이 스스로 감지→다운로드→설치한다. [사용법 참고](#android-인앱-자동-업데이트-v07)
 - **차단 목록 기기 간 동기화**: 키워드·발신번호를 한 기기에서 추가/삭제하면 `blocklist_updated` 실시간 이벤트로 다른 기기에 즉시 반영된다.

@@ -18,7 +18,12 @@ object BlocklistManager {
         val shared = BlocklistSync.load()
         val normalizedPhone = PhoneNumberNormalizer.normalize(phoneNumber)
         if (normalizedPhone.isNotBlank()) {
-            if (db.blockedSenderDao().contains(normalizedPhone)) {
+            // Older releases stored Korean numbers as 010..., while current
+            // releases store +8210.... Match existing Room rows without a
+            // destructive or one-way data migration.
+            if (db.blockedSenderDao().getAll().any {
+                senderMatches(normalizedPhone, it.phoneNumber)
+            }) {
                 return Decision(true, "차단한 발신번호")
             }
             if (shared.senders.any { senderMatches(normalizedPhone, it) }) {
