@@ -66,4 +66,24 @@ class UpdateValidationTest {
         assertTrue(UpdateValidation.shouldStartInstallSession(PendingInstallState.FAILED))
         assertTrue(UpdateValidation.shouldStartInstallSession(null))
     }
+
+    @Test
+    fun installedTargetReconcilesWhenPackageReplacementKilledCallback() {
+        assertTrue(
+            UpdateValidation.installedTargetSatisfied("0.9.0", "0.9.0", 2_000, 1_000),
+        )
+        assertTrue(
+            UpdateValidation.installedTargetSatisfied("0.9.0", "0.10.0", 1, 2_000),
+        )
+    }
+
+    @Test
+    fun pendingTargetIsNotClearedBeforeInstallOrWhenStillOlder() {
+        assertFalse(
+            UpdateValidation.installedTargetSatisfied("0.9.0", "0.9.0", 1_000, 2_000),
+        )
+        assertFalse(
+            UpdateValidation.installedTargetSatisfied("0.10.0", "0.9.0", 3_000, 2_000),
+        )
+    }
 }

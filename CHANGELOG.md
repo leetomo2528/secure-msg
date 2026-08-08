@@ -32,7 +32,7 @@
 - SMS 핵심 권한과 Android 13+ 알림 권한 상태를 분리해 알림 거부가 브리지 장애로 표시되지 않도록 수정
 - Android debug 빌드에서 같은 LAN의 로컬 relay HTTP 테스트 허용(릴리스 빌드는 HTTPS-only 유지)
 - 신규 기능: Android 대화 상대·전화번호 및 대화 내 메시지 로컬 검색(차단 메시지 본문은 검색 결과에서 제외)
-- Android 77개 단위 테스트 + lint + Debug APK 빌드, 웹 61개 테스트 + TypeScript + production build, 서버 32개 테스트 통과
+- Android 79개 단위 테스트 + lint + Debug APK 빌드, 웹 61개 테스트 + TypeScript + production build, 서버 32개 테스트 통과
 - versionCode 11 / versionName 0.9.0
 
 ## v0.8.0 (2026-08-05) — Android UI 리디자인: 웹 브랜드 이식

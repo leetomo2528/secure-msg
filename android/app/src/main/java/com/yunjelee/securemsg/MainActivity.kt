@@ -403,6 +403,25 @@ class MainActivity : ComponentActivity() {
 
     private fun restorePendingUpdate() {
         val pending = updater.pendingUpdate() ?: return
+        val packageUpdatedAt = try {
+            packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        } catch (_: PackageManager.NameNotFoundException) {
+            0L
+        }
+        if (pending.state == PendingInstallState.SESSION_SUBMITTED &&
+            UpdateValidation.installedTargetSatisfied(
+                pending.info.versionName,
+                BuildConfig.VERSION_NAME,
+                packageUpdatedAt,
+                pending.file.lastModified(),
+            )
+        ) {
+            pending.file.delete()
+            updater.clearPendingUpdate()
+            pendingInstallFile = null
+            updateState = UpdateUiState.Idle
+            return
+        }
         pendingInstallFile = pending.file
         updateState = when (pending.state) {
             PendingInstallState.AWAITING_PERMISSION ->

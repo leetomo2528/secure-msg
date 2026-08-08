@@ -410,6 +410,24 @@ object UpdateValidation {
     fun shouldStartInstallSession(state: PendingInstallState?): Boolean =
         state != PendingInstallState.SESSION_SUBMITTED
 
+    /**
+     * Package replacement can kill the installer process before its terminal
+     * callback is delivered. Reconcile the persisted session on next launch.
+     * For a same-version developer-flow install, the package update timestamp
+     * must be newer than the downloaded APK so an Activity recreation before
+     * confirmation does not falsely complete the update.
+     */
+    fun installedTargetSatisfied(
+        targetVersion: String,
+        currentVersion: String,
+        packageUpdatedAt: Long,
+        apkDownloadedAt: Long,
+    ): Boolean {
+        if (AppUpdater.isNewer(currentVersion, targetVersion)) return true
+        if (AppUpdater.isNewer(targetVersion, currentVersion)) return false
+        return packageUpdatedAt >= apkDownloadedAt
+    }
+
     private fun sha256(certificate: ByteArray): String =
         MessageDigest.getInstance("SHA-256")
             .digest(certificate)
