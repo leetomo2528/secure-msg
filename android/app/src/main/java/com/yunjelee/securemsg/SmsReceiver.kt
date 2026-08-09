@@ -15,8 +15,9 @@ import kotlinx.coroutines.launch
  * SMS app. We classify before writing to the system SMS Provider; a blocked message
  * is kept in the local quarantine table and is never notified or relayed.
  *
- * This receiver is minimal — all heavy work happens in the service to survive
- * background execution limits.
+ * The receiver performs only classification plus the mandatory durable local
+ * transaction. Network work remains in the foreground service so a relay outage
+ * cannot delay notification or local presentation.
  */
 class SmsReceiver : BroadcastReceiver() {
 
@@ -78,9 +79,26 @@ class SmsReceiver : BroadcastReceiver() {
                     }
                 }
 
-                // As the default SMS app, SecureMsg owns provider persistence.
+                // As the default SMS app, SecureMsg owns provider persistence. Room must
+                // become authoritative before the notification can open the conversation.
                 val providerId = SmsProvider.insertIncoming(context, sender, body, receivedAt)
-                SmsNotifier.notifyIncoming(context, sender, body, receivedAt)
+                val persisted = IncomingMessageRepository(
+                    db ?: AppDatabase.get(context),
+                ).persist(
+                    direction = "incoming_sms",
+                    phoneNumber = sender,
+                    content = RelayContentCodec.text(body),
+                    providerId = providerId,
+                    receivedAt = receivedAt,
+                )
+                SmsNotifier.notifyIncoming(
+                    context = context,
+                    phoneNumber = persisted.conversation.normalizedPhone,
+                    body = body,
+                    date = receivedAt,
+                    cid = persisted.conversation.cid,
+                    messageIdentity = persisted.outbox.mid,
+                )
                 Log.i(
                     "SmsReceiver",
                     "SMS accepted from ${PhoneNumberNormalizer.redact(sender)} (${body.length} chars)",

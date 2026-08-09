@@ -36,6 +36,11 @@ B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 _socketio_ref: SocketIO | None = None
 
 
+def _device_room(sid: str, session_version: int) -> str:
+    """Versioned rooms prevent revoked live sockets from receiving new pushes."""
+    return f"device:{sid}:session:{session_version}"
+
+
 def emit_to_user_devices(
     user_id: int, event: str, data: dict, exclude_sid: str | None = None
 ) -> None:
@@ -46,10 +51,15 @@ def emit_to_user_devices(
     """
     if _socketio_ref is None:
         return
-    for sid in store.list_user_device_sids(user_id):
+    for device in store.list_user_devices(user_id):
+        sid = device["sid"]
         if sid == exclude_sid:
             continue
-        _socketio_ref.emit(event, data, to=f"device:{sid}")
+        _socketio_ref.emit(
+            event,
+            data,
+            to=_device_room(sid, device["session_version"]),
+        )
 
 
 def emit_to_conv_members(conv_id: int, event: str, data: dict) -> None:
@@ -62,19 +72,24 @@ def emit_to_conv_members(conv_id: int, event: str, data: dict) -> None:
 def attach_socketio(app, socketio: SocketIO) -> None:
     global _socketio_ref
     _socketio_ref = socketio
-    clients: dict[str, tuple[int, str, int, int]] = {}
+    clients: dict[str, tuple[int, str, int, int, int]] = {}
 
     def current_client() -> tuple[int, str, int] | None:
         record = clients.get(request.sid)
         if not record:
             return None
-        uid, sid, device_id, expires_at = record
+        uid, sid, device_id, expires_at, session_version = record
         if expires_at <= int(time.time()):
             clients.pop(request.sid, None)
             disconnect_client()
             return None
         device = store.get_device_by_sid(sid)
-        if not device or device["user_id"] != uid or device["id"] != device_id:
+        if (
+            not device
+            or device["user_id"] != uid
+            or device["id"] != device_id
+            or device["session_version"] != session_version
+        ):
             clients.pop(request.sid, None)
             # Same contract as the expiry branch above: a revoked/unknown device
             # must not keep an idle socket alive (README: revoked sockets are
@@ -109,19 +124,30 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if not decoded:
             raise ConnectionRefusedError("invalid token")
         try:
-            uid, sid, expires_at = (
+            uid, sid, expires_at, session_version = (
                 int(decoded["uid"]),
                 str(decoded["sid"]),
                 int(decoded["exp"]),
+                int(decoded["sv"]),
             )
         except (KeyError, TypeError, ValueError):
             raise ConnectionRefusedError("invalid token")
         dev = store.get_device_by_sid(sid)
-        if not dev or dev["user_id"] != uid:
+        if (
+            not dev
+            or dev["user_id"] != uid
+            or dev["session_version"] != session_version
+        ):
             raise ConnectionRefusedError("device unknown")
         store.touch_device(dev["id"])
-        clients[request.sid] = (uid, sid, dev["id"], expires_at)
-        join_room(f"device:{sid}")
+        clients[request.sid] = (
+            uid,
+            sid,
+            dev["id"],
+            expires_at,
+            session_version,
+        )
+        join_room(_device_room(sid, session_version))
         log.info("connect uid=%s sid=%s", uid, sid)
 
     @socketio.on("disconnect")
@@ -247,7 +273,11 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         # Fan out exactly once per registered device. Sending repeatedly to a
         # shared user room would duplicate carrier SMS when a user has 2+ devices.
         for device in members:
-            socketio.emit("message_new", envelope, to=f"device:{device['sid']}")
+            socketio.emit(
+                "message_new",
+                envelope,
+                to=_device_room(device["sid"], device["session_version"]),
+            )
         return {"ok": True, "seq": seq, "id": msg_id}
 
     @socketio.on("message_delivered")
@@ -331,7 +361,11 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             "carrier_updated_at": result["updated_at"],
         }
         for member in members:
-            socketio.emit("message_status", event, to=f"device:{member['sid']}")
+            socketio.emit(
+                "message_status",
+                event,
+                to=_device_room(member["sid"], member["session_version"]),
+            )
         return {"ok": True, **event}
 
     @socketio.on("typing")
@@ -364,5 +398,5 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             socketio.emit(
                 "typing",
                 {"cid": cid, "user_id": uid, "is_typing": is_typing},
-                to=f"device:{device['sid']}",
+                to=_device_room(device["sid"], device["session_version"]),
             )

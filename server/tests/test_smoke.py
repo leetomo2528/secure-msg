@@ -1,9 +1,11 @@
 import hashlib
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 with tempfile.NamedTemporaryFile(
     prefix="securemsg-test-",
@@ -68,6 +70,49 @@ class ServerSmokeTest(unittest.TestCase):
         listed = self.client.get("/api/conversations", headers=self.headers)
         self.assertEqual(listed.status_code, 200, listed.json)
         self.assertEqual(listed.json["conversations"][0]["name"], "+821012345678")
+        self.assertEqual(
+            listed.json["conversations"][0]["synced_contact_name"], ""
+        )
+
+    def test_existing_database_migrates_synced_contact_name(self):
+        import store
+
+        with tempfile.NamedTemporaryFile(
+            prefix="securemsg-legacy-contact-", suffix=".db", delete=False
+        ) as legacy_file:
+            legacy_path = Path(legacy_file.name)
+        try:
+            with sqlite3.connect(legacy_path) as connection:
+                connection.execute(
+                    "CREATE TABLE conversations ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "cid TEXT NOT NULL UNIQUE, "
+                    "name TEXT NOT NULL DEFAULT '', "
+                    "created_at INTEGER NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO conversations(cid, name, created_at) VALUES (?, ?, ?)",
+                    ("legacy-contact", "+821012345678", 1),
+                )
+            with mock.patch.object(store, "DB_PATH", legacy_path):
+                store.init_schema()
+                with store.conn_ctx() as connection:
+                    columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(conversations)"
+                        ).fetchall()
+                    }
+                    row = connection.execute(
+                        "SELECT name, synced_contact_name FROM conversations "
+                        "WHERE cid = 'legacy-contact'"
+                    ).fetchone()
+            self.assertIn("synced_contact_name", columns)
+            self.assertEqual(row["name"], "+821012345678")
+            self.assertEqual(row["synced_contact_name"], "")
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                legacy_path.with_name(legacy_path.name + suffix).unlink(missing_ok=True)
 
     def test_sms_conversation_creation_is_idempotent(self):
         first = self.create_conversation("+821099988877")
@@ -110,6 +155,211 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(revoked.status_code, 200, revoked.json)
         after = self.client.get("/api/devices", headers=self.headers)
         self.assertEqual(after.status_code, 401, after.json)
+
+    def test_logout_revokes_rest_socket_reconnect_and_connected_socket(self):
+        connected = socketio.test_client(app, auth={"token": self.token})
+        self.assertTrue(connected.is_connected())
+
+        logged_out = self.client.post("/api/logout", headers=self.headers)
+        self.assertEqual(logged_out.status_code, 200, logged_out.json)
+        self.assertTrue(logged_out.json["logged_out"])
+
+        # The device and its public keys remain registered, but this token can
+        # no longer authorize either transport.
+        denied = self.client.get("/api/devices", headers=self.headers)
+        self.assertEqual(denied.status_code, 401, denied.json)
+        reconnect = socketio.test_client(app, auth={"token": self.token})
+        self.assertFalse(reconnect.is_connected())
+
+        import sockets
+        import store
+
+        user = store.get_user_by_name(self.username)
+        sockets.emit_to_user_devices(user["id"], "session_probe", {"value": 1})
+        pushed = [e for e in connected.get_received() if e["name"] == "session_probe"]
+        self.assertEqual(pushed, [])
+
+        # A socket authenticated before logout is checked again for every
+        # event; it is disconnected before its event can be processed.
+        connected.emit("message_send", {}, callback=True)
+        self.assertFalse(connected.is_connected())
+
+        self.assertIsNotNone(store.get_device_by_sid(self.sid))
+        relogin = self.client.post(
+            "/api/device-login",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "sid": self.sid,
+            },
+        )
+        self.assertEqual(relogin.status_code, 200, relogin.json)
+        restored = self.client.get(
+            "/api/devices",
+            headers={"Authorization": f"Bearer {relogin.json['token']}"},
+        )
+        self.assertEqual(restored.status_code, 200, restored.json)
+
+    def test_device_login_rotates_only_that_devices_session(self):
+        second = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "second-session",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            },
+        )
+        self.assertEqual(second.status_code, 200, second.json)
+        second_headers = {
+            "Authorization": f"Bearer {second.json['token']}"
+        }
+        first_socket = socketio.test_client(app, auth={"token": self.token})
+        second_socket = socketio.test_client(
+            app, auth={"token": second.json["token"]}
+        )
+        self.assertTrue(first_socket.is_connected())
+        self.assertTrue(second_socket.is_connected())
+        first_socket.get_received()
+        second_socket.get_received()
+
+        relogin = self.client.post(
+            "/api/device-login",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "sid": self.sid,
+            },
+        )
+        self.assertEqual(relogin.status_code, 200, relogin.json)
+        self.assertNotEqual(relogin.json["token"], self.token)
+
+        old_denied = self.client.get("/api/devices", headers=self.headers)
+        self.assertEqual(old_denied.status_code, 401, old_denied.json)
+        new_allowed = self.client.get(
+            "/api/devices",
+            headers={"Authorization": f"Bearer {relogin.json['token']}"},
+        )
+        self.assertEqual(new_allowed.status_code, 200, new_allowed.json)
+        other_allowed = self.client.get("/api/devices", headers=second_headers)
+        self.assertEqual(other_allowed.status_code, 200, other_allowed.json)
+
+        import sockets
+        import store
+
+        user = store.get_user_by_name(self.username)
+        sockets.emit_to_user_devices(user["id"], "rotation_probe", {"value": 1})
+        self.assertEqual(
+            [e for e in first_socket.get_received() if e["name"] == "rotation_probe"],
+            [],
+        )
+        second_events = [
+            e for e in second_socket.get_received() if e["name"] == "rotation_probe"
+        ]
+        self.assertEqual(len(second_events), 1, second_events)
+        self.assertTrue(second_socket.is_connected())
+        first_socket.emit("message_send", {}, callback=True)
+        self.assertFalse(first_socket.is_connected())
+        second_socket.disconnect()
+
+    def test_logout_rejects_missing_malformed_and_old_format_tokens(self):
+        missing = self.client.post("/api/logout")
+        self.assertEqual(missing.status_code, 401, missing.json)
+        malformed = self.client.post(
+            "/api/logout", headers={"Authorization": "Bearer not-a-jwt"}
+        )
+        self.assertEqual(malformed.status_code, 401, malformed.json)
+
+        import time
+
+        import config
+        import jwt
+
+        old_format = jwt.encode(
+            {
+                "uid": 1,
+                "sid": self.sid,
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 60,
+            },
+            config.JWT_SECRET,
+            algorithm=config.JWT_ALG,
+        )
+        missing_version = self.client.post(
+            "/api/logout",
+            headers={"Authorization": f"Bearer {old_format}"},
+        )
+        self.assertEqual(missing_version.status_code, 401, missing_version.json)
+
+    def test_registration_token_version_and_malformed_socket_claims(self):
+        import time
+
+        import config
+        import jwt
+        import store
+        from auth import verify_jwt
+
+        device = store.get_device_by_sid(self.sid)
+        decoded = verify_jwt(self.token)
+        self.assertEqual(decoded["sv"], device["session_version"])
+
+        base_claims = {
+            "uid": device["user_id"],
+            "sid": self.sid,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+        }
+        for session_version in (None, "invalid", device["session_version"] + 1):
+            claims = dict(base_claims)
+            if session_version is not None:
+                claims["sv"] = session_version
+            token = jwt.encode(
+                claims, config.JWT_SECRET, algorithm=config.JWT_ALG
+            )
+            rejected = socketio.test_client(app, auth={"token": token})
+            self.assertFalse(rejected.is_connected())
+
+    def test_existing_database_migrates_device_session_version(self):
+        import sqlite3
+        from contextlib import closing
+        from unittest.mock import patch
+
+        import store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_path = Path(tmp) / "legacy.db"
+            with closing(sqlite3.connect(legacy_path)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+                        pw_hash TEXT NOT NULL, created_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE devices (
+                        id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+                        sid TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'web', pub_key TEXT NOT NULL,
+                        sig_pub TEXT NOT NULL, created_at INTEGER NOT NULL,
+                        last_seen INTEGER NOT NULL,
+                        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO users VALUES (1, 'legacy', 'hash', 1);
+                    INSERT INTO devices VALUES
+                        (1, 1, 'legacy01', 'old', 'web', 'pub', 'sig', 1, 1);
+                    """
+                )
+            with patch.object(store, "DB_PATH", legacy_path):
+                store.init_schema()
+                with store.conn_ctx() as conn:
+                    columns = {
+                        row[1] for row in conn.execute("PRAGMA table_info(devices)")
+                    }
+                    version = conn.execute(
+                        "SELECT session_version FROM devices WHERE id = 1"
+                    ).fetchone()[0]
+            self.assertIn("session_version", columns)
+            self.assertEqual(version, 1)
 
     def test_history_payload_is_a_json_object(self):
         import json
@@ -756,6 +1006,190 @@ class ServerSmokeTest(unittest.TestCase):
         other_socket.disconnect()
 
     # ----- conversation rename ------------------------------------------
+
+    def test_bulk_contact_names_sync_is_atomic_and_fans_out_once(self):
+        first = self.create_conversation("+821011110001")
+        second = self.create_conversation("+821011110002")
+        gateway = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "contacts-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "O" * 43,
+                "sig_pub": "P" * 43,
+            },
+        )
+        self.assertEqual(gateway.status_code, 200, gateway.json)
+        gateway_headers = {"Authorization": f"Bearer {gateway.json['token']}"}
+        origin_socket = socketio.test_client(
+            app, auth={"token": gateway.json["token"]}
+        )
+        web_socket = socketio.test_client(app, auth={"token": self.token})
+        origin_socket.get_received()
+        web_socket.get_received()
+
+        synced = self.client.post(
+            "/api/contact-names/sync",
+            headers=gateway_headers,
+            json={
+                "entries": [
+                    {"cid": first["cid"], "contact_name": "  엄마  "},
+                    {"cid": second["cid"], "contact_name": "아빠"},
+                ]
+            },
+        )
+        self.assertEqual(synced.status_code, 200, synced.json)
+        self.assertEqual(synced.json["updated"], 2)
+        expected_entries = [
+            {"cid": first["cid"], "contact_name": "엄마"},
+            {"cid": second["cid"], "contact_name": "아빠"},
+        ]
+        self.assertEqual(synced.json["entries"], expected_entries)
+
+        listed = self.client.get("/api/conversations", headers=self.headers).json
+        by_cid = {row["cid"]: row for row in listed["conversations"]}
+        self.assertEqual(by_cid[first["cid"]]["name"], "+821011110001")
+        self.assertEqual(by_cid[first["cid"]]["synced_contact_name"], "엄마")
+        self.assertEqual(by_cid[second["cid"]]["name"], "+821011110002")
+        self.assertEqual(by_cid[second["cid"]]["synced_contact_name"], "아빠")
+
+        for connected in (origin_socket, web_socket):
+            events = [
+                event
+                for event in connected.get_received()
+                if event["name"] == "contacts_updated"
+            ]
+            self.assertEqual(len(events), 1, events)
+            self.assertEqual(events[0]["args"][0], {"entries": expected_entries})
+
+        cleared = self.client.post(
+            "/api/contact-names/sync",
+            headers=gateway_headers,
+            json={
+                "entries": [
+                    {"cid": first["cid"], "contact_name": None},
+                    {"cid": second["cid"], "contact_name": "   "},
+                ]
+            },
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.json)
+        listed = self.client.get("/api/conversations", headers=self.headers).json
+        by_cid = {row["cid"]: row for row in listed["conversations"]}
+        self.assertEqual(by_cid[first["cid"]]["synced_contact_name"], "")
+        self.assertEqual(by_cid[second["cid"]]["synced_contact_name"], "")
+        origin_socket.disconnect()
+        web_socket.disconnect()
+
+    def test_bulk_contact_names_requires_gateway_and_validates_bounds(self):
+        created = self.create_conversation("+821022220001")
+        endpoint = "/api/contact-names/sync"
+        denied = self.client.post(
+            endpoint,
+            headers=self.headers,
+            json={"entries": []},
+        )
+        self.assertEqual(denied.status_code, 403, denied.json)
+
+        gateway = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "validation-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "Q" * 43,
+                "sig_pub": "R" * 43,
+            },
+        )
+        headers = {"Authorization": f"Bearer {gateway.json['token']}"}
+        invalid_entries = (
+            None,
+            {},
+            [None],
+            [{"cid": created["cid"]}],
+            [{"cid": created["cid"], "contact_name": 1}],
+            [{"cid": created["cid"], "contact_name": "x" * 101}],
+            [{"cid": created["cid"], "contact_name": "line\nbreak"}],
+            [
+                {"cid": created["cid"], "contact_name": "a"},
+                {"cid": created["cid"], "contact_name": "b"},
+            ],
+            [{"cid": f"cid-{index}", "contact_name": "x"} for index in range(501)],
+        )
+        for entries in invalid_entries:
+            response = self.client.post(
+                endpoint,
+                headers=headers,
+                json={"entries": entries},
+            )
+            self.assertEqual(response.status_code, 400, (entries, response.json))
+
+        accepted_maximum = [
+            {"cid": created["cid"], "contact_name": "x" * 100}
+        ]
+        response = self.client.post(
+            endpoint, headers=headers, json={"entries": accepted_maximum}
+        )
+        self.assertEqual(response.status_code, 200, response.json)
+
+        with mock.patch("conversations.rate_limit", return_value=9) as limiter:
+            limited = self.client.post(endpoint, headers=headers, json={"entries": []})
+        self.assertEqual(limited.status_code, 429, limited.json)
+        self.assertEqual(limited.headers["Retry-After"], "9")
+        limiter.assert_called_once_with(
+            "contact-names-sync", gateway.json["sid"], 10, 60
+        )
+
+    def test_bulk_contact_names_rejects_non_self_conversations_atomically(self):
+        import store
+
+        valid = self.create_conversation("+821033330001")
+        other = self.client.post(
+            "/api/register",
+            json={"username": "bulk_" + self.username[-6:], "pw_hash": self.pw_hash},
+        )
+        other_user = store.get_user_by_name(other.json["username"])
+        multi_conv_id = store.create_conversation("bulk-multi", "+821033330002")
+        current_user = store.get_user_by_name(self.username)
+        store.add_member(multi_conv_id, current_user["id"])
+        store.add_member(multi_conv_id, other_user["id"])
+
+        gateway = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "atomic-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "S" * 43,
+                "sig_pub": "T" * 43,
+            },
+        )
+        headers = {"Authorization": f"Bearer {gateway.json['token']}"}
+        rejected = self.client.post(
+            "/api/contact-names/sync",
+            headers=headers,
+            json={
+                "entries": [
+                    {"cid": valid["cid"], "contact_name": "must-not-commit"},
+                    {"cid": "bulk-multi", "contact_name": "forbidden"},
+                ]
+            },
+        )
+        self.assertEqual(rejected.status_code, 403, rejected.json)
+        self.assertEqual(
+            store.get_conversation_by_cid(valid["cid"])["synced_contact_name"],
+            "",
+        )
+
+        missing = self.client.post(
+            "/api/contact-names/sync",
+            headers=headers,
+            json={"entries": [{"cid": "does-not-exist", "contact_name": "x"}]},
+        )
+        self.assertEqual(missing.status_code, 404, missing.json)
 
     def test_rename_conversation_updates_and_fans_out(self):
         created = self.create_conversation("+821055556666")

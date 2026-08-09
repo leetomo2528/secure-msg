@@ -7,14 +7,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
@@ -26,6 +25,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -36,10 +36,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
+import com.yunjelee.securemsg.ConversationTarget
+import com.yunjelee.securemsg.ConversationTargetResolver
 import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -48,6 +51,8 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ColumnScope.MessagesPane(
     threads: List<SmsThread>,
+    conversationTarget: ConversationTarget?,
+    onConversationTargetConsumed: (String) -> Unit,
     smsRoleHeld: Boolean,
     smsPermissionsGranted: Boolean,
     setStatus: (String) -> Unit,
@@ -72,6 +77,25 @@ fun ColumnScope.MessagesPane(
     }
     val visibleMessages = remember(selectedMessages, messageSearchQuery) {
         MessageSearch.filterMessages(selectedMessages, messageSearchQuery)
+    }
+
+    // A notification can arrive before Room's thread Flow emits (cold process),
+    // or its local cid can have been replaced by the authoritative relay cid.
+    // Wait for either exact cid or canonical phone, then consume exactly once.
+    LaunchedEffect(
+        conversationTarget?.requestId,
+        conversationTarget?.cid,
+        conversationTarget?.normalizedPhone,
+        threads,
+    ) {
+        val target = conversationTarget ?: return@LaunchedEffect
+        val resolved = ConversationTargetResolver.resolve(threads, target)
+            ?: return@LaunchedEffect
+        selectedThread = resolved
+        threadSearchQuery = ""
+        messageSearchQuery = ""
+        reply = ""
+        onConversationTargetConsumed(target.requestId)
     }
 
     // Offline sends start in a provisional local thread. Once the relay
@@ -192,6 +216,52 @@ fun ColumnScope.MessagesPane(
                 }
             }
         } else {
+            val conversationListState = rememberLazyListState()
+            var followsLatest by remember(thread.cid) { mutableStateOf(true) }
+
+            // Only user scrolling changes follow mode. A Room emission can
+            // shift keyed rows when a new message is inserted at index 0; it
+            // must not accidentally make an at-bottom user look scrolled up.
+            LaunchedEffect(conversationListState, thread.cid) {
+                snapshotFlow { conversationListState.isScrollInProgress }
+                    .distinctUntilChanged()
+                    .collect { scrolling ->
+                        if (scrolling) {
+                            // Stop follow mode as soon as a drag/fling starts so an arrival during
+                            // the gesture cannot pull the reader back to the latest message.
+                            followsLatest = false
+                        } else {
+                            followsLatest =
+                                conversationListState.firstVisibleItemIndex == 0 &&
+                                conversationListState.firstVisibleItemScrollOffset == 0
+                        }
+                    }
+            }
+
+            // Opening/switching a conversation starts at its newest message.
+            // Continue following arrivals only while the user is already at
+            // the latest position; reading older history is never interrupted.
+            LaunchedEffect(
+                visibleMessages.firstOrNull()?.id,
+            ) {
+                if (
+                    followsLatest &&
+                    !conversationListState.isScrollInProgress &&
+                    visibleMessages.isNotEmpty()
+                ) {
+                    conversationListState.scrollToItem(0)
+                }
+            }
+
+            // A new/cleared search is a new result set, so begin at its latest
+            // match. Subsequent arrivals still respect the user's scroll mode.
+            LaunchedEffect(thread.cid, messageSearchQuery) {
+                followsLatest = true
+                if (visibleMessages.isNotEmpty()) {
+                    conversationListState.scrollToItem(0)
+                }
+            }
+
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -235,7 +305,12 @@ fun ColumnScope.MessagesPane(
                     fontSize = 12.sp,
                 )
             }
-            LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                state = conversationListState,
+                reverseLayout = true,
+                verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom),
+            ) {
                 items(visibleMessages, key = { it.id }) { message ->
                     ChatBubble(
                         mine = message.mine,
@@ -246,7 +321,6 @@ fun ColumnScope.MessagesPane(
                             message.plaintext + carrierStatusLabel(message.carrierStatus)
                         },
                     )
-                    Spacer(Modifier.height(6.dp))
                 }
             }
             Row(

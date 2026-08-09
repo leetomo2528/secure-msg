@@ -18,6 +18,69 @@ function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): Message
   };
 }
 
+describe("logout session cleanup", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    api.setToken(null);
+    useStore.setState({ authed: false, username: null, uid: null, sid: null, error: null });
+  });
+
+  it("attempts remote invalidation before clearing the in-memory token", async () => {
+    api.setToken("active-token");
+    useStore.setState({ authed: true, username: "alice", uid: 1, sid: "device-a" });
+    const remoteLogout = vi.spyOn(api, "logout").mockImplementation(async () => {
+      expect(api.token).toBe("active-token");
+      expect(useStore.getState().authed).toBe(true);
+      return { ok: true };
+    });
+
+    await useStore.getState().logout();
+
+    expect(remoteLogout).toHaveBeenCalledTimes(1);
+    expect(api.token).toBeNull();
+    expect(useStore.getState().authed).toBe(false);
+    expect(useStore.getState().conversations).toEqual([]);
+  });
+
+  it("always clears local auth when remote invalidation throws", async () => {
+    api.setToken("active-token");
+    useStore.setState({ authed: true, username: "alice", uid: 1, sid: "device-a" });
+    vi.spyOn(api, "logout").mockRejectedValue(new TypeError("offline"));
+
+    await useStore.getState().logout();
+
+    expect(api.token).toBeNull();
+    expect(useStore.getState().authed).toBe(false);
+    expect(useStore.getState().activeCid).toBeNull();
+  });
+
+  it("always clears rendered auth state when IndexedDB cleanup throws", async () => {
+    api.setToken("active-token");
+    useStore.setState({
+      authed: true,
+      username: "alice",
+      uid: 1,
+      sid: "device-a",
+      keypair: {} as any,
+      conversations: [{ cid: "secret" } as any],
+      activeMessages: [{ plaintext: "secret text" } as any],
+    });
+    vi.spyOn(api, "logout").mockResolvedValue({ ok: true });
+    const transaction = vi.spyOn(IDBDatabase.prototype, "transaction")
+      .mockImplementation(() => { throw new DOMException("broken", "InvalidStateError"); });
+
+    await expect(useStore.getState().logout()).resolves.toBeUndefined();
+
+    expect(transaction).toHaveBeenCalled();
+    expect(api.token).toBeNull();
+    expect(useStore.getState().authed).toBe(false);
+    expect(useStore.getState().keypair).toBeNull();
+    expect(useStore.getState().conversations).toEqual([]);
+    expect(useStore.getState().activeMessages).toEqual([]);
+    expect(useStore.getState().error).toContain("로컬 캐시");
+  });
+});
+
 describe("Korean SMS conversation identity", () => {
   afterEach(() => {
     vi.restoreAllMocks();

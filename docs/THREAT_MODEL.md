@@ -18,11 +18,13 @@ carrier → SmsReceiver/MmsReceiver → local filter → Android SMS/MMS Provide
 |---|---|---|
 | 수신 SMS/MMS 평문 | Android SMS/MMS Provider, Android Room, 웹 IndexedDB | 해당 기기의 메시지 유출 |
 | 차단 격리 메시지 | Android Room `blocked_sms` | 기기 접근 시 차단 문자·차단 사유 유출 |
-| Android/PWA 기기 개인키 | Android DataStore / 웹 IndexedDB | 해당 기기로 전달된 envelope 복호 가능 |
+| Android/PWA 기기 개인키 | Android Keystore AES-GCM 암호문(DataStore) / 웹 IndexedDB | 해당 기기로 전달된 envelope 복호 가능 |
+| 세션 토큰 | Android Keystore AES-GCM 암호문 / 웹 메모리 | 해당 기기 권한으로 만료 전 API 접근 가능 |
 | 사용자 비밀번호 | 메모리에서 Argon2id 처리 후 폐기 | 입력 중 탈취 가능성 |
 | 키워드·차단 발신번호 | 각 클라이언트 로컬 DB | 해당 기기 접근 시 필터 의도 노출 |
 | 암호화 메시지 | relay 서버 SQLite | 메타데이터는 노출, 평문은 직접 복호 불가 |
 | 전화번호 대화 라벨 | relay 서버 `conversations.name` | 서버 DB 유출 시 전화번호/대화 관계 노출 |
+| 동기화된 연락처 표시명 | relay 서버 `conversations.synced_contact_name` | 서버 DB 유출 시 연락처 이름/전화번호 관계 노출 |
 
 ## 보장하는 것
 
@@ -67,7 +69,10 @@ Android는 전화번호 이름을 가진 대화라도 멤버가 게이트웨이 
 - 계정·기기 수와 마지막 접속 시각
 - 어떤 `cid`에 어떤 계정이 참여하는가
 - 대화 라벨로 저장된 전화번호
+- Android에서 명시적으로 동기화한 SecureMsg 대화의 연락처 표시명
 - 메시지 시각·크기·송신 기기
+
+연락처 동기화는 전체 주소록이나 메시지 내용을 전송하지 않고, 계정의 Android gateway가 본인 단독 SMS 대화와 매칭한 이름·삭제 상태만 업로드한다. 그러나 이 표시명은 현재 E2E envelope가 아닌 서버 평문 메타데이터이므로 서버 운영자에게 숨겨지지 않는다.
 
 메타데이터 저항성(mixnet/onion routing)은 범위 밖이다.
 
@@ -93,11 +98,11 @@ Oracle 단일 인스턴스와 Android foreground bridge에 의존한다. 수신 
 
 relay 서버가 envelope를 임의로 변조하면 클라이언트의 secretbox 검증 또는 X25519 복호화가 실패한다. 다만 서버가 웹 JS 자체를 변조해 사용자의 개인키/평문을 빼내는 공급망 공격은 별도 문제다. 자체 빌드·자체 호스팅·HTTPS·코드 무결성 검증이 필요하다.
 
-JWT 만료 시 서버는 이미 연결된 Socket.IO 세션도 다음 이벤트에서 종료한다. 기기 폐기 역시 각 이벤트에서 DB를 재확인한다. 웹과 Android는 명시적인 인증 거부를 받으면 세션 토큰만 지우고 다시 로그인을 요구한다.
+JWT에는 기기별 `session_version`이 포함되고 서버는 REST와 Socket.IO 연결·이벤트마다 DB의 현재 값과 대조한다. 로그아웃과 동일 기기 재로그인은 버전을 회전하고, Socket.IO room도 버전별로 분리되어 이전 연결은 이후 서버 푸시를 받지 못한다. JWT 만료나 기기 폐기 역시 연결을 종료한다. 웹과 Android는 명시적인 인증 거부를 받으면 세션 토큰만 지우고 다시 로그인을 요구한다.
 
 ### Android 기기 분실
 
-기기 잠금, File-based encryption, 앱 데이터 보호에 의존한다. Android DataStore와 SMS Provider/Room의 평문은 기기 잠금 해제나 루팅 공격에 노출될 수 있다. 기기 분실 시 웹의 `기기 관리`에서 해당 `sid`를 폐기하고 Android 설치를 제거한다.
+Android의 JWT와 X25519/Ed25519 개인키는 Android Keystore의 비내보내기 AES-256-GCM 키로 암호화해 DataStore에는 버전·nonce·암호문만 둔다. 기존 평문 자격 증명은 첫 로드에서 자동 이전한다. 다만 SMS Provider와 Room의 메시지 평문, 실행 중 프로세스 메모리는 기기 잠금 해제·루팅 공격에 노출될 수 있다. 기기 분실 시 웹의 `기기 관리`에서 해당 `sid`를 폐기하고 Android 설치를 제거한다.
 
 ### 필터 우회·오탐
 
@@ -110,6 +115,6 @@ JWT 만료 시 서버는 이미 연결된 Socket.IO 세션도 다음 이벤트�
 - [x] Android 내구성 outbox + 동일 mid 기반 서버 ACK 재전송 큐
 - [x] MMS·첨부파일 지원(통신사/OEM별 실제 단말 검증은 필요)
 - [ ] RCS 지원 검토
-- [ ] 전화번호 라벨을 서버에 평문으로 저장하지 않는 thread metadata 설계
+- [ ] 전화번호·연락처 표시명을 서버에 평문으로 저장하지 않는 E2E thread metadata 설계
 - [ ] PWA PIN/생체 잠금 및 민감 알림 내용 숨김
 - [ ] 다중 서버·백업·감사 로그

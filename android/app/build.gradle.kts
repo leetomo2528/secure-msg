@@ -13,8 +13,8 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.9.0"
+        versionCode = 12
+        versionName = "0.10.0"
     }
 
     buildTypes {
@@ -78,4 +78,5 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

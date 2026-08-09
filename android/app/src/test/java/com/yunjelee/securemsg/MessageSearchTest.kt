@@ -54,6 +54,18 @@ class MessageSearchTest {
         )
     }
 
+    @Test
+    fun `message search preserves newest-first conversation order`() {
+        val newest = message(3, "찾을 내용 newest")
+        val middle = message(2, "다른 내용")
+        val oldest = message(1, "찾을 내용 oldest")
+
+        assertEquals(
+            listOf(newest, oldest),
+            MessageSearch.filterMessages(listOf(newest, middle, oldest), "찾을 내용"),
+        )
+    }
+
     private fun thread(
         cid: String,
         phone: String = "010-0000-0000",

@@ -63,6 +63,7 @@ import { applyBlock, matchBlockKeywords } from "./blocklist";
 import { normalizePhone, ownedSmsPhone } from "./conversationPolicy";
 import {
   decodeRelayContent,
+  conversationDisplayName,
   errorText,
   isSafeMimeType,
   matchesBlockedSender,
@@ -87,7 +88,10 @@ function readNotifyPref(): boolean {
 export interface Conversation {
   cid: string;
   conv_id: number;
+  /** Stable phone/SMS identity; never substitute a contact label in routing. */
   name: string;
+  /** Account-wide contact label supplied by the server for presentation only. */
+  synced_contact_name?: string | null;
   members: string[];
   created_at: number;
 }
@@ -291,16 +295,42 @@ export const useStore = create<State>((set, get) => ({
   },
 
   logout: async () => {
+    const rememberedUsername = get().username;
+    try {
+      // Best effort: revoke the bearer token while it is still available.
+      // A rejected/expired token or offline server must never trap the user in
+      // a local authenticated state.
+      if (api.token) await api.logout();
+    } catch {
+      // The normal API path returns a structured failure, but also tolerate an
+      // unexpected transport/runtime exception and complete local logout.
+    }
+
     disconnectSocket();
     api.setToken(null);
-    // Keep the local device key so the next login renews this device instead
-    // of silently creating an orphaned server device. Plaintext caches go away.
-    const meta = await getMeta();
-    await clearSessionData();
+
+    // Authentication state must disappear even if IndexedDB is unavailable or
+    // corrupt. Read/clear it best-effort, then unconditionally remove every
+    // in-memory key and plaintext conversation from the rendered UI.
+    let localUsername = rememberedUsername;
+    let cleanupFailed = false;
+    try {
+      localUsername = (await getMeta())?.username ?? localUsername;
+    } catch {
+      cleanupFailed = true;
+    }
+    try {
+      await clearSessionData();
+    } catch {
+      cleanupFailed = true;
+    }
     set({
-      authed: false, username: meta?.username ?? null, uid: null, sid: null,
+      authed: false, username: localUsername ?? null, uid: null, sid: null,
       deviceName: null, keypair: null, conversations: [],
-      activeCid: null, activeMessages: [], deviceCache: new Map(), error: null,
+      activeCid: null, activeMessages: [], deviceCache: new Map(),
+      error: cleanupFailed
+        ? "로그아웃됐지만 브라우저의 로컬 캐시를 완전히 지우지 못했습니다. 브라우저 사이트 데이터를 삭제하세요."
+        : null,
     });
   },
 
@@ -458,7 +488,7 @@ export const useStore = create<State>((set, get) => ({
       set({ activeMessages: await listMessages(cid) });
     }
     if (notifyIsIncoming && notifyBody != null) {
-      maybeNotify(conv?.name || "새 메시지", notifyBody, gatewaySids.size > 0);
+      maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody, gatewaySids.size > 0);
     }
   },
 
@@ -713,6 +743,7 @@ async function postLogin(): Promise<void> {
   socket.off("typing");
   socket.off("blocklist_updated");
   socket.off("conv_updated");
+  socket.off("contacts_updated");
   const syncAll = async () => {
     const state = useStore.getState();
     useStore.setState({ error: null });
@@ -776,6 +807,11 @@ async function postLogin(): Promise<void> {
     await reapplyBlocklist();
   });
   socket.on("conv_updated", async () => {
+    await useStore.getState().refreshConversations();
+  });
+  socket.on("contacts_updated", async () => {
+    // Bulk contact syncs fan out one account-scoped invalidation event. Reload
+    // the authoritative labels immediately on every connected browser.
     await useStore.getState().refreshConversations();
   });
   if (socket.connected) await syncAll();

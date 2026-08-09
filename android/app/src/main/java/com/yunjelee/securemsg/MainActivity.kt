@@ -52,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private var smsPermissionsGranted by mutableStateOf(false)
     private var notificationPermissionGranted by mutableStateOf(true)
     private var status by mutableStateOf("연결 확인 중…")
+    private var conversationTarget by mutableStateOf<ConversationTarget?>(null)
 
     // In-app self-update (game-style: detect → download → install prompt)
     private val updater by lazy { AppUpdater(applicationContext, AppUpdater.buildHttp()) }
@@ -129,6 +130,9 @@ class MainActivity : ComponentActivity() {
         smsPermissionsGranted = hasSmsPerms()
         notificationPermissionGranted = hasNotificationPermission()
         autoUpdateEnabled = updater.autoCheckEnabled()
+        // Returning through a notification/system surface must also wake durable
+        // provider import and relay flushing; service-side work is idempotent.
+        if (smsRoleHeld && smsPermissionsGranted) startBridgeService()
         // The user may have just toggled "install unknown apps" in system settings.
         val pending = updater.pendingUpdate()
         if (pending?.state == PendingInstallState.AWAITING_PERMISSION &&
@@ -278,7 +282,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleInstallResult(intent)
+        handleConversationIntent(intent)
     }
 
     /** PackageInstaller session callback: shows guidance when the system
@@ -397,6 +403,7 @@ class MainActivity : ComponentActivity() {
 
         restorePendingUpdate()
         handleInstallResult(intent)
+        handleConversationIntent(intent)
 
         setContent { App() }
     }
@@ -513,6 +520,12 @@ class MainActivity : ComponentActivity() {
                 smsRoleHeld = smsRoleHeld,
                 smsPermissionsGranted = smsPermissionsGranted,
                 notificationPermissionGranted = notificationPermissionGranted,
+                conversationTarget = conversationTarget,
+                onConversationTargetConsumed = { requestId ->
+                    if (conversationTarget?.requestId == requestId) {
+                        conversationTarget = null
+                    }
+                },
                 update = UpdateFlow(
                     state = updateState,
                     message = updateMessage,
@@ -548,9 +561,34 @@ class MainActivity : ComponentActivity() {
                 sendSms = { phone, text -> sendNewSms(current, phone, text) },
                 onLogout = {
                     lifecycleScope.launch(Dispatchers.IO) {
-                        stopService(Intent(this@MainActivity, SmsBridgeService::class.java))
-                        Credentials.clearSession(this@MainActivity)
-                        withContext(Dispatchers.Main) { creds = null }
+                        try {
+                            RelayApi(ServerConfig.url(this@MainActivity)).also {
+                                it.token = current.token
+                            }.logout()
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Remote logout failed; clearing local session", e)
+                        } finally {
+                            stopService(Intent(this@MainActivity, SmsBridgeService::class.java))
+                            var localCleanupFailed = false
+                            try {
+                                Credentials.clearSession(this@MainActivity)
+                            } catch (e: Exception) {
+                                localCleanupFailed = true
+                                Log.e("MainActivity", "Local credential cleanup failed", e)
+                            } finally {
+                                // Never leave decrypted messages or keys rendered merely because
+                                // Keystore/DataStore cleanup failed. Server logout already revoked
+                                // the token, and the next launch will retry credential validation.
+                                withContext(Dispatchers.Main) {
+                                    creds = null
+                                    status = if (localCleanupFailed) {
+                                        "로그아웃했습니다. 로컬 인증정보 정리에 실패해 앱 데이터 초기화가 필요합니다."
+                                    } else {
+                                        "로그아웃했습니다."
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 onSimulateSms = ::simulateIncomingSms,
@@ -572,6 +610,22 @@ class MainActivity : ComponentActivity() {
         } catch (e: RuntimeException) {
             Log.e("MainActivity", "Bridge service start rejected", e)
         }
+    }
+
+    private fun handleConversationIntent(intent: Intent?) {
+        if (intent?.action != SmsNotifier.ACTION_OPEN_CONVERSATION) return
+        val phone = PhoneNumberNormalizer.normalize(
+            intent.getStringExtra(SmsNotifier.EXTRA_PHONE).orEmpty(),
+        )
+        val cid = intent.getStringExtra(SmsNotifier.EXTRA_CID)?.takeIf { it.isNotBlank() }
+        val requestId = intent.getStringExtra(SmsNotifier.EXTRA_REQUEST_ID)
+            ?.takeIf { it.isNotBlank() }
+            ?: intent.data?.lastPathSegment.orEmpty()
+        if (cid == null && phone.isBlank()) return
+        conversationTarget = ConversationTarget(cid, phone, requestId)
+        // Importing the provider and flushing an already-persisted outbox are safe
+        // to repeat on a cold start and on every singleTask onNewIntent delivery.
+        startBridgeService()
     }
 
     /** Debug-only: inject a fake incoming SMS through the real receive
@@ -604,7 +658,21 @@ class MainActivity : ComponentActivity() {
                 }
                 val receivedAt = System.currentTimeMillis()
                 val providerId = SmsProvider.insertIncoming(ctx, sender, body, receivedAt)
-                SmsNotifier.notifyIncoming(ctx, sender, body, receivedAt)
+                val persisted = IncomingMessageRepository(db).persist(
+                    direction = "incoming_sms",
+                    phoneNumber = sender,
+                    content = RelayContentCodec.text(body),
+                    providerId = providerId,
+                    receivedAt = receivedAt,
+                )
+                SmsNotifier.notifyIncoming(
+                    ctx,
+                    persisted.conversation.normalizedPhone,
+                    body,
+                    receivedAt,
+                    persisted.conversation.cid,
+                    persisted.outbox.mid,
+                )
                 val intent = Intent(ctx, SmsBridgeService::class.java).apply {
                     action = SmsBridgeService.ACTION_INCOMING_SMS
                     putExtra(SmsBridgeService.EXTRA_PHONE, sender)

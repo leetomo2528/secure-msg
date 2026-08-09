@@ -70,4 +70,33 @@ describe("Api 401 handling", () => {
     expect(result.status).toBe(0);
     expect(result.error).toBeTruthy();
   });
+
+  it("posts logout with the current bearer token", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new Api();
+    api.setToken("jwt-token");
+
+    const result = await api.logout();
+
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith("/api/logout", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({ Authorization: "Bearer jwt-token" }),
+    }));
+  });
+
+  it("does not recursively fire onUnauthorized when logout itself gets 401", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(401, { ok: false, error: "invalid token" })));
+    const api = new Api();
+    api.setToken("expired-token");
+    const onUnauthorized = vi.fn();
+    api.onUnauthorized = onUnauthorized;
+
+    const result = await api.logout();
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(401);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
 });

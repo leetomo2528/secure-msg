@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS devices (
     kind          TEXT    NOT NULL DEFAULT 'web',   -- web | android_gateway
     pub_key       TEXT    NOT NULL,                 -- base64 X25519
     sig_pub       TEXT    NOT NULL,                 -- base64 Ed25519
+    session_version INTEGER NOT NULL DEFAULT 1,     -- rotated to revoke issued JWTs
     created_at    INTEGER NOT NULL,
     last_seen     INTEGER NOT NULL
 );
@@ -37,7 +38,8 @@ CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 CREATE TABLE IF NOT EXISTS conversations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     cid           TEXT    NOT NULL UNIQUE,          -- opaque conversation id
-    name          TEXT    NOT NULL DEFAULT '',       -- display name (phone number or contact)
+    name          TEXT    NOT NULL DEFAULT '',       -- stable SMS identity (normally phone number)
+    synced_contact_name TEXT NOT NULL DEFAULT '',    -- user-synced display label
     created_at    INTEGER NOT NULL
 );
 

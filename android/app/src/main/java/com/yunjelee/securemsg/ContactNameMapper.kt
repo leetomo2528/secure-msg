@@ -13,6 +13,8 @@ data class ContactNameUpdate(
 
 data class ContactMapping(
     val updates: List<ContactNameUpdate>,
+    /** Complete desired state, including null clears, used for relay publication. */
+    val desiredNames: List<ContactNameUpdate>,
     val matchedThreadCount: Int,
     val contactPhoneCount: Int,
 )
@@ -33,13 +35,16 @@ object ContactNameMapper {
             }
         }
         var matched = 0
-        val updates = threads.mapNotNull { thread ->
+        val desiredNames = threads.map { thread ->
             val name = namesByPhone[PhoneNumberNormalizer.normalize(thread.phoneNumber)]
             if (name != null) matched++
-            if (name == thread.localContactName) null else ContactNameUpdate(thread.cid, name)
+            ContactNameUpdate(thread.cid, name)
         }
+        val localNames = threads.associate { it.cid to it.localContactName }
+        val updates = desiredNames.filter { it.localContactName != localNames[it.cid] }
         return ContactMapping(
             updates = updates,
+            desiredNames = desiredNames,
             matchedThreadCount = matched,
             contactPhoneCount = namesByPhone.size,
         )

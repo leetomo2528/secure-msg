@@ -19,7 +19,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -43,6 +42,7 @@ class SmsBridgeService : Service() {
     private var api: RelayApi? = null
     private var creds: SavedCredentials? = null
     private lateinit var db: AppDatabase
+    private lateinit var incomingRepository: IncomingMessageRepository
     private var outboxLoop: Job? = null
     private val outboxLoopStarted = AtomicBoolean(false)
     private val sessionInvalidated = AtomicBoolean(false)
@@ -64,6 +64,7 @@ class SmsBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         db = AppDatabase.get(this)
+        incomingRepository = IncomingMessageRepository(db)
         BridgeNotifications.createChannel(this)
     }
 
@@ -300,6 +301,11 @@ class SmsBridgeService : Service() {
                     }
                 }
             }
+            client.onContactsUpdated = {
+                // The event is an invalidation signal. Re-listing is resilient
+                // to missed events and guarantees a complete server snapshot.
+                scope.launch { syncFromServer() }
+            }
         }
         relay!!.connect(loaded.token)
         Log.i(TAG, "Bridge started for ${loaded.username}")
@@ -357,11 +363,10 @@ class SmsBridgeService : Service() {
             return
         }
 
-        val normalizedPhone = PhoneNumberNormalizer.normalize(phone)
         val content = RelayContentCodec.text(body)
-        queueIncomingMessage(
+        incomingRepository.persist(
             direction = "incoming_sms",
-            phone = normalizedPhone,
+            phoneNumber = phone,
             content = content,
             providerId = providerId,
             receivedAt = receivedAt,
@@ -424,68 +429,14 @@ class SmsBridgeService : Service() {
             subject = mms.subject,
             attachments = attachments,
         )
-        queueIncomingMessage(
+        incomingRepository.persist(
             direction = "incoming_mms",
-            phone = phone,
+            phoneNumber = phone,
             content = content,
             providerId = id,
             receivedAt = mms.date,
         )
         flushOutbox()
-    }
-
-    /** Persist presentation and retry state together before any relay dependency. */
-    private suspend fun queueIncomingMessage(
-        direction: String,
-        phone: String,
-        content: RelayContent,
-        providerId: Long?,
-        receivedAt: Long,
-    ): RelayOutbox {
-        val encoded = RelayContentCodec.encode(content)
-        val mid = IncomingMessageIdentity.mid(direction, providerId, phone, receivedAt, encoded)
-        db.relayOutboxDao().getByMid(mid)?.let { return it }
-
-        return db.withTransaction {
-            db.relayOutboxDao().getByMid(mid)?.let { return@withTransaction it }
-            val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
-                cid = "local_${UUID.randomUUID().toString().replace("-", "")}",
-                phoneNumber = phone,
-                serverName = null,
-            ).also { db.threadDao().upsert(it) }
-            db.threadDao().touch(thread.cid, receivedAt)
-            val localMessageId = db.messageDao().insert(
-                MessageRow(
-                    cid = thread.cid,
-                    seq = 0,
-                    senderSid = "",
-                    plaintext = content.text,
-                    createdAt = receivedAt,
-                    mine = false,
-                    contentType = content.type,
-                    subject = content.subject,
-                    attachmentsJson = attachmentsJson(content),
-                ),
-            )
-            val outboxId = db.relayOutboxDao().insert(
-                RelayOutbox(
-                    mid = mid,
-                    cid = thread.cid,
-                    payload = "",
-                    plaintext = encoded,
-                    contentType = content.type,
-                    subject = content.subject,
-                    attachmentsJson = attachmentsJson(content),
-                    phoneNumber = phone,
-                    providerId = providerId,
-                    localMessageId = localMessageId,
-                    direction = direction,
-                    createdAt = receivedAt,
-                ),
-            )
-            db.relayOutboxDao().getByMid(mid)
-                ?: error("missing incoming outbox row id=$outboxId")
-        }
     }
 
     private suspend fun flushOutbox() {
@@ -1047,7 +998,13 @@ class SmsBridgeService : Service() {
             return (existing?.copy(
                 phoneNumber = phone,
                 serverName = serverConversationName(row),
-            ) ?: SmsThread(cid, phone, serverConversationName(row)))
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            ) ?: SmsThread(
+                cid = cid,
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            ))
                 .also { db.threadDao().upsert(it) }
         }
         return null
@@ -1073,7 +1030,13 @@ class SmsBridgeService : Service() {
             return (existing?.copy(
                 phoneNumber = phone,
                 serverName = serverConversationName(row),
-            ) ?: SmsThread(cid, phone, serverConversationName(row)))
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            ) ?: SmsThread(
+                cid = cid,
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            ))
                 .also { db.threadDao().upsert(it) }
         }
 
@@ -1100,6 +1063,11 @@ class SmsBridgeService : Service() {
 
     private fun serverConversationName(row: JSONObject): String? =
         row.optString("name").trim().takeIf { it.isNotEmpty() }
+
+    private fun nullableContactName(row: JSONObject, key: String): String? {
+        if (!row.has(key) || row.isNull(key)) return null
+        return row.optString(key).trim().takeIf { it.isNotEmpty() }
+    }
 
     private suspend fun syncFromServer() {
         syncMutex.withLock {
@@ -1155,7 +1123,13 @@ class SmsBridgeService : Service() {
                     existing?.copy(
                         phoneNumber = phone,
                         serverName = serverConversationName(row),
-                    ) ?: SmsThread(cid, phone, serverConversationName(row)),
+                        syncedContactName = nullableContactName(row, "synced_contact_name"),
+                    ) ?: SmsThread(
+                        cid = cid,
+                        phoneNumber = phone,
+                        serverName = serverConversationName(row),
+                        syncedContactName = nullableContactName(row, "synced_contact_name"),
+                    ),
                 )
                 ownedCids += cid
             }

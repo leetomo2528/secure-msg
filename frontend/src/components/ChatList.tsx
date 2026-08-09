@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../store/useStore";
 import { searchMessages, type MessageRow } from "../store/db";
+import { conversationDisplayName } from "../store/helpers";
 
 export default function ChatList() {
   const { conversations, activeCid, selectConversation, refreshConversations } = useStore();
@@ -26,7 +27,8 @@ export default function ChatList() {
   const q = query.trim().toLowerCase();
   const convHits = q
     ? conversations.filter((c) =>
-        (c.name || c.members.join(", ")).toLowerCase().includes(q))
+        [conversationDisplayName(c), c.name, c.members.join(", ")]
+          .some((label) => label.toLowerCase().includes(q)))
     : [];
   const searching = q.length > 0;
 
@@ -63,10 +65,10 @@ export default function ChatList() {
               onClick={() => selectConversation(c.cid)}
               className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition hover:bg-fg/[0.04]"
             >
-              <Avatar label={c.name || c.members.join(", ")} size="h-8 w-8 text-[11px]" />
+              <Avatar label={conversationDisplayName(c)} size="h-8 w-8 text-[11px]" />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold text-tx-2">
-                  {c.name || c.members.join(", ")}
+                  {conversationDisplayName(c)}
                 </div>
                 <div className="text-[10px] text-tx-4">대화</div>
               </div>
@@ -82,13 +84,13 @@ export default function ChatList() {
                 className="flex w-full items-start gap-3 rounded-xl px-3 py-2 text-left transition hover:bg-fg/[0.04]"
               >
                 <Avatar
-                  label={conv?.name || conv?.members.join(", ") || "?"}
+                  label={conversationDisplayName(conv, "?")}
                   size="h-8 w-8 text-[11px]"
                 />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-baseline justify-between gap-2">
                     <span className="truncate text-xs font-semibold text-tx-2">
-                      {conv?.name || conv?.members.join(", ") || "대화"}
+                      {conversationDisplayName(conv)}
                     </span>
                     <span className="shrink-0 text-[9px] text-tx-4">
                       {new Date(m.created_at).toLocaleDateString("ko-KR", { month: "short", day: "numeric" })}
@@ -111,7 +113,7 @@ export default function ChatList() {
         </li>
       )}
       {conversations.map((c) => {
-        const display = c.name || c.members.join(", ");
+        const display = conversationDisplayName(c);
         const active = activeCid === c.cid;
         return (
           <li key={c.cid}>

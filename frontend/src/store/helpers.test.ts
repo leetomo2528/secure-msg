@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { matchesBlockedSender } from "./helpers";
+import {
+  conversationDisplayName,
+  matchesBlockedSender,
+} from "./helpers";
 import type { SenderRow } from "./db";
 
 function sender(value: string): SenderRow {
@@ -29,4 +32,25 @@ describe("matchesBlockedSender", () => {
     expect(matchesBlockedSender("BANK01012345678", [sender("01012345678")])).toBe(false);
     expect(matchesBlockedSender("MYBANK", [sender("BANK")])).toBe(false);
   });
+});
+
+describe("cross-device contact display names", () => {
+  const conversation = {
+    cid: "sms-a",
+    name: "+821012345678",
+    members: ["alice"],
+  };
+
+  it("prefers a nonblank synchronized contact name without changing SMS identity", () => {
+    const withContact = { ...conversation, synced_contact_name: "  홍길동  " };
+    expect(conversationDisplayName(withContact)).toBe("홍길동");
+    expect(withContact.name).toBe("+821012345678");
+  });
+
+  it("falls back to conversation identity, members, then the supplied fallback", () => {
+    expect(conversationDisplayName({ ...conversation, synced_contact_name: "   " })).toBe("+821012345678");
+    expect(conversationDisplayName({ ...conversation, name: "" })).toBe("alice");
+    expect(conversationDisplayName(undefined, "?")).toBe("?");
+  });
+
 });

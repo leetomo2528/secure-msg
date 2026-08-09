@@ -8,11 +8,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-class RelayApi(val baseUrl: String) {
+class RelayApi(
+    val baseUrl: String,
+    private val http: OkHttpClient = HTTP,
+) {
 
     private val normalizedBaseUrl = baseUrl.trim().trimEnd('/')
-
-    private val http = HTTP
 
     private val json = "application/json".toMediaType()
 
@@ -79,12 +80,17 @@ class RelayApi(val baseUrl: String) {
             .put("pw_hash", pwHash)
             .put("sid", sid))
 
+    fun logout(): JSONObject = post("/api/logout", JSONObject())
+
     fun createConversation(members: JSONArray, name: String): JSONObject =
         post("/api/conversation", JSONObject()
             .put("members", members)
             .put("name", name))
 
     fun listConversations(): JSONObject = get("/api/conversations")
+
+    fun syncContactNames(entries: JSONArray): JSONObject =
+        post("/api/contact-names/sync", JSONObject().put("entries", entries))
 
     fun convMembers(cid: String): JSONObject = get("/api/conversation/$cid/members")
 

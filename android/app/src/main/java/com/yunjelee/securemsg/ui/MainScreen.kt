@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
 import com.yunjelee.securemsg.BuildConfig
+import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.SavedCredentials
 
 /** Post-login home: status header, update banner, tabs (messages / settings). */
@@ -40,6 +41,8 @@ fun MainScreen(
     smsRoleHeld: Boolean,
     smsPermissionsGranted: Boolean,
     notificationPermissionGranted: Boolean,
+    conversationTarget: ConversationTarget?,
+    onConversationTargetConsumed: (String) -> Unit,
     update: UpdateFlow,
     requestSmsRole: () -> Unit,
     requestPerms: () -> Unit,
@@ -55,6 +58,10 @@ fun MainScreen(
     val db = AppDatabase.get(context)
     val threads by db.threadDao().observeAll().collectAsState(initial = emptyList())
     var selectedSection by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(conversationTarget?.requestId, conversationTarget?.cid) {
+        if (conversationTarget != null) selectedSection = 0
+    }
 
     LaunchedEffect(smsRoleHeld, smsPermissionsGranted, creds.sid) {
         if (!smsRoleHeld) {
@@ -170,6 +177,8 @@ fun MainScreen(
         if (selectedSection == 0) {
             MessagesPane(
                 threads = threads,
+                conversationTarget = conversationTarget,
+                onConversationTargetConsumed = onConversationTargetConsumed,
                 smsRoleHeld = smsRoleHeld,
                 smsPermissionsGranted = smsPermissionsGranted,
                 setStatus = setStatus,

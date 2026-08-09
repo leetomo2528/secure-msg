@@ -6,7 +6,8 @@ Crypto notes:
 - Password is hashed client-side with Argon2id via libsodium before transmission (so the
   server never sees the raw password either); then we bcrypt-hash it again server-side
   for storage defense in depth. Both layers are off the wire.
-- JWT contains only {uid, sid}. No PII.
+- JWT contains only {uid, sid, sv}. No PII. ``sv`` is a per-device revocation
+  version checked against SQLite on every authenticated operation.
 """
 
 from __future__ import annotations
@@ -63,10 +64,11 @@ def _rate_error(retry_after: int) -> tuple:
     return response, 429
 
 
-def issue_jwt(uid: int, sid: str) -> str:
+def issue_jwt(uid: int, sid: str, session_version: int) -> str:
     payload = {
         "uid": uid,
         "sid": sid,
+        "sv": session_version,
         "iat": int(time.time()),
         "exp": int(time.time()) + config.JWT_TTL_SECONDS,
     }
@@ -121,12 +123,22 @@ def auth_required(fn):
         try:
             uid = int(decoded["uid"])
             sid = str(decoded["sid"])
+            session_version = int(decoded["sv"])
         except (KeyError, TypeError, ValueError):
             return _err("invalid token", 401)
         device = store.get_device_by_sid(sid)
-        if not device or device["user_id"] != uid:
+        if (
+            not device
+            or device["user_id"] != uid
+            or device["session_version"] != session_version
+        ):
             return _err("device revoked or unknown", 401)
-        g.auth = {"uid": uid, "sid": sid, "device_id": device["id"]}
+        g.auth = {
+            "uid": uid,
+            "sid": sid,
+            "device_id": device["id"],
+            "session_version": session_version,
+        }
         return fn(*args, **kwargs)
 
     return wrapper
@@ -250,7 +262,8 @@ def device_register():
         if device_kind == "android_gateway":
             return _err("an Android SMS gateway is already registered", 409)
         return _err("device registration conflict; retry", 409)
-    token = issue_jwt(user["id"], sid)
+    device = store.get_device_by_sid(sid)
+    token = issue_jwt(user["id"], sid, device["session_version"])
     return _ok(sid=sid, token=token, uid=user["id"])
 
 
@@ -283,9 +296,25 @@ def device_login():
     dev = store.get_device_by_sid(sid)
     if not dev or dev["user_id"] != user["id"]:
         return _err("device not found", 404)
-    store.touch_device(dev["id"])
-    token = issue_jwt(user["id"], sid)
+    session_version = store.rotate_device_session(dev["id"], user["id"])
+    if session_version is None:
+        return _err("device not found", 404)
+    token = issue_jwt(user["id"], sid, session_version)
     return _ok(sid=sid, token=token, uid=user["id"])
+
+
+@bp.post("/logout")
+@auth_required
+def logout():
+    """Revoke all JWTs from the current device without deleting its keypair."""
+    session_version = store.rotate_device_session(
+        g.auth["device_id"],
+        g.auth["uid"],
+        expected_version=g.auth["session_version"],
+    )
+    if session_version is None:
+        return _err("invalid token", 401)
+    return _ok(logged_out=True)
 
 
 @bp.get("/devices")

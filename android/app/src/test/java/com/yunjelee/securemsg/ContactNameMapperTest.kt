@@ -12,6 +12,7 @@ class ContactNameMapperTest {
         )
 
         assertEquals(listOf(ContactNameUpdate("cid-1", "윤제")), result.updates)
+        assertEquals(listOf(ContactNameUpdate("cid-1", "윤제")), result.desiredNames)
         assertEquals(1, result.matchedThreadCount)
         assertEquals(1, result.contactPhoneCount)
     }
@@ -82,5 +83,40 @@ class ContactNameMapperTest {
 
         assertEquals("서버 대화 이름", thread.displayName)
         assertEquals(true, thread.showsPhoneSubtitle)
+    }
+
+    @Test
+    fun syncedContactNameIsFallbackBetweenLocalAndServerNames() {
+        val remoteOnly = SmsThread(
+            cid = "cid-1",
+            phoneNumber = "+821011112222",
+            serverName = "서버 대화 이름",
+            syncedContactName = "다른 폰 연락처",
+        )
+        val localWins = remoteOnly.copy(localContactName = "이 폰 연락처")
+
+        assertEquals("다른 폰 연락처", remoteOnly.displayName)
+        assertEquals("이 폰 연락처", localWins.displayName)
+        assertEquals("서버 대화 이름", remoteOnly.serverName)
+    }
+
+    @Test
+    fun desiredNamesIncludesUnchangedNamesAndExplicitClearsForPublishing() {
+        val result = ContactNameMapper.map(
+            contacts = listOf(ContactPhoneRow("동기화 이름", "010-1111-2222")),
+            threads = listOf(
+                SmsThread("cid-1", "01011112222", null, localContactName = "동기화 이름"),
+                SmsThread("cid-2", "01033334444", null, localContactName = "삭제될 이름"),
+            ),
+        )
+
+        assertEquals(
+            listOf(
+                ContactNameUpdate("cid-1", "동기화 이름"),
+                ContactNameUpdate("cid-2", null),
+            ),
+            result.desiredNames,
+        )
+        assertEquals(listOf(ContactNameUpdate("cid-2", null)), result.updates)
     }
 }

@@ -4,6 +4,7 @@ import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
 import type { MessageRow } from "../store/db";
 import { Avatar } from "./ChatList";
+import { conversationDisplayName } from "../store/helpers";
 
 export default function ChatView({ cid }: { cid: string }) {
   const { activeMessages, conversations, sendContent, sid } = useStore();
@@ -14,7 +15,7 @@ export default function ChatView({ cid }: { cid: string }) {
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversation = conversations.find((item) => item.cid === cid);
-  const title = conversation?.name || conversation?.members.join(", ") || "대화";
+  const title = conversationDisplayName(conversation);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [exportMenu, setExportMenu] = useState(false);

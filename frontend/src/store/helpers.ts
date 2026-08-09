@@ -8,6 +8,29 @@ import type { BlockRow, SenderRow, MessageAttachment } from "./db";
 import type { RelayContent } from "./useStore";
 import { normalizePhone } from "./conversationPolicy";
 
+export interface DisplayableConversation {
+  name: string;
+  members: string[];
+  synced_contact_name?: string | null;
+}
+
+/**
+ * A synchronized phone-book label is presentation data only. `name` remains
+ * the stable SMS phone/conversation identity used by routing code.
+ */
+export function conversationDisplayName(
+  conversation: DisplayableConversation | null | undefined,
+  fallback = "대화",
+): string {
+  if (!conversation) return fallback;
+  const contactName = conversation.synced_contact_name?.trim();
+  if (contactName) return contactName;
+  const identity = conversation.name.trim();
+  if (identity) return identity;
+  const members = conversation.members.join(", ").trim();
+  return members || fallback;
+}
+
 export function ruleToKeywordRow(rule: BlockRule): BlockRow {
   return { id: `srv:${rule.id}`, keyword: rule.value, created_at: rule.created_at * 1000 };
 }

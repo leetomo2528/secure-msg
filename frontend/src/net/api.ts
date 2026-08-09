@@ -83,7 +83,11 @@ export class Api {
 
   setToken(t: string | null) { this.token = t; }
 
-  private async request<T extends ApiResult>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T extends ApiResult>(
+    path: string,
+    init: RequestInit = {},
+    notifyUnauthorized = true,
+  ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -96,7 +100,7 @@ export class Api {
           ...init.headers,
         },
       });
-      if (response.status === 401 && this.token && this.onUnauthorized) {
+      if (notifyUnauthorized && response.status === 401 && this.token && this.onUnauthorized) {
         this.onUnauthorized();
       }
       const text = await response.text();
@@ -144,6 +148,10 @@ export class Api {
   }
   deviceLogin(username: string, pwHash: string, sid: string) {
     return this.post("/device-login", { username, pw_hash: pwHash, sid });
+  }
+  /** Invalidate the current bearer token without recursively firing onUnauthorized. */
+  logout(): Promise<ApiResult> {
+    return this.request("/logout", { method: "POST", body: JSON.stringify({}) }, false);
   }
   listDevices() { return this.get("/devices"); }
   deviceRevoke(sid: string) { return this.post("/device-revoke", { sid }); }

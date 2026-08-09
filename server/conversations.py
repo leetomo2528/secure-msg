@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import re
 import secrets
+import unicodedata
 
 import store
 from auth import _err, _ok, auth_required
 from flask import Blueprint, g, jsonify, request
 from rate_limit import check as rate_limit
-from sockets import emit_to_conv_members
+from sockets import emit_to_conv_members, emit_to_user_devices
 
 bp = Blueprint("conv", __name__, url_prefix="/api")
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
@@ -106,13 +107,81 @@ def rename_conversation():
     return _ok(cid=cid, name=name)
 
 
+@bp.post("/contact-names/sync")
+@auth_required
+def sync_contact_names():
+    """Atomically replace a gateway's shared contact-label snapshot.
+
+    Only the account's Android SMS gateway may publish phone contact labels.
+    Every target must be a self-only conversation belonging to that account,
+    so a contact name can never be leaked into a multi-user conversation.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _err("JSON object required", 400)
+
+    device = store.get_device_by_sid(g.auth["sid"])
+    if not device or device["kind"] != "android_gateway":
+        return _err("android gateway required", 403)
+    retry_after = rate_limit("contact-names-sync", g.auth["sid"], 10, 60)
+    if retry_after:
+        response = jsonify({"ok": False, "error": "too many requests"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+
+    raw_entries = body.get("entries")
+    if not isinstance(raw_entries, list) or len(raw_entries) > 500:
+        return _err("entries must be a list with at most 500 items", 400)
+
+    entries: list[tuple[str, str]] = []
+    seen_cids: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            return _err("each entry must be an object", 400)
+        cid = raw_entry.get("cid")
+        if "contact_name" not in raw_entry:
+            return _err("contact_name required", 400)
+        raw_name = raw_entry.get("contact_name")
+        if not isinstance(cid, str) or not cid:
+            return _err("entry cid required", 400)
+        if cid in seen_cids:
+            return _err("duplicate entry cid", 400)
+        seen_cids.add(cid)
+        if raw_name is not None and not isinstance(raw_name, str):
+            return _err("contact_name must be a string or null", 400)
+        contact_name = raw_name.strip() if isinstance(raw_name, str) else ""
+        if len(contact_name) > 100:
+            return _err("contact_name must be at most 100 characters", 400)
+        if any(unicodedata.category(char) == "Cc" for char in contact_name):
+            return _err("contact_name must not contain control characters", 400)
+        entries.append((cid, contact_name))
+
+    result = store.sync_contact_names(g.auth["uid"], entries)
+    if result == "not_found":
+        return _err("conversation not found", 404)
+    if result == "forbidden":
+        return _err("conversation must be self-only and owned by the account", 403)
+
+    event_entries = [
+        {"cid": cid, "contact_name": contact_name}
+        for cid, contact_name in entries
+    ]
+    emit_to_user_devices(
+        g.auth["uid"],
+        "contacts_updated",
+        {"entries": event_entries},
+    )
+    return _ok(entries=event_entries, updated=len(event_entries))
+
+
 @bp.get("/conversations")
 @auth_required
 def list_conversations():
     """Return conversations the current user is in, plus their other members."""
     with store.conn_ctx() as c:
         rows = c.execute(
-            "SELECT cv.cid, cv.id AS conv_id, cv.name, cv.created_at FROM conversation_members m "
+            "SELECT cv.cid, cv.id AS conv_id, cv.name, cv.synced_contact_name, "
+            "cv.created_at FROM conversation_members m "
             "JOIN conversations cv ON cv.id = m.conv_id WHERE m.user_id = ? "
             "ORDER BY cv.created_at DESC, cv.id DESC",
             (g.auth["uid"],),
@@ -129,6 +198,7 @@ def list_conversations():
                     "cid": r["cid"],
                     "conv_id": r["conv_id"],
                     "name": r["name"],
+                    "synced_contact_name": r["synced_contact_name"],
                     "members": [mr["username"] for mr in members_rows],
                     "created_at": r["created_at"],
                 }

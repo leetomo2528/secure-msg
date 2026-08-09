@@ -45,6 +45,11 @@ def init_schema() -> None:
             c.execute(
                 "ALTER TABLE conversations ADD COLUMN name TEXT NOT NULL DEFAULT ''"
             )
+        if "synced_contact_name" not in cols:
+            c.execute(
+                "ALTER TABLE conversations ADD COLUMN synced_contact_name "
+                "TEXT NOT NULL DEFAULT ''"
+            )
         message_cols = [
             row[1] for row in c.execute("PRAGMA table_info(messages)").fetchall()
         ]
@@ -86,6 +91,11 @@ def init_schema() -> None:
             c.execute(
                 "UPDATE devices SET kind = 'android_gateway' WHERE id IN ("
                 "SELECT MIN(id) FROM devices WHERE name LIKE 'android-%' GROUP BY user_id)"
+            )
+        if "session_version" not in device_cols:
+            c.execute(
+                "ALTER TABLE devices ADD COLUMN session_version "
+                "INTEGER NOT NULL DEFAULT 1"
             )
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_android_gateway_per_user "
@@ -169,8 +179,9 @@ def add_device(
                     raise ValueError("device limit reached")
             timestamp = now()
             cur = c.execute(
-                "INSERT INTO devices(user_id, sid, name, kind, pub_key, sig_pub, created_at, last_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO devices(user_id, sid, name, kind, pub_key, sig_pub, "
+                "session_version, created_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (user_id, sid, name, kind, pub_key, sig_pub, timestamp, timestamp),
             )
             c.execute("COMMIT")
@@ -183,7 +194,8 @@ def add_device(
 def get_device_by_sid(sid: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT d.id, d.user_id, d.sid, d.name, d.kind, d.pub_key, d.sig_pub, d.created_at, d.last_seen, "
+            "SELECT d.id, d.user_id, d.sid, d.name, d.kind, d.pub_key, d.sig_pub, "
+            "d.session_version, d.created_at, d.last_seen, "
             "u.username FROM devices d JOIN users u ON u.id = d.user_id WHERE d.sid = ?",
             (sid,),
         ).fetchone()
@@ -193,7 +205,8 @@ def get_device_by_sid(sid: str) -> dict[str, Any] | None:
 def list_user_devices(user_id: int) -> list[dict[str, Any]]:
     with conn_ctx() as c:
         rows = c.execute(
-            "SELECT id, sid, name, kind, pub_key, sig_pub, created_at, last_seen "
+            "SELECT id, sid, name, kind, pub_key, sig_pub, session_version, "
+            "created_at, last_seen "
             "FROM devices WHERE user_id = ? ORDER BY created_at",
             (user_id,),
         ).fetchall()
@@ -203,6 +216,44 @@ def list_user_devices(user_id: int) -> list[dict[str, Any]]:
 def touch_device(device_id: int) -> None:
     with conn_ctx() as c:
         c.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (now(), device_id))
+
+
+def rotate_device_session(
+    device_id: int,
+    user_id: int,
+    expected_version: int | None = None,
+) -> int | None:
+    """Atomically revoke existing JWTs for one device and return its new version.
+
+    ``expected_version`` prevents an older request from revoking a newer login
+    that won a race after the request was authenticated.
+    """
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            params: tuple[Any, ...]
+            where = "id = ? AND user_id = ?"
+            params = (device_id, user_id)
+            if expected_version is not None:
+                where += " AND session_version = ?"
+                params += (expected_version,)
+            cur = c.execute(
+                "UPDATE devices SET session_version = session_version + 1, "
+                "last_seen = ? WHERE " + where,
+                (now(), *params),
+            )
+            if cur.rowcount != 1:
+                c.execute("ROLLBACK")
+                return None
+            row = c.execute(
+                "SELECT session_version FROM devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            c.execute("COMMIT")
+            return int(row["session_version"])
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
 
 
 def revoke_device(device_id: int, user_id: int) -> bool:
@@ -307,7 +358,8 @@ def add_member(conv_id: int, user_id: int) -> None:
 def get_conversation_by_cid(cid: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, cid, name, created_at FROM conversations WHERE cid = ?",
+            "SELECT id, cid, name, synced_contact_name, created_at "
+            "FROM conversations WHERE cid = ?",
             (cid,),
         ).fetchone()
         return dict(row) if row else None
@@ -317,7 +369,8 @@ def list_members(conv_id: int) -> list[dict[str, Any]]:
     """Return all devices of all members — needed to fan out envelope keys."""
     with conn_ctx() as c:
         rows = c.execute(
-            "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.name, d.kind "
+            "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.name, d.kind, "
+            "d.session_version "
             "FROM conversation_members m "
             "JOIN devices d ON d.user_id = m.user_id "
             "WHERE m.conv_id = ?",
@@ -585,6 +638,55 @@ def remove_block_rule(user_id: int, rule_id: int) -> bool:
 def update_conversation_name(conv_id: int, name: str) -> None:
     with conn_ctx() as c:
         c.execute("UPDATE conversations SET name = ? WHERE id = ?", (name, conv_id))
+
+
+def sync_contact_names(
+    user_id: int, entries: list[tuple[str, str]]
+) -> str | None:
+    """Validate and update a contact snapshot in one write transaction.
+
+    Returns ``not_found`` or ``forbidden`` without applying any update, or
+    ``None`` after all entries were committed.
+    """
+    if not entries:
+        return None
+    cids = [cid for cid, _ in entries]
+    placeholders = ",".join("?" for _ in cids)
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            rows = c.execute(
+                "SELECT cv.id, cv.cid, "
+                "EXISTS(SELECT 1 FROM conversation_members own "
+                "WHERE own.conv_id = cv.id AND own.user_id = ?) AS owned, "
+                "(SELECT COUNT(*) FROM conversation_members members "
+                "WHERE members.conv_id = cv.id) AS member_count "
+                f"FROM conversations cv WHERE cv.cid IN ({placeholders})",
+                (user_id, *cids),
+            ).fetchall()
+            by_cid = {str(row["cid"]): row for row in rows}
+            if any(cid not in by_cid for cid in cids):
+                c.execute("ROLLBACK")
+                return "not_found"
+            if any(
+                not bool(by_cid[cid]["owned"])
+                or int(by_cid[cid]["member_count"]) != 1
+                for cid in cids
+            ):
+                c.execute("ROLLBACK")
+                return "forbidden"
+            c.executemany(
+                "UPDATE conversations SET synced_contact_name = ? WHERE id = ?",
+                (
+                    (contact_name, int(by_cid[cid]["id"]))
+                    for cid, contact_name in entries
+                ),
+            )
+            c.execute("COMMIT")
+            return None
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
 
 
 def list_member_user_ids(conv_id: int) -> list[int]:

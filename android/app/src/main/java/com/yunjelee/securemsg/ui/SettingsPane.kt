@@ -111,10 +111,18 @@ fun SettingsPane(
         contactMessage = null
         scope.launch(Dispatchers.IO) {
             try {
-                val result = ContactSync.sync(context)
+                val saved = Credentials.load(context)
+                    ?: error("다시 로그인한 뒤 동기화해 주세요")
+                val api = RelayApi(ServerConfig.url(context)).also { it.token = saved.token }
+                val result = ContactSync.sync(context, api)
                 withContext(Dispatchers.Main) {
                     contactStatus = result
-                    contactMessage = "연락처 이름을 기기 내부에 반영했습니다."
+                    contactMessage = if (result.failedUploadCount == 0) {
+                        "이 기기와 다른 로그인 기기에 연락처 이름을 반영했습니다."
+                    } else {
+                        "로컬 반영 완료 · 서버 업로드 ${result.uploadedCount}건 · " +
+                            "실패 ${result.failedUploadCount}건"
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("SettingsPane", "local contact sync failed", e)
@@ -275,7 +283,11 @@ fun SettingsPane(
 
         SmCard {
             SectionTitle("연락처 이름")
-            Caption("전화번호와 이름은 이 Android 기기에서만 대조하며 서버로 전송하지 않습니다.")
+            Caption(
+                "폰 연락처와 전화번호를 이 기기에서 대조한 뒤, 일치한 이름(또는 삭제 상태)을 " +
+                    "다른 로그인 기기에도 표시하도록 릴레이 서버에 저장합니다. 전체 연락처 목록은 " +
+                    "업로드하지 않습니다.",
+            )
             ContactSyncStatusText(contactStatus)
             SmGhostButton(
                 text = if (contactSyncing) "동기화 중…" else "연락처 이름 동기화",
@@ -401,7 +413,8 @@ private fun ContactSyncStatusText(status: ContactSyncStatus?) {
     }
     Caption(
         "마지막 동기화: $timestamp · 연락처 번호 ${status.contactPhoneCount}개 · " +
-            "대화 ${status.matchedThreadCount}개 일치",
+            "대화 ${status.matchedThreadCount}개 일치 · 서버 ${status.uploadedCount}건" +
+            if (status.failedUploadCount > 0) " · 실패 ${status.failedUploadCount}건" else "",
     )
 }
 

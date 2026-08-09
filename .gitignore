@@ -11,5 +11,6 @@ frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
 android/.gradle/
+android/.kotlin/
 android/local.properties
 android/**/build/

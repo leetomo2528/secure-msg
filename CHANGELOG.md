@@ -1,5 +1,51 @@
 # 업데이트 내역
 
+## v0.10.0 (2026-08-09) — 인증정보 보호 + 알림 진입 복구 + 연락처 다기기 동기화
+
+### 인증·세션 보안
+
+- Android DataStore에 평문으로 남던 JWT와 X25519/Ed25519 개인키를 Android Keystore 기반 AES-256-GCM으로 암호화
+  - 저장할 때마다 12바이트 랜덤 nonce와 인증 태그 사용
+  - 기존 평문 `token`·`box_sk`·`sign_sk`는 최초 로드 시 암호문으로 자동 이전 후 삭제
+  - 암호문 변조·Keystore 키 소실 시 앱이 종료되지 않고 해당 로컬 인증정보를 폐기한 뒤 재로그인 요구
+- 서버 `devices.session_version`과 JWT `sv`를 추가해 기기별 세션을 즉시 폐기 가능하도록 변경
+  - 명시적 로그아웃과 동일 기기 재로그인 시 이전 JWT 무효화
+  - REST, Socket.IO 연결 및 모든 클라이언트 이벤트에서 DB 세션 버전 재검증
+  - 소켓 room도 세션 버전별로 격리해 로그아웃 전 기존 연결의 후속 서버 푸시 차단
+  - 다른 기기의 로그인 세션과 기기 공개키는 유지
+- 웹과 Android 로그아웃이 `POST /api/logout`으로 서버 토큰을 먼저 폐기한 뒤, 네트워크 실패나 이미 만료된 토큰에도 로컬 세션을 반드시 정리하도록 변경
+- 비밀번호 원문과 재사용 가능한 클라이언트 검증값은 로컬 저장하지 않음. 웹 JWT는 계속 메모리에만 유지
+
+### Android 대화 화면
+
+- Room 메시지 조회를 `createdAt DESC, id DESC`로 변경하고 Compose 목록에 `reverseLayout`을 적용
+- 대화를 열면 최신 문자가 화면 최하단에 보이며, 새 문자 도착 시 기존 대화가 위로 밀리는 일반 메신저 방식으로 변경
+- 사용자가 과거 대화를 읽는 중에는 최신 문자로 강제 이동하지 않고, 최하단에 있을 때만 새 문자를 계속 따라감
+- 대화방 전환과 검색 시작·초기화 시 해당 대화 또는 검색 결과의 최신 문자부터 표시
+
+### 알림에서 수신 문자 열기
+
+- 수신 SMS를 알림보다 먼저 Room의 `sms_threads`·`messages`·`relay_outbox`에 한 트랜잭션으로 저장해, 릴레이 서비스가 늦거나 오프라인이어도 앱 화면에 즉시 표시
+- 알림마다 고유 message identity·CID·정규화 전화번호를 담은 독립 PendingIntent를 생성해 여러 알림이 서로 덮어쓰지 않도록 수정
+- 앱 종료 상태의 `onCreate`와 실행 중 `singleTask onNewIntent`를 모두 처리해 알림을 누르면 메시지 탭의 해당 대화를 직접 열도록 변경
+- 로컬 CID가 서버 CID로 병합됐거나 Room Flow가 늦게 도착해도 전화번호 fallback으로 한 번만 대화를 선택하고, 앱 복귀 시 Provider import/outbox flush 재시작
+
+### 연락처 이름 다기기 동기화
+
+- 서버 `conversations.synced_contact_name`과 Android Room `syncedContactName`을 추가해 SMS 전화번호 identity를 바꾸지 않고 별도의 표시명으로 동기화
+- Android 연락처 동기화 시 SecureMsg의 본인 단독 SMS 대화와 매칭된 이름·삭제 상태만 최대 500개 bulk snapshot으로 서버에 원자 반영
+- 업로드는 계정의 Android SMS gateway만 허용하고, 그룹·타 계정 대화·잘못된 타입·제어문자·중복 CID는 전부 거부
+- `contacts_updated` Socket.IO 이벤트와 재연결 목록 조회로 웹·다른 Android 기기에서 즉시/오프라인 복구 표시
+- 표시 우선순위는 현재 기기 연락처 → 동기화된 연락처 이름 → 서버 대화명 → 전화번호. 실제 SMS 발신은 계속 전화번호 필드만 사용
+- 전체 주소록과 메시지 내용은 업로드하지 않지만, 매칭된 연락처 이름은 다른 기기 표시를 위해 relay SQLite에 메타데이터로 저장된다는 점을 설정 화면에 명시
+
+### 검증
+
+- 서버 41개 테스트 통과(로그아웃·토큰 회전·연락처 bulk 원자성·권한 경계·DB 마이그레이션 포함)
+- 웹 68개 테스트 + TypeScript + production build 통과
+- Android 96개 단위 테스트 + lint + Debug/Release APK 빌드 통과
+- versionCode 12 / versionName 0.10.0
+
 ## v0.9.0 (2026-08-08) — GitHub 이슈 4건 해결 + Android 구조 리팩토링
 
 ### GitHub 이슈 수정

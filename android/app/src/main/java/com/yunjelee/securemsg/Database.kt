@@ -14,11 +14,14 @@ data class SmsThread(
     val lastSeq: Int = 0,
     /** Local ordering key; advances even while a relay sequence is unavailable. */
     val lastActivityAt: Long = 0L,
-    /** Android address-book name. This value is local-only and is never sent to the relay. */
+    /** Android address-book name read on this device. */
     val localContactName: String? = null,
+    /** Contact name shared through the relay by one of this account's devices. */
+    val syncedContactName: String? = null,
 ) {
     val displayName: String
         get() = localContactName?.takeIf { it.isNotBlank() }
+            ?: syncedContactName?.takeIf { it.isNotBlank() }
             ?: serverName?.takeIf { it.isNotBlank() }
             ?: phoneNumber
 
@@ -180,13 +183,18 @@ interface ThreadDao {
     @Query("UPDATE sms_threads SET localContactName = :name WHERE cid = :cid")
     suspend fun updateLocalContactNameByCid(cid: String, name: String?)
 
+    @Query("UPDATE sms_threads SET syncedContactName = :name WHERE cid = :cid")
+    suspend fun updateSyncedContactNameByCid(cid: String, name: String?)
+
     @Query("UPDATE sms_threads SET contactName = :name WHERE cid = :cid")
     suspend fun updateServerNameByCid(cid: String, name: String?)
 }
 
 @Dao
 interface MessageDao {
-    @Query("SELECT * FROM messages WHERE cid = :cid ORDER BY createdAt ASC, id ASC")
+    // Newest-first matches the reverse-layout conversation list: index 0 is
+    // physically anchored at the bottom while older messages extend upward.
+    @Query("SELECT * FROM messages WHERE cid = :cid ORDER BY createdAt DESC, id DESC")
     fun observeForCid(cid: String): Flow<List<MessageRow>>
 
     @Query("SELECT * FROM messages WHERE id = :id")
@@ -417,7 +425,7 @@ interface CarrierPartResultDao {
         ProcessedMms::class,
         CarrierPartResult::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -447,6 +455,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_5_6,
                     MIGRATION_6_7,
                     MIGRATION_7_8,
+                    MIGRATION_8_9,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -605,6 +614,14 @@ abstract class AppDatabase : RoomDatabase() {
                 // Preserve contactName as the relay-owned label. Address-book
                 // synchronization starts with an independent, local-only slot.
                 db.execSQL("ALTER TABLE sms_threads ADD COLUMN localContactName TEXT")
+            }
+        }
+
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Keep device address-book values independent from the name
+                // shared across the user's other authenticated devices.
+                db.execSQL("ALTER TABLE sms_threads ADD COLUMN syncedContactName TEXT")
             }
         }
     }
