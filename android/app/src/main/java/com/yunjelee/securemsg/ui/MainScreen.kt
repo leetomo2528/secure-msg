@@ -32,7 +32,13 @@ import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
 import com.yunjelee.securemsg.BuildConfig
 import com.yunjelee.securemsg.ConversationTarget
+import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.SavedCredentials
+import com.yunjelee.securemsg.ServerConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 
 /** Post-login home: status header, update banner, tabs (messages / settings). */
 @Composable
@@ -58,6 +64,7 @@ fun MainScreen(
     val db = AppDatabase.get(context)
     val threads by db.threadDao().observeAll().collectAsState(initial = emptyList())
     var selectedSection by remember { mutableIntStateOf(0) }
+    var pendingApprovalCount by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(conversationTarget?.requestId, conversationTarget?.cid) {
         if (conversationTarget != null) selectedSection = 0
@@ -70,6 +77,26 @@ fun MainScreen(
             setStatus("SMS 권한 필요 — 설정에서 승인하세요")
         } else {
             setStatus("브리지 사용 준비됨 (${creds.username}@${creds.sid})")
+        }
+    }
+
+    // The Android bridge receives device_pending over Socket.IO, but the
+    // service can be running while the user is looking at the message tab.
+    // Poll the authoritative device list so a pending web login is visible in
+    // the foreground UI instead of being reduced to a logcat entry.
+    LaunchedEffect(creds.sid) {
+        while (isActive) {
+            pendingApprovalCount = withContext(Dispatchers.IO) {
+                runCatching {
+                    val response = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }.listDevices()
+                    val devices = response.optJSONArray("devices") ?: return@runCatching 0
+                    (0 until devices.length()).count { index ->
+                        val device = devices.optJSONObject(index)
+                        device != null && device.optString("sid") != creds.sid && device.optString("trust_state") == "pending"
+                    }
+                }.getOrDefault(0)
+            }
+            delay(5_000)
         }
     }
 
@@ -118,6 +145,31 @@ fun MainScreen(
             onCloseInstallBlocked = update.onCloseInstallBlocked,
             onDismiss = update.onDismiss,
         )
+        if (pendingApprovalCount > 0) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Sm.teal.copy(alpha = 0.10f))
+                    .border(1.dp, Sm.teal.copy(alpha = 0.42f), RoundedCornerShape(14.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(9.dp),
+            ) {
+                Text(
+                    "새 기기 승인 요청 ${pendingApprovalCount}건",
+                    color = Sm.teal, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    "웹에서 로그인한 기기를 확인하려면 기기 보안 화면에서 승인하세요.",
+                    color = Sm.text2, fontSize = 12.sp, lineHeight = 17.sp,
+                )
+                SmGradientButton(
+                    text = "기기 보안 열기",
+                    onClick = { selectedSection = 1 },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
         if (!smsRoleHeld) {
             Column(
                 Modifier

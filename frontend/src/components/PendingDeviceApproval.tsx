@@ -41,6 +41,9 @@ export default function PendingDeviceApproval() {
             이미 승인된 SecureMsg 기기의 ‘기기 및 암호화 검증’에서 이 기기를 승인하세요.
             승인 전에는 대화·메시지 키에 접근할 수 없습니다.
           </p>
+          <p className="mt-2 rounded-xl bg-accent-tx/10 px-3 py-2.5 text-left text-[11px] leading-relaxed text-accent-tx ring-1 ring-accent-tx/20">
+            Android에서는 <strong>메시지 → 차단·설정 → 기기 보안</strong>으로 이동하면 승인 요청이 표시됩니다.
+          </p>
         </div>
         <div className="rounded-xl bg-fg/[0.04] p-3 text-left">
           <div className="text-[10px] text-tx-4">기기 SID</div>
