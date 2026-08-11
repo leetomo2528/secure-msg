@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import time
+from functools import wraps
 
 import bcrypt
 import config
@@ -110,24 +111,41 @@ def _json_body() -> dict | None:
     return body if isinstance(body, dict) else None
 
 
+def _request_claims(*, missing_error: str) -> tuple[dict | None, tuple | None]:
+    """Decode the bearer token once and normalize malformed JWT claims.
+
+    Both authenticated decorators use the same claim validation. Keeping it in
+    one place prevents subtle differences in how pending and approved devices
+    interpret a token while retaining their distinct error messages.
+    """
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return None, _err(missing_error, 401)
+    decoded = verify_jwt(header[7:])
+    if not decoded:
+        return None, _err("invalid token", 401)
+    try:
+        claims = {
+            "uid": int(decoded["uid"]),
+            "sid": str(decoded["sid"]),
+            "session_version": int(decoded["sv"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None, _err("invalid token", 401)
+    return claims, None
+
+
 def auth_required(fn):
     """Validate JWT and ensure its device has not since been revoked."""
-    from functools import wraps
-
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        header = request.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return _err("missing bearer token", 401)
-        decoded = verify_jwt(header[7:])
-        if not decoded:
-            return _err("invalid token", 401)
-        try:
-            uid = int(decoded["uid"])
-            sid = str(decoded["sid"])
-            session_version = int(decoded["sv"])
-        except (KeyError, TypeError, ValueError):
-            return _err("invalid token", 401)
+        claims, error = _request_claims(missing_error="missing bearer token")
+        if error:
+            return error
+        assert claims is not None
+        uid = claims["uid"]
+        sid = claims["sid"]
+        session_version = claims["session_version"]
         device = store.get_device_by_sid(sid)
         if (
             not device
@@ -150,18 +168,15 @@ def auth_required(fn):
 
 def pending_auth_required(fn):
     """Authenticate a device token without granting application access."""
-    from functools import wraps
-
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        header = request.headers.get("Authorization", "")
-        decoded = verify_jwt(header[7:]) if header.startswith("Bearer ") else None
-        if not decoded:
-            return _err("invalid token", 401)
-        try:
-            uid, sid, sv = int(decoded["uid"]), str(decoded["sid"]), int(decoded["sv"])
-        except (KeyError, TypeError, ValueError):
-            return _err("invalid token", 401)
+        claims, error = _request_claims(missing_error="invalid token")
+        if error:
+            return error
+        assert claims is not None
+        uid = claims["uid"]
+        sid = claims["sid"]
+        sv = claims["session_version"]
         device = store.get_device_by_sid(sid)
         if not device or device["user_id"] != uid or device["session_version"] != sv or device["trust_state"] == "revoked":
             return _err("device revoked or unknown", 401)
