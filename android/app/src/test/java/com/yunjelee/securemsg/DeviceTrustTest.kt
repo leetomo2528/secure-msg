@@ -133,7 +133,7 @@ class DeviceTrustTest {
         assertTrue(verifyDirectoryProof(
             proof.copy(approvalCertificates = proof.approvalCertificates.map { it.copy(statement = it.statement + "x") }),
             snapshot, false,
-        ) { _, _, _ -> true }!!.contains("does not match"))
+        ) { _, _, _ -> true }!!.contains("invalid"))
     }
 
     @Test fun rollbackAndSameEpochEquivocationAreRejected() {
