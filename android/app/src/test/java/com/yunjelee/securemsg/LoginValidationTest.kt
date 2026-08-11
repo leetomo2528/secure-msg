@@ -1,11 +1,26 @@
 package com.yunjelee.securemsg
 
 import com.yunjelee.securemsg.ui.isLocalTestHost
-import org.junit.Assert.assertFalse
+import com.yunjelee.securemsg.ui.ACCOUNT_RECOVERY_WARNING
+import com.yunjelee.securemsg.ui.NEW_DEVICE_HISTORY_WARNING
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class LoginValidationTest {
+
+    @Test
+    fun onboardingWarnsAboutAccountRecoveryAndSessionExpiry() {
+        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("비밀번호 재설정·계정 복구 수단이 없습니다"))
+        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("세션은 만료 전까지 동작할 수"))
+        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("세션 만료 후에는 다시 로그인할 수 없습니다"))
+    }
+
+    @Test
+    fun onboardingWarnsAboutNewDeviceHistoryCutoff() {
+        assertTrue(NEW_DEVICE_HISTORY_WARNING.contains("기기 등록 이전 메시지를 복호화할 수 없습니다"))
+        assertTrue(NEW_DEVICE_HISTORY_WARNING.contains("기존 기기 전송이나 암호화 백업 기능을 제공하지 않습니다"))
+    }
 
     @Test
     fun localhostAliasesAreAllowed() {

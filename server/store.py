@@ -6,13 +6,40 @@ All functions return plain dicts/tuples. Caller is responsible for serialization
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
 import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import Any
 
+import config
 from config import BASE_DIR, DB_PATH
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def device_fingerprint(pub_key: str, sig_pub: str) -> str:
+    canonical = (
+        "securemsg-device-fingerprint-v1\n"
+        f"pub_key={pub_key}\n"
+        f"sig_pub={sig_pub}\n"
+    )
+    return _b64u(hashlib.sha256(canonical.encode("utf-8")).digest())
+
+
+def _directory_hash_rows(rows: Iterable[sqlite3.Row | dict[str, Any]]) -> str:
+    records = [
+        [str(r["sid"]), str(r["pub_key"]), str(r["sig_pub"]), str(r["kind"])]
+        for r in rows
+    ]
+    records.sort(key=lambda item: item[0])
+    canonical = json.dumps(records, separators=(",", ":"), ensure_ascii=True)
+    return _b64u(hashlib.sha256(canonical.encode()).digest())
 
 
 def _connect() -> sqlite3.Connection:
@@ -37,6 +64,21 @@ def init_schema() -> None:
     sql = schema_path.read_text(encoding="utf-8")
     with conn_ctx() as c:
         c.executescript(sql)
+        # Every additive migration below is one write-locked transaction.
+        # Closing the connection on an exception rolls the whole migration
+        # back, avoiding a visible half-migrated trust directory.
+        c.execute("BEGIN IMMEDIATE")
+        user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)")}
+        if "identity_sig_pub" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN identity_sig_pub TEXT NOT NULL DEFAULT ''")
+        if "security_epoch" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN security_epoch INTEGER NOT NULL DEFAULT 0")
+        if "directory_hash" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN directory_hash TEXT NOT NULL DEFAULT ''")
+        if "trust_enforced_at" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN trust_enforced_at INTEGER")
+        if "security_mode" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN security_mode TEXT NOT NULL DEFAULT 'legacy_v1'")
         # Migration: add name column if missing (existing DBs created before this column).
         cols = [
             row[1] for row in c.execute("PRAGMA table_info(conversations)").fetchall()
@@ -86,6 +128,7 @@ def init_schema() -> None:
         device_cols = [
             row[1] for row in c.execute("PRAGMA table_info(devices)").fetchall()
         ]
+        legacy_trust_migration = "trust_state" not in device_cols
         if "kind" not in device_cols:
             c.execute("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'web'")
             c.execute(
@@ -97,10 +140,113 @@ def init_schema() -> None:
                 "ALTER TABLE devices ADD COLUMN session_version "
                 "INTEGER NOT NULL DEFAULT 1"
             )
-        c.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_android_gateway_per_user "
-            "ON devices(user_id) WHERE kind = 'android_gateway'"
-        )
+        trust_columns = {
+            "trust_state": "TEXT NOT NULL DEFAULT 'approved'",
+            "challenge": "TEXT NOT NULL DEFAULT ''",
+            "approved_by_sid": "TEXT",
+            "approved_at": "INTEGER",
+            "approval_signature": "TEXT",
+            "fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "revoked_at": "INTEGER",
+            "verification_state": "TEXT NOT NULL DEFAULT 'legacy_unverified'",
+        }
+        for column, definition in trust_columns.items():
+            if column not in device_cols:
+                c.execute(f"ALTER TABLE devices ADD COLUMN {column} {definition}")
+        # Every pre-trust device is grandfathered in. The oldest key is the
+        # account's stable legacy-TOFU identity anchor; no key material changes.
+        c.execute("UPDATE devices SET trust_state = 'approved' WHERE trust_state IS NULL OR trust_state = ''")
+        for row in c.execute("SELECT id, pub_key, sig_pub, fingerprint FROM devices").fetchall():
+            fingerprint = device_fingerprint(row["pub_key"], row["sig_pub"])
+            if row["fingerprint"] == fingerprint:
+                continue
+            c.execute(
+                "UPDATE devices SET fingerprint = ? WHERE id = ?",
+                (fingerprint, row["id"]),
+            )
+        timestamp = now()
+        for user in c.execute("SELECT id FROM users ORDER BY id").fetchall():
+            uid = int(user["id"])
+            gateways = c.execute(
+                "SELECT id,sid FROM devices WHERE user_id=? AND kind='android_gateway' AND trust_state='approved' ORDER BY created_at,id",
+                (uid,),
+            ).fetchall()
+            quarantined_gateways: list[str] = []
+            for duplicate in gateways[1:]:
+                c.execute(
+                    "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
+                    (_b64u(__import__("secrets").token_bytes(32)), duplicate["id"]),
+                )
+                quarantined_gateways.append(str(duplicate["sid"]))
+            earliest = c.execute(
+                "SELECT sig_pub FROM devices WHERE user_id = ? ORDER BY created_at, id LIMIT 1",
+                (uid,),
+            ).fetchone()
+            if earliest:
+                c.execute(
+                    "UPDATE users SET identity_sig_pub = CASE WHEN identity_sig_pub = '' THEN ? ELSE identity_sig_pub END, "
+                    "security_epoch = CASE WHEN security_epoch = 0 THEN 1 ELSE security_epoch END, "
+                    "trust_enforced_at = COALESCE(trust_enforced_at, ?) WHERE id = ?",
+                    (earliest["sig_pub"], timestamp, uid),
+                )
+                if legacy_trust_migration:
+                    c.execute(
+                        "UPDATE devices SET approved_by_sid = COALESCE(approved_by_sid, 'legacy_tofu'), approved_at = COALESCE(approved_at, created_at) WHERE user_id = ? AND trust_state = 'approved'",
+                        (uid,),
+                    )
+                    c.execute(
+                        "UPDATE devices SET verification_state='legacy_unverified' WHERE user_id=?",
+                        (uid,),
+                    )
+            if quarantined_gateways:
+                epoch = int(c.execute("SELECT security_epoch FROM users WHERE id=?", (uid,)).fetchone()["security_epoch"]) + 1
+                c.execute("UPDATE users SET security_epoch=? WHERE id=?", (epoch, uid))
+                directory_hash = _refresh_directory_locked(c, uid)
+                _append_security_event_locked(
+                    c,
+                    uid,
+                    "legacy_gateway_quarantined",
+                    None,
+                    None,
+                    epoch,
+                    {"sids": quarantined_gateways, "directory_hash": directory_hash},
+                )
+            else:
+                _refresh_directory_locked(c, uid)
+        c.execute("DROP INDEX IF EXISTS idx_one_android_gateway_per_user")
+        # Triggers enforce the invariant for all future writes while allowing a
+        # pathological legacy database with duplicate gateways to migrate
+        # without deleting or silently reclassifying either device.
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS one_approved_gateway_insert
+            BEFORE INSERT ON devices
+            WHEN NEW.kind = 'android_gateway' AND NEW.trust_state = 'approved'
+             AND EXISTS(SELECT 1 FROM devices WHERE user_id = NEW.user_id AND kind = 'android_gateway' AND trust_state = 'approved')
+            BEGIN SELECT RAISE(ABORT, 'approved Android gateway already exists'); END
+        """)
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS one_approved_gateway_update
+            BEFORE UPDATE OF kind, trust_state ON devices
+            WHEN NEW.kind = 'android_gateway' AND NEW.trust_state = 'approved'
+             AND EXISTS(SELECT 1 FROM devices WHERE user_id = NEW.user_id AND id != OLD.id AND kind = 'android_gateway' AND trust_state = 'approved')
+            BEGIN SELECT RAISE(ABORT, 'approved Android gateway already exists'); END
+        """)
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS devices_keys_immutable
+            BEFORE UPDATE OF pub_key, sig_pub ON devices
+            WHEN NEW.pub_key != OLD.pub_key OR NEW.sig_pub != OLD.sig_pub
+            BEGIN
+                SELECT RAISE(ABORT, 'device public keys are immutable');
+            END
+        """)
+        c.execute("""
+            CREATE TRIGGER IF NOT EXISTS users_identity_key_immutable
+            BEFORE UPDATE OF identity_sig_pub ON users
+            WHEN OLD.identity_sig_pub != '' AND NEW.identity_sig_pub != OLD.identity_sig_pub
+            BEGIN
+                SELECT RAISE(ABORT, 'account identity key is immutable');
+            END
+        """)
         # Cross-device shared block rules (v0.6.0). Values are user-entered
         # filter strings, synced per user; each device still applies them
         # locally to plaintext after decryption.
@@ -119,10 +265,64 @@ def init_schema() -> None:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_block_rules_user ON block_rules(user_id)"
         )
+        c.execute("COMMIT")
 
 
 def now() -> int:
     return int(time.time())
+
+
+def _refresh_directory_locked(c: sqlite3.Connection, user_id: int) -> str:
+    rows = c.execute(
+        "SELECT sid, pub_key, sig_pub, kind FROM devices "
+        "WHERE user_id = ? AND trust_state = 'approved' ORDER BY sid",
+        (user_id,),
+    ).fetchall()
+    digest = _directory_hash_rows(rows)
+    c.execute("UPDATE users SET directory_hash = ? WHERE id = ?", (digest, user_id))
+    return digest
+
+
+def _append_security_event_locked(
+    c: sqlite3.Connection,
+    user_id: int,
+    event_type: str,
+    actor_sid: str | None,
+    subject_sid: str | None,
+    security_epoch: int,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    previous = c.execute(
+        "SELECT event_hash FROM security_events WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    previous_hash = str(previous["event_hash"]) if previous else ""
+    created_at = now()
+    event_json = json.dumps(details, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    material = json.dumps(
+        {
+            "user_id": user_id,
+            "event_type": event_type,
+            "actor_sid": actor_sid,
+            "subject_sid": subject_sid,
+            "security_epoch": security_epoch,
+            "event_json": event_json,
+            "previous_hash": previous_hash,
+            "created_at": created_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    event_hash = _b64u(hashlib.sha256(material).digest())
+    signature = _b64u(
+        hmac.new(config.JWT_SECRET.encode(), event_hash.encode(), hashlib.sha256).digest()
+    )
+    cur = c.execute(
+        "INSERT INTO security_events(user_id,event_type,actor_sid,subject_sid,security_epoch,event_json,previous_hash,event_hash,server_signature,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (user_id, event_type, actor_sid, subject_sid, security_epoch, event_json, previous_hash, event_hash, signature, created_at),
+    )
+    return {"id": cur.lastrowid, "event_hash": event_hash, "server_signature": signature}
 
 
 # ----- users -------------------------------------------------------------
@@ -140,7 +340,7 @@ def create_user(username: str, pw_hash: str) -> int:
 def get_user_by_name(username: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, username, pw_hash, created_at FROM users WHERE username = ?",
+            "SELECT id, username, pw_hash, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE username = ?",
             (username,),
         ).fetchone()
         return dict(row) if row else None
@@ -149,7 +349,7 @@ def get_user_by_name(username: str) -> dict[str, Any] | None:
 def get_user(uid: int) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, username, created_at FROM users WHERE id = ?",
+            "SELECT id, username, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE id = ?",
             (uid,),
         ).fetchone()
         return dict(row) if row else None
@@ -172,18 +372,39 @@ def add_device(
         try:
             if max_devices is not None:
                 row = c.execute(
-                    "SELECT COUNT(*) AS count FROM devices WHERE user_id = ?",
+                    "SELECT COUNT(*) AS count FROM devices WHERE user_id = ? AND trust_state != 'revoked'",
                     (user_id,),
                 ).fetchone()
                 if int(row["count"]) >= max_devices:
                     raise ValueError("device limit reached")
             timestamp = now()
+            total_count = c.execute(
+                "SELECT COUNT(*) AS count FROM devices WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()["count"]
+            # Only a genuinely new account may self-bootstrap. Tombstones are
+            # retained, so revoking every device cannot silently reset trust.
+            trust_state = "approved" if int(total_count) == 0 else "pending"
+            challenge = _b64u(__import__("secrets").token_bytes(32))
+            fingerprint = device_fingerprint(pub_key, sig_pub)
             cur = c.execute(
                 "INSERT INTO devices(user_id, sid, name, kind, pub_key, sig_pub, "
-                "session_version, created_at, last_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                (user_id, sid, name, kind, pub_key, sig_pub, timestamp, timestamp),
+                "session_version, trust_state, challenge, approved_by_sid, approved_at, fingerprint, verification_state, created_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'verified', ?, ?)",
+                (user_id, sid, name, kind, pub_key, sig_pub, trust_state, challenge, sid if trust_state == "approved" else None, timestamp if trust_state == "approved" else None, fingerprint, timestamp, timestamp),
             )
+            user = c.execute("SELECT security_epoch, identity_sig_pub FROM users WHERE id = ?", (user_id,)).fetchone()
+            if trust_state == "approved":
+                epoch = int(user["security_epoch"]) + 1
+                c.execute(
+                    "UPDATE users SET identity_sig_pub = CASE WHEN identity_sig_pub = '' THEN ? ELSE identity_sig_pub END, security_epoch = ?, trust_enforced_at = COALESCE(trust_enforced_at, ?) WHERE id = ?",
+                    (sig_pub, epoch, timestamp, user_id),
+                )
+                directory_hash = _refresh_directory_locked(c, user_id)
+                _append_security_event_locked(c, user_id, "device_bootstrap", sid, sid, epoch, {"fingerprint": fingerprint, "directory_hash": directory_hash, "legacy_tofu": False})
+            else:
+                epoch = int(user["security_epoch"])
+                _append_security_event_locked(c, user_id, "device_pending", sid, sid, epoch, {"fingerprint": fingerprint})
             c.execute("COMMIT")
             return cur.lastrowid
         except Exception:
@@ -195,8 +416,8 @@ def get_device_by_sid(sid: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
             "SELECT d.id, d.user_id, d.sid, d.name, d.kind, d.pub_key, d.sig_pub, "
-            "d.session_version, d.created_at, d.last_seen, "
-            "u.username FROM devices d JOIN users u ON u.id = d.user_id WHERE d.sid = ?",
+            "d.session_version, d.trust_state, d.challenge, d.approved_by_sid, d.approved_at, d.approval_signature, d.fingerprint, d.revoked_at, d.verification_state, d.created_at, d.last_seen, "
+            "u.username, u.identity_sig_pub, u.security_epoch, u.directory_hash, u.security_mode FROM devices d JOIN users u ON u.id = d.user_id WHERE d.sid = ?",
             (sid,),
         ).fetchone()
         return dict(row) if row else None
@@ -205,8 +426,7 @@ def get_device_by_sid(sid: str) -> dict[str, Any] | None:
 def list_user_devices(user_id: int) -> list[dict[str, Any]]:
     with conn_ctx() as c:
         rows = c.execute(
-            "SELECT id, sid, name, kind, pub_key, sig_pub, session_version, "
-            "created_at, last_seen "
+            "SELECT id, sid, name, kind, pub_key, sig_pub, session_version, trust_state, challenge, approved_by_sid, approved_at, approval_signature, fingerprint, revoked_at, verification_state, created_at, last_seen "
             "FROM devices WHERE user_id = ? ORDER BY created_at",
             (user_id,),
         ).fetchall()
@@ -256,13 +476,328 @@ def rotate_device_session(
             raise
 
 
-def revoke_device(device_id: int, user_id: int) -> bool:
+def revoke_device(
+    device_id: int,
+    user_id: int,
+    actor_sid: str,
+    actor_session_version: int,
+    parent_epoch: int,
+    statement: str,
+    signature: str,
+) -> bool:
     with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        actor = c.execute(
+            "SELECT trust_state,session_version FROM devices WHERE user_id = ? AND sid = ?",
+            (user_id, actor_sid),
+        ).fetchone()
+        if not actor or actor["trust_state"] != "approved" or int(actor["session_version"]) != actor_session_version:
+            c.execute("ROLLBACK")
+            raise PermissionError("actor is no longer approved")
+        row = c.execute("SELECT sid, trust_state FROM devices WHERE id = ? AND user_id = ?", (device_id, user_id)).fetchone()
+        if not row or row["trust_state"] == "revoked":
+            c.execute("ROLLBACK")
+            return False
+        if row["trust_state"] != "approved":
+            c.execute("ROLLBACK")
+            raise ValueError("device is not approved")
+        current_epoch = int(c.execute(
+            "SELECT security_epoch FROM users WHERE id=?", (user_id,)
+        ).fetchone()["security_epoch"])
+        if current_epoch != parent_epoch:
+            c.execute("ROLLBACK")
+            raise RuntimeError("security epoch changed")
         cur = c.execute(
-            "DELETE FROM devices WHERE id = ? AND user_id = ?",
-            (device_id, user_id),
+            "UPDATE devices SET trust_state = 'revoked', revoked_at = ?, session_version = session_version + 1 WHERE id = ? AND user_id = ?",
+            (now(), device_id, user_id),
         )
+        epoch = parent_epoch + 1
+        c.execute("UPDATE users SET security_epoch = ? WHERE id = ?", (epoch, user_id))
+        directory_hash = _refresh_directory_locked(c, user_id)
+        c.execute(
+            "INSERT INTO device_revocations(user_id,subject_sid,actor_sid,parent_epoch,resulting_epoch,reason,statement,signature,created_at) VALUES (?,?,?,?,?,'user_revoked',?,?,?)",
+            (user_id, row["sid"], actor_sid, parent_epoch, epoch, statement, signature, now()),
+        )
+        _append_security_event_locked(c, user_id, "device_revoked", actor_sid, row["sid"], epoch, {"directory_hash": directory_hash, "statement": statement, "signature": signature})
+        c.execute("COMMIT")
         return cur.rowcount > 0
+
+
+def cancel_pending_device(
+    device_id: int, user_id: int, sid: str, session_version: int
+) -> bool:
+    """Atomically cancel exactly the pending device authenticated by its JWT."""
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE devices SET trust_state='revoked', revoked_at=?, session_version=session_version+1 "
+            "WHERE id=? AND user_id=? AND sid=? AND session_version=? AND trust_state='pending'",
+            (now(), device_id, user_id, sid, session_version),
+        )
+        if cur.rowcount != 1:
+            c.execute("ROLLBACK")
+            return False
+        epoch = int(c.execute("SELECT security_epoch FROM users WHERE id=?", (user_id,)).fetchone()["security_epoch"])
+        directory_hash = _refresh_directory_locked(c, user_id)
+        _append_security_event_locked(c, user_id, "device_revoked", sid, sid, epoch, {"directory_hash": directory_hash, "pending_cancel": True})
+        c.execute("COMMIT")
+        return True
+
+
+def reject_pending_device(
+    user_id: int,
+    actor_sid: str,
+    actor_session_version: int,
+    subject_sid: str,
+    challenge: str,
+    parent_epoch: int,
+) -> bool:
+    """Approved-device rejection of an untrusted registration; no directory change."""
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        actor = c.execute(
+            "SELECT trust_state,session_version FROM devices WHERE user_id=? AND sid=?",
+            (user_id, actor_sid),
+        ).fetchone()
+        user = c.execute("SELECT security_epoch FROM users WHERE id=?", (user_id,)).fetchone()
+        if not actor or actor["trust_state"] != "approved" or int(actor["session_version"]) != actor_session_version:
+            c.execute("ROLLBACK")
+            raise PermissionError("actor is no longer approved")
+        if int(user["security_epoch"]) != parent_epoch:
+            c.execute("ROLLBACK")
+            raise RuntimeError("security epoch changed")
+        cur = c.execute(
+            "UPDATE devices SET trust_state='revoked',revoked_at=?,session_version=session_version+1 "
+            "WHERE user_id=? AND sid=? AND trust_state='pending' AND challenge=?",
+            (now(), user_id, subject_sid, challenge),
+        )
+        if cur.rowcount != 1:
+            c.execute("ROLLBACK")
+            return False
+        directory_hash = _refresh_directory_locked(c, user_id)
+        _append_security_event_locked(c, user_id, "pending_device_rejected", actor_sid, subject_sid, parent_epoch, {"challenge": challenge, "directory_hash": directory_hash})
+        c.execute("COMMIT")
+        return True
+
+
+def approve_pending_device(
+    user_id: int,
+    approver_sid: str,
+    subject_sid: str,
+    parent_epoch: int,
+    statement: str,
+    signature: str,
+    approver_session_version: int,
+) -> dict[str, Any]:
+    """Approve once, conditional on the signed directory epoch."""
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            approver = c.execute(
+                "SELECT trust_state, session_version FROM devices WHERE user_id = ? AND sid = ?",
+                (user_id, approver_sid),
+            ).fetchone()
+            subject = c.execute(
+                "SELECT trust_state FROM devices WHERE user_id = ? AND sid = ?",
+                (user_id, subject_sid),
+            ).fetchone()
+            user = c.execute(
+                "SELECT security_epoch FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if (
+                not approver
+                or approver["trust_state"] != "approved"
+                or int(approver["session_version"]) != approver_session_version
+            ):
+                raise PermissionError("approver is not approved")
+            if not subject:
+                raise LookupError("device not found")
+            if subject["trust_state"] != "pending":
+                raise ValueError("device is not pending")
+            if int(user["security_epoch"]) != parent_epoch:
+                raise RuntimeError("security epoch changed")
+            epoch = parent_epoch + 1
+            timestamp = now()
+            c.execute(
+                "UPDATE devices SET trust_state = 'approved', verification_state='verified', approved_by_sid = ?, approved_at = ?, approval_signature = ? WHERE user_id = ? AND sid = ? AND trust_state = 'pending'",
+                (approver_sid, timestamp, signature, user_id, subject_sid),
+            )
+            c.execute(
+                "INSERT INTO device_approvals(user_id,subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, subject_sid, approver_sid, parent_epoch, epoch, statement, signature, timestamp),
+            )
+            c.execute("UPDATE users SET security_epoch = ? WHERE id = ?", (epoch, user_id))
+            directory_hash = _refresh_directory_locked(c, user_id)
+            _append_security_event_locked(c, user_id, "device_approved", approver_sid, subject_sid, epoch, {"directory_hash": directory_hash, "approval_signature": signature})
+            c.execute("COMMIT")
+            return {"security_epoch": epoch, "directory_hash": directory_hash}
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
+
+def upgrade_legacy_security(
+    user_id: int,
+    actor_sid: str,
+    actor_session_version: int,
+    parent_epoch: int,
+    statement: str,
+    signature: str,
+) -> dict[str, Any]:
+    """Promote the legacy identity anchor and quarantine all uncertified peers."""
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            user = c.execute(
+                "SELECT security_mode,security_epoch,identity_sig_pub FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            actor = c.execute(
+                "SELECT sig_pub,trust_state,session_version FROM devices WHERE user_id=? AND sid=?",
+                (user_id, actor_sid),
+            ).fetchone()
+            if not user or user["security_mode"] != "legacy_v1":
+                raise ValueError("account is not legacy")
+            if int(user["security_epoch"]) != parent_epoch:
+                raise RuntimeError("security epoch changed")
+            if (
+                not actor
+                or actor["trust_state"] != "approved"
+                or int(actor["session_version"]) != actor_session_version
+                or actor["sig_pub"] != user["identity_sig_pub"]
+            ):
+                raise PermissionError("legacy identity anchor required")
+            timestamp = now()
+            for peer in c.execute(
+                "SELECT id FROM devices WHERE user_id=? AND sid!=? AND trust_state='approved'",
+                (user_id, actor_sid),
+            ).fetchall():
+                c.execute(
+                    "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
+                    (_b64u(__import__("secrets").token_bytes(32)), peer["id"]),
+                )
+            epoch = parent_epoch + 1
+            c.execute(
+                "UPDATE devices SET verification_state='verified', approved_by_sid=sid, approved_at=COALESCE(approved_at,?) WHERE user_id=? AND sid=?",
+                (timestamp, user_id, actor_sid),
+            )
+            c.execute(
+                "UPDATE users SET security_mode='verified_v2', security_epoch=?, trust_enforced_at=? WHERE id=?",
+                (epoch, timestamp, user_id),
+            )
+            directory_hash = _refresh_directory_locked(c, user_id)
+            c.execute(
+                "INSERT INTO security_upgrades(user_id,identity_sid,parent_epoch,resulting_epoch,statement,signature,created_at) VALUES (?,?,?,?,?,?,?)",
+                (user_id, actor_sid, parent_epoch, epoch, statement, signature, timestamp),
+            )
+            _append_security_event_locked(c, user_id, "legacy_security_upgraded", actor_sid, actor_sid, epoch, {"statement": statement, "signature": signature, "directory_hash": directory_hash})
+            c.execute("COMMIT")
+            return {"security_epoch": epoch, "directory_hash": directory_hash}
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
+
+def get_key_directory(user_id: int) -> dict[str, Any] | None:
+    user = get_user(user_id)
+    if not user:
+        return None
+    proof = get_directory_proof(user_id)
+    return {
+        "user_id": user_id,
+        "identity_sig_pub": user["identity_sig_pub"],
+        "security_epoch": user["security_epoch"],
+        "directory_hash": user["directory_hash"],
+        "trust_enforced_at": user["trust_enforced_at"],
+        "security_mode": user["security_mode"],
+        "devices": [d for d in list_user_devices(user_id) if d["trust_state"] == "approved"],
+        "device_history": proof["device_history"],
+        "approval_certificates": proof["approval_certificates"],
+        "revocation_certificates": proof["revocation_certificates"],
+        "security_upgrade_certificates": proof["security_upgrade_certificates"],
+    }
+
+
+def get_directory_proof(user_id: int) -> dict[str, Any] | None:
+    """Public verification material for an account device directory.
+
+    Revoked devices that were once approved remain in device_history because
+    they may be approvers in a still-valid descendant certificate chain.
+    Never-approved pending/cancelled devices are intentionally omitted.
+    """
+    user = get_user(user_id)
+    if not user:
+        return None
+    with conn_ctx() as c:
+        history = c.execute(
+            "SELECT sid,kind,pub_key,sig_pub,fingerprint,trust_state,challenge,approved_by_sid,approved_at,approval_signature,revoked_at,verification_state "
+            "FROM devices WHERE user_id = ? AND (trust_state = 'approved' OR approved_at IS NOT NULL) ORDER BY created_at,id",
+            (user_id,),
+        ).fetchall()
+        approvals = c.execute(
+            "SELECT subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at "
+            "FROM device_approvals WHERE user_id = ? ORDER BY resulting_epoch,id",
+            (user_id,),
+        ).fetchall()
+        revocations = c.execute(
+            "SELECT subject_sid,actor_sid,parent_epoch,resulting_epoch,reason,statement,signature,created_at FROM device_revocations WHERE user_id=? ORDER BY resulting_epoch,id",
+            (user_id,),
+        ).fetchall()
+        upgrades = c.execute(
+            "SELECT identity_sid,parent_epoch,resulting_epoch,statement,signature,created_at FROM security_upgrades WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    return {
+        "user_id": user_id,
+        "identity_sig_pub": user["identity_sig_pub"],
+        "security_epoch": user["security_epoch"],
+        "directory_hash": user["directory_hash"],
+        "trust_enforced_at": user["trust_enforced_at"],
+        "security_mode": user["security_mode"],
+        "device_history": [dict(row) for row in history],
+        "approval_certificates": [dict(row) for row in approvals],
+        "revocation_certificates": [dict(row) for row in revocations],
+        "security_upgrade_certificates": [dict(row) for row in upgrades],
+    }
+
+
+def list_security_events(user_id: int, limit: int = 200, before_id: int | None = None) -> list[dict[str, Any]]:
+    with conn_ctx() as c:
+        where = "user_id = ?"
+        params: tuple[Any, ...] = (user_id,)
+        if before_id is not None:
+            where += " AND id < ?"
+            params += (before_id,)
+        rows = c.execute(
+            "SELECT id,event_type,actor_sid,subject_sid,security_epoch,event_json,previous_hash,event_hash,server_signature,created_at FROM security_events WHERE " + where + " ORDER BY id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        result = []
+        # Return the newest bounded page in chronological order so clients can
+        # verify previous_hash as a forward chain without fetching all history.
+        for row in reversed(rows):
+            item = dict(row)
+            item["details"] = json.loads(item.pop("event_json"))
+            result.append(item)
+        return result
+
+
+def count_security_events(user_id: int) -> int:
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS count FROM security_events WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row["count"])
+
+
+def count_security_events_before(user_id: int, before_id: int) -> int:
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS count FROM security_events WHERE user_id=? AND id<?",
+            (user_id, before_id),
+        ).fetchone()
+        return int(row["count"])
 
 
 # ----- conversations -----------------------------------------------------
@@ -369,11 +904,12 @@ def list_members(conv_id: int) -> list[dict[str, Any]]:
     """Return all devices of all members — needed to fan out envelope keys."""
     with conn_ctx() as c:
         rows = c.execute(
-            "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.name, d.kind, "
-            "d.session_version "
+            "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.sig_pub, d.name, d.kind, "
+            "d.session_version, u.security_epoch, u.directory_hash, u.identity_sig_pub "
             "FROM conversation_members m "
             "JOIN devices d ON d.user_id = m.user_id "
-            "WHERE m.conv_id = ?",
+            "JOIN users u ON u.id = d.user_id "
+            "WHERE m.conv_id = ? AND d.trust_state = 'approved'",
             (conv_id,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -413,7 +949,7 @@ def insert_message(
         try:
             timestamp = int(created_at) if created_at is not None else now()
             sender = c.execute(
-                "SELECT pub_key FROM devices WHERE sid = ? AND user_id = ?",
+                "SELECT pub_key FROM devices WHERE sid = ? AND user_id = ? AND trust_state = 'approved'",
                 (sender_sid, sender_id),
             ).fetchone()
             if not sender:
@@ -437,7 +973,7 @@ def insert_message(
                     for row in c.execute(
                         "SELECT d.sid FROM conversation_members m "
                         "JOIN devices d ON d.user_id = m.user_id "
-                        "WHERE m.conv_id = ?",
+                        "WHERE m.conv_id = ? AND d.trust_state = 'approved'",
                         (conv_id,),
                     ).fetchall()
                 }
@@ -701,7 +1237,7 @@ def list_member_user_ids(conv_id: int) -> list[int]:
 def list_user_device_sids(user_id: int) -> list[str]:
     with conn_ctx() as c:
         rows = c.execute(
-            "SELECT sid FROM devices WHERE user_id = ?",
+            "SELECT sid FROM devices WHERE user_id = ? AND trust_state = 'approved'",
             (user_id,),
         ).fetchall()
         return [str(r["sid"]) for r in rows]

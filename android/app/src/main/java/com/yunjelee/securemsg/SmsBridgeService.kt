@@ -236,6 +236,18 @@ class SmsBridgeService : Service() {
         val serverUrl = getServerUrl()
         val relayApi = RelayApi(serverUrl).also { it.token = loaded.token }
         api = relayApi
+        val trustView = DeviceSecurityController(
+            RelayTrustedDeviceApi(relayApi, loaded.uid.toLong()),
+            loaded,
+            DeviceTrustRepository(db),
+        ).refresh()
+        if (trustView.serverUnsupported || trustView.selfPending || trustView.error != null ||
+            trustView.trustWarning != null
+        ) {
+            Log.e(TAG, "Bridge blocked by device trust: $trustView")
+            stopSelf()
+            return
+        }
         val authCheck = try {
             relayApi.listConversations()
         } catch (_: Exception) {
@@ -305,6 +317,12 @@ class SmsBridgeService : Service() {
                 // The event is an invalidation signal. Re-listing is resilient
                 // to missed events and guarantees a complete server snapshot.
                 scope.launch { syncFromServer() }
+            }
+            client.onDevicePending = {
+                // Existing traffic remains on the last verified directory. The settings
+                // screen exposes the approval request; every new fan-out refreshes and
+                // verifies the directory before accepting recipient keys.
+                Log.w(TAG, "New device approval is pending")
             }
         }
         relay!!.connect(loaded.token)
@@ -671,6 +689,7 @@ class SmsBridgeService : Service() {
 
         val members = a.convMembers(resolvedThread.cid)
         if (!members.optBoolean("ok")) return null
+        if (!validateTrustedRecipients(a, c, members)) return null
         val recipients = mutableListOf<CryptoUtil.Recipient>()
         val membersArr = members.optJSONArray("members") ?: JSONArray()
         for (index in 0 until membersArr.length()) {
@@ -678,8 +697,7 @@ class SmsBridgeService : Service() {
             val sid = member.optString("sid")
             val pubKey = member.optString("pub_key")
             if (sid.isBlank() || pubKey.isBlank()) continue
-            recipients += CryptoUtil.Recipient(sid, pubKey)
-            db.deviceCacheDao().upsert(
+            val pinned = db.deviceCacheDao().pinOrReject(
                 DeviceCache(
                     sid = sid,
                     userId = member.optInt("user_id"),
@@ -687,6 +705,11 @@ class SmsBridgeService : Service() {
                     pubKey = pubKey,
                 ),
             )
+            if (!pinned) {
+                Log.e(TAG, "Blocked send: public key changed for pinned sid=$sid")
+                return null
+            }
+            recipients += CryptoUtil.Recipient(sid, pubKey)
         }
         if (recipients.isEmpty()) return null
         val payload = CryptoUtil.envelopeToJson(
@@ -848,7 +871,7 @@ class SmsBridgeService : Service() {
                     val sid = m.optString("sid")
                     val pubKey = m.optString("pub_key")
                     if (sid.isBlank() || pubKey.isBlank()) continue
-                    db.deviceCacheDao().upsert(
+                    val pinned = db.deviceCacheDao().pinOrReject(
                         DeviceCache(
                             sid = sid,
                             userId = m.optInt("user_id"),
@@ -856,11 +879,20 @@ class SmsBridgeService : Service() {
                             pubKey = pubKey,
                         ),
                     )
+                    if (!pinned) {
+                        Log.e(TAG, "Blocked receive: public key changed for pinned sid=$sid")
+                        return false
+                    }
                 }
                 senderDev = db.deviceCacheDao().get(senderSid)
             }
         }
         if (senderPubKey == null) senderPubKey = senderDev?.pubKey
+        val trustedSender = db.deviceTrustDao().getPin(senderSid)
+        if (senderPubKey != null && (trustedSender == null || trustedSender.pubKey != senderPubKey)) {
+            Log.e(TAG, "Blocked envelope: sender is missing or differs from trusted sid=$senderSid")
+            return false
+        }
         if (senderPubKey == null) {
             if (!memberLookupSucceeded) {
                 // A transient member lookup failure is retryable. Do not advance
@@ -980,6 +1012,56 @@ class SmsBridgeService : Service() {
                 PhoneNumberNormalizer.redact(thread.phoneNumber),
         )
         return true
+    }
+
+    /** Fail-closed validation for the self-only SMS relay recipient directory. */
+    private suspend fun validateTrustedRecipients(
+        relayApi: RelayApi,
+        credentials: SavedCredentials,
+        response: JSONObject,
+    ): Boolean {
+        val refreshed = DeviceSecurityController(
+            RelayTrustedDeviceApi(relayApi, credentials.uid.toLong()),
+            credentials,
+            DeviceTrustRepository(db),
+        ).refresh()
+        if (refreshed.serverUnsupported || refreshed.selfPending || refreshed.error != null ||
+            refreshed.trustWarning != null
+        ) {
+            Log.e(TAG, "Recipient directory refresh rejected: $refreshed")
+            return false
+        }
+        val state = db.deviceTrustDao().getState(credentials.uid.toLong()) ?: return false
+        val checkpoints = response.optJSONArray("directory_checkpoints") ?: return false
+        val ownCheckpoint = (0 until checkpoints.length()).mapNotNull { checkpoints.optJSONObject(it) }
+            .firstOrNull { it.optLong("user_id", -1) == credentials.uid.toLong() }
+            ?: return false
+        if (ownCheckpoint.optString("identity_sig_pub") != state.identityKey ||
+            ownCheckpoint.optLong("security_epoch", -1) != state.epoch ||
+            ownCheckpoint.optString("directory_hash") != state.directoryHash
+        ) {
+            Log.e(TAG, "Conversation directory checkpoint differs from locally verified state")
+            return false
+        }
+        val members = response.optJSONArray("members") ?: return false
+        val keys = mutableListOf<TrustedRecipientKey>()
+        for (i in 0 until members.length()) {
+            val member = members.optJSONObject(i) ?: return false
+            val userId = member.optLong("user_id", -1)
+            val sid = member.optString("sid")
+            val pubKey = member.optString("pub_key")
+            val sigPub = member.optString("sig_pub")
+            val kind = member.optString("kind")
+            // Android SMS conversations are owned by exactly one relay account. Peer
+            // account directories need a separate verified identity exchange protocol.
+            if (userId != credentials.uid.toLong()) return false
+            val pin = db.deviceTrustDao().getPin(sid) ?: return false
+            if (pin.pubKey != pubKey || pin.sigPub != sigPub || pin.kind != kind) return false
+            keys += TrustedRecipientKey(userId, sid, pubKey, sigPub)
+        }
+        val expected = runCatching { DeviceTrustCrypto.recipientKeysetHash(keys) }.getOrNull()
+            ?: return false
+        return expected == response.optString("recipient_keyset_hash")
     }
 
     private suspend fun resolveThreadFromServer(

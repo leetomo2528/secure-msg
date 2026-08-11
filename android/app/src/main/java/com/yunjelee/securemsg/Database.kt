@@ -91,6 +91,31 @@ data class DeviceCache(
     val pubKey: String,
 )
 
+/** Immutable TOFU/approval pin. Key material is never overwritten on conflict. */
+@Entity(tableName = "trusted_device_pins", indices = [Index("accountUid")])
+data class TrustedDevicePin(
+    @PrimaryKey val sid: String,
+    val accountUid: Long,
+    val name: String,
+    val kind: String,
+    val pubKey: String,
+    val sigPub: String,
+    val fingerprint: String,
+    val firstSeenAt: Long,
+    val lastSeenAt: Long,
+)
+
+/** Last accepted, monotonic key-directory view for split-view/rollback detection. */
+@Entity(tableName = "trust_directory_state")
+data class TrustDirectoryState(
+    @PrimaryKey val accountUid: Long,
+    val identityKey: String,
+    val epoch: Long,
+    val directoryHash: String,
+    val safetyNumber: String,
+    val updatedAt: Long,
+)
+
 /** Atomic idempotency claim for relay messages that may trigger carrier SMS. */
 @Entity(tableName = "relay_receipts", primaryKeys = ["cid", "seq"])
 data class RelayReceipt(
@@ -309,11 +334,54 @@ interface DeviceCacheDao {
     @Query("SELECT * FROM device_cache WHERE sid = :sid")
     suspend fun get(sid: String): DeviceCache?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsert(d: DeviceCache)
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insert(d: DeviceCache)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertAll(devices: List<DeviceCache>)
+    @Query("UPDATE device_cache SET name = :name WHERE sid = :sid")
+    suspend fun updateName(sid: String, name: String)
+
+    /** TOFU pin: metadata may advance, but a SID can never silently change account/box key. */
+    @Transaction
+    suspend fun pinOrReject(d: DeviceCache): Boolean {
+        val existing = get(d.sid)
+        if (existing == null) {
+            insert(d)
+            return true
+        }
+        if (existing.userId != d.userId || existing.pubKey != d.pubKey) return false
+        updateName(d.sid, d.name)
+        return true
+    }
+}
+
+@Dao
+interface DeviceTrustDao {
+    @Query("SELECT * FROM trusted_device_pins WHERE accountUid = :uid ORDER BY name, sid")
+    fun observePins(uid: Long): Flow<List<TrustedDevicePin>>
+
+    @Query("SELECT * FROM trusted_device_pins WHERE accountUid = :uid ORDER BY name, sid")
+    suspend fun getPins(uid: Long): List<TrustedDevicePin>
+
+    @Query("SELECT * FROM trusted_device_pins WHERE sid = :sid")
+    suspend fun getPin(sid: String): TrustedDevicePin?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertPin(pin: TrustedDevicePin)
+
+    @Query("UPDATE trusted_device_pins SET name = :name, lastSeenAt = :at WHERE sid = :sid")
+    suspend fun touchPin(sid: String, name: String, at: Long)
+
+    @Query("SELECT * FROM trust_directory_state WHERE accountUid = :uid")
+    fun observeState(uid: Long): Flow<TrustDirectoryState?>
+
+    @Query("SELECT * FROM trust_directory_state WHERE accountUid = :uid")
+    suspend fun getState(uid: Long): TrustDirectoryState?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertState(state: TrustDirectoryState)
+
+    @Update(onConflict = OnConflictStrategy.ABORT)
+    suspend fun updateState(state: TrustDirectoryState)
 }
 
 @Dao
@@ -424,8 +492,10 @@ interface CarrierPartResultDao {
         RelayOutbox::class,
         ProcessedMms::class,
         CarrierPartResult::class,
+        TrustedDevicePin::class,
+        TrustDirectoryState::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -440,6 +510,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun relayOutboxDao(): RelayOutboxDao
     abstract fun processedMmsDao(): ProcessedMmsDao
     abstract fun carrierPartResultDao(): CarrierPartResultDao
+    abstract fun deviceTrustDao(): DeviceTrustDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -456,6 +527,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_6_7,
                     MIGRATION_7_8,
                     MIGRATION_8_9,
+                    MIGRATION_9_10,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -622,6 +694,36 @@ abstract class AppDatabase : RoomDatabase() {
                 // Keep device address-book values independent from the name
                 // shared across the user's other authenticated devices.
                 db.execSQL("ALTER TABLE sms_threads ADD COLUMN syncedContactName TEXT")
+            }
+        }
+
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS trusted_device_pins (" +
+                        "sid TEXT NOT NULL PRIMARY KEY," +
+                        "accountUid INTEGER NOT NULL," +
+                        "name TEXT NOT NULL," +
+                        "kind TEXT NOT NULL," +
+                        "pubKey TEXT NOT NULL," +
+                        "sigPub TEXT NOT NULL," +
+                        "fingerprint TEXT NOT NULL," +
+                        "firstSeenAt INTEGER NOT NULL," +
+                        "lastSeenAt INTEGER NOT NULL)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_trusted_device_pins_accountUid " +
+                        "ON trusted_device_pins(accountUid)",
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS trust_directory_state (" +
+                        "accountUid INTEGER NOT NULL PRIMARY KEY," +
+                        "identityKey TEXT NOT NULL," +
+                        "epoch INTEGER NOT NULL," +
+                        "directoryHash TEXT NOT NULL," +
+                        "safetyNumber TEXT NOT NULL," +
+                        "updatedAt INTEGER NOT NULL)",
+                )
             }
         }
     }

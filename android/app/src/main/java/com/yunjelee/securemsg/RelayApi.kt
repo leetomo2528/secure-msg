@@ -82,6 +82,38 @@ class RelayApi(
 
     fun logout(): JSONObject = post("/api/logout", JSONObject())
 
+    fun listDevices(): JSONObject = get("/api/devices")
+
+    fun keyDirectory(): JSONObject = get("/api/key-directory")
+
+    fun pendingDeviceStatus(): JSONObject = get("/api/device-pending-status")
+
+    fun revokeOwnPendingDevice(): JSONObject = post("/api/device-pending-revoke", JSONObject())
+
+    fun upgradeLegacySecurity(parentEpoch: Long, signature: String): JSONObject =
+        post("/api/security-upgrade", JSONObject()
+            .put("parent_epoch", parentEpoch).put("signature", signature))
+
+    fun approveDevice(
+        subjectSid: String,
+        parentEpoch: Long,
+        signature: String,
+    ): JSONObject = post("/api/device-approve", JSONObject()
+        .put("subject_sid", subjectSid)
+        .put("parent_epoch", parentEpoch)
+        .put("signature", signature))
+
+    fun revokeDevice(sid: String, parentEpoch: Long, signature: String): JSONObject =
+        post("/api/device-revoke", JSONObject()
+            .put("sid", sid)
+            .put("parent_epoch", parentEpoch)
+            .put("signature", signature)
+            .put("reason", "user_revoked"))
+
+    fun rejectPendingDevice(sid: String, challenge: String, parentEpoch: Long): JSONObject =
+        post("/api/device-reject-pending", JSONObject()
+            .put("sid", sid).put("challenge", challenge).put("parent_epoch", parentEpoch))
+
     fun createConversation(members: JSONArray, name: String): JSONObject =
         post("/api/conversation", JSONObject()
             .put("members", members)

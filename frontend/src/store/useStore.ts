@@ -16,6 +16,7 @@ import {
   type ServerMessage,
   type ConvMember,
   type BlockRule,
+  type ConversationMembersResult,
 } from "../net/api";
 import {
   initCrypto,
@@ -29,6 +30,7 @@ import {
   type Envelope,
   type RecipientDevice,
 } from "../crypto/keys";
+import { deviceFingerprint, recipientKeysetHash, verifyDirectoryProof } from "../crypto/deviceTrust";
 import {
   setMeta,
   getMeta,
@@ -58,6 +60,8 @@ import {
   type BlockRow,
   type SenderRow,
   type MessageAttachment,
+  pinTrustedDirectory,
+  TrustViolationError,
 } from "./db";
 import { applyBlock, matchBlockKeywords } from "./blocklist";
 import { normalizePhone, ownedSmsPhone } from "./conversationPolicy";
@@ -107,6 +111,8 @@ export interface RelayContent {
 interface State {
   ready: boolean;
   authed: boolean;
+  approvalPending: boolean;
+  securityLocked: boolean;
   username: string | null;
   uid: number | null;
   sid: string | null;
@@ -128,6 +134,7 @@ interface State {
   loginExistingDevice: (username: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
   forgetLocalDevice: () => Promise<void>;
+  refreshPendingApproval: () => Promise<"pending" | "approved" | "revoked" | "error">;
   refreshConversations: () => Promise<void>;
   newConversation: (members: string[]) => Promise<string | null>;
   newSmsConversation: (phone: string) => Promise<string | null>;
@@ -148,6 +155,8 @@ interface State {
 export const useStore = create<State>((set, get) => ({
   ready: false,
   authed: false,
+  approvalPending: false,
+  securityLocked: false,
   username: null,
   uid: null,
   sid: null,
@@ -246,7 +255,7 @@ export const useStore = create<State>((set, get) => ({
         if (reused) return true;
         // A device revoked from another session must get a fresh keypair. Do not
         // discard keys on transient network errors.
-        if (get().error !== "device not found") return false;
+        if (!/^(device not found|device revoked)$/.test(get().error ?? "")) return false;
         await clearAllData();
         return await get().addDevice(
           username, password, "device-" + Math.random().toString(36).slice(2, 6),
@@ -275,8 +284,9 @@ export const useStore = create<State>((set, get) => ({
     const meta = { username, uid: r.uid!, sid: r.sid, deviceName, keypair: kp };
     await setMeta(meta);
     await cacheDevice({ sid: r.sid, user_id: r.uid!, name: deviceName, pub_key: kp.box.pk });
-    set({ authed: true, error: null, ...meta });
-    await postLogin();
+    const approvalPending = r.trust_state === "pending";
+    set({ authed: true, approvalPending, securityLocked: false, error: null, ...meta });
+    if (!approvalPending) await postLogin();
     return true;
   },
 
@@ -288,10 +298,28 @@ export const useStore = create<State>((set, get) => ({
     const r = await api.deviceLogin(username, pwHash, meta.sid);
     if (!r.ok || !r.token) { set({ error: r.error || "device login failed" }); return false; }
     api.setToken(r.token);
-    set({ authed: true, username: meta.username, uid: meta.uid, sid: meta.sid,
+    const approvalPending = r.trust_state === "pending";
+    set({ authed: true, approvalPending, securityLocked: false, username: meta.username, uid: meta.uid, sid: meta.sid,
            deviceName: meta.deviceName, keypair: meta.keypair, error: null });
-    await postLogin();
+    if (!approvalPending) await postLogin();
     return true;
+  },
+
+  refreshPendingApproval: async () => {
+    if (!get().approvalPending || !api.token) return get().authed ? "approved" : "error";
+    const result = await api.deviceApprovalStatus();
+    if (!result.ok) {
+      if (result.status === 401 || result.status === 403) return "revoked";
+      set({ error: result.error ?? "기기 승인 상태를 확인하지 못했습니다." });
+      return "error";
+    }
+    if (result.trust_state === "approved") {
+      set({ approvalPending: false, error: null });
+      await postLogin();
+      return "approved";
+    }
+    if (result.trust_state === "revoked" || result.trust_state === "rejected") return "revoked";
+    return "pending";
   },
 
   logout: async () => {
@@ -325,7 +353,7 @@ export const useStore = create<State>((set, get) => ({
       cleanupFailed = true;
     }
     set({
-      authed: false, username: localUsername ?? null, uid: null, sid: null,
+      authed: false, approvalPending: false, securityLocked: false, username: localUsername ?? null, uid: null, sid: null,
       deviceName: null, keypair: null, conversations: [],
       activeCid: null, activeMessages: [], deviceCache: new Map(),
       error: cleanupFailed
@@ -339,7 +367,7 @@ export const useStore = create<State>((set, get) => ({
     api.setToken(null);
     await clearAllData();
     set({
-      authed: false, username: null, uid: null, sid: null,
+      authed: false, approvalPending: false, securityLocked: false, username: null, uid: null, sid: null,
       deviceName: null, keypair: null, conversations: [],
       activeCid: null, activeMessages: [], blockKeywords: [],
       deviceCache: new Map(), error: null,
@@ -399,11 +427,17 @@ export const useStore = create<State>((set, get) => ({
       set({ error: mr.error || "대화 기기 목록을 불러오지 못했습니다" });
       return;
     }
+    try {
+      await verifyConversationKeyDirectory(mr);
+    } catch (error) {
+      lockForTrustViolation(error);
+      return;
+    }
     const memberMap = new Map<string, ConvMember>();
     for (const m of mr.members) memberMap.set(m.sid, m);
     set({ deviceCache: memberMap });
     await cacheDevices(mr.members.map((m) => ({
-      sid: m.sid, user_id: m.user_id, name: m.name, pub_key: m.pub_key,
+      sid: m.sid, user_id: m.user_id, name: m.name, pub_key: m.pub_key, sig_pub: m.sig_pub,
     })));
 
     // 2. Pull every page since our last cursor. Advance even past an envelope
@@ -568,6 +602,12 @@ export const useStore = create<State>((set, get) => ({
         set({ error: mr.error || "members fetch failed" });
         return false;
       }
+      try {
+        await verifyConversationKeyDirectory(mr);
+      } catch (error) {
+        lockForTrustViolation(error);
+        return false;
+      }
       const recipients: RecipientDevice[] = mr.members.map((m) => ({ sid: m.sid, pub_key: m.pub_key }));
       if (recipients.length === 0) {
         set({ error: "암호화할 수신 기기가 없습니다" });
@@ -728,6 +768,58 @@ export const useStore = create<State>((set, get) => ({
 
 async function postLogin(): Promise<void> {
   const me = useStore.getState();
+  // Verify the account key directory before fetching any encrypted history.
+  // A known identity/key rollback is fail-closed for the entire message UI,
+  // not merely a warning shown when the user happens to open DeviceManager.
+  if (me.uid != null) {
+    try {
+      const directory = await api.keyDirectory();
+      if (!directory.ok) {
+        // Only an explicitly old server may use the compatibility path.
+        if (directory.status === 404) return;
+        throw new Error(directory.error ?? "키 디렉터리를 불러오지 못했습니다.");
+      }
+      if (!directory.identity_sig_pub || !directory.directory_hash
+        || !Number.isSafeInteger(directory.security_epoch) || !directory.devices
+        || !directory.device_history || !directory.approval_certificates
+        || !directory.revocation_certificates || !directory.security_upgrade_certificates) {
+        throw new Error("서버 키 디렉터리 응답이 불완전합니다.");
+      }
+      verifyDirectoryProof({
+        user_id: me.uid,
+        identity_sig_pub: directory.identity_sig_pub,
+        security_epoch: directory.security_epoch!,
+        directory_hash: directory.directory_hash,
+        trust_enforced_at: directory.trust_enforced_at,
+        security_mode: directory.security_mode,
+        device_history: directory.device_history,
+        approval_certificates: directory.approval_certificates,
+        revocation_certificates: directory.revocation_certificates,
+        security_upgrade_certificates: directory.security_upgrade_certificates,
+      }, directory.devices);
+      const own = directory.devices.find((device) => device.sid === me.sid);
+      if (!own || !me.keypair || own.pub_key !== me.keypair.box.pk || own.sig_pub !== me.keypair.sign.pk) {
+        throw new Error("현재 SID의 로컬 키와 검증된 공개키 디렉터리가 일치하지 않습니다.");
+      }
+      await pinTrustedDirectory({
+        uid: me.uid,
+        identity_sig_pub: directory.identity_sig_pub,
+        security_epoch: directory.security_epoch!,
+        directory_hash: directory.directory_hash,
+        devices: directory.devices.map((device) => ({
+          sid: device.sid,
+          pub_key: device.pub_key,
+          sig_pub: device.sig_pub,
+          kind: device.kind,
+          fingerprint: deviceFingerprint(device.pub_key, device.sig_pub).hash,
+        })),
+      });
+      useStore.setState({ securityLocked: false });
+    } catch (error) {
+      lockForTrustViolation(error);
+      return;
+    }
+  }
   await me.refreshBlocklist();
   // Pull shared block rules from the server (and push any local-only ones).
   await me.syncBlockRules().catch(() => undefined);
@@ -744,6 +836,7 @@ async function postLogin(): Promise<void> {
   socket.off("blocklist_updated");
   socket.off("conv_updated");
   socket.off("contacts_updated");
+  socket.off("device_pending");
   const syncAll = async () => {
     const state = useStore.getState();
     useStore.setState({ error: null });
@@ -814,6 +907,13 @@ async function postLogin(): Promise<void> {
     // the authoritative labels immediately on every connected browser.
     await useStore.getState().refreshConversations();
   });
+  socket.on("device_pending", () => {
+    // DeviceManager owns the approval UI; a DOM event avoids coupling that
+    // account-security surface to the message Zustand state.
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("securemsg:device-pending"));
+    }
+  });
   if (socket.connected) await syncAll();
 }
 
@@ -829,6 +929,67 @@ function queueConversationSync(cid: string): Promise<void> {
     });
   syncJobs.set(cid, next);
   return next;
+}
+
+export async function verifyConversationKeyDirectory(result: ConversationMembersResult): Promise<void> {
+  if (!result.members || !result.directory_checkpoints || !result.directory_proofs || !result.recipient_keyset_hash) {
+    throw new TrustViolationError("equivocation", "대화 키 디렉터리 checkpoint가 누락되었습니다.");
+  }
+  const calculatedKeyset = recipientKeysetHash(result.members.map((member) => ({
+    user_id: member.user_id,
+    sid: member.sid,
+    pub_key: member.pub_key,
+    sig_pub: member.sig_pub,
+  })));
+  if (calculatedKeyset !== result.recipient_keyset_hash) {
+    throw new TrustViolationError("equivocation", "대화 수신 기기 keyset 해시가 일치하지 않습니다.");
+  }
+
+  const checkpointByUser = new Map(result.directory_checkpoints.map((checkpoint) => [checkpoint.user_id, checkpoint]));
+  const proofByUser = new Map(result.directory_proofs.map((proof) => [proof.user_id, proof]));
+  const membersByUser = new Map<number, typeof result.members>();
+  for (const member of result.members) {
+    const group = membersByUser.get(member.user_id) ?? [];
+    group.push(member);
+    membersByUser.set(member.user_id, group);
+  }
+  if (checkpointByUser.size !== membersByUser.size || proofByUser.size !== membersByUser.size) {
+    throw new TrustViolationError("equivocation", "대화 참여자 디렉터리 checkpoint 수가 일치하지 않습니다.");
+  }
+  for (const [userId, members] of membersByUser) {
+    const checkpoint = checkpointByUser.get(userId);
+    const proof = proofByUser.get(userId);
+    if (!checkpoint || !proof) {
+      throw new TrustViolationError("equivocation", `사용자 ${userId}의 키 디렉터리가 누락되었습니다.`);
+    }
+    if (proof.identity_sig_pub !== checkpoint.identity_sig_pub
+      || proof.security_epoch !== checkpoint.security_epoch
+      || proof.directory_hash !== checkpoint.directory_hash) {
+      throw new TrustViolationError("equivocation", `사용자 ${userId}의 checkpoint와 proof가 일치하지 않습니다.`);
+    }
+    verifyDirectoryProof(proof, members);
+    await pinTrustedDirectory({
+      uid: userId,
+      identity_sig_pub: checkpoint.identity_sig_pub,
+      security_epoch: checkpoint.security_epoch,
+      directory_hash: checkpoint.directory_hash,
+      devices: members.map((member) => ({
+        sid: member.sid,
+        pub_key: member.pub_key,
+        sig_pub: member.sig_pub,
+        kind: member.kind,
+        fingerprint: deviceFingerprint(member.pub_key, member.sig_pub).hash,
+      })),
+    });
+  }
+}
+
+function lockForTrustViolation(error: unknown): void {
+  const message = error instanceof Error ? error.message : "알 수 없는 키 디렉터리 오류";
+  useStore.setState({
+    securityLocked: true,
+    error: `보안 경고: ${message} 메시지 암복호화를 중단했습니다.`,
+  });
 }
 
 async function reapplyBlocklist(): Promise<void> {

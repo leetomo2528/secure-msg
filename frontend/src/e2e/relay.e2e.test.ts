@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { io, type Socket } from "socket.io-client";
 import { initCrypto, generateKeypair, hashPassword, saltForUser, encryptMessage } from "../crypto/keys";
+import { signDeviceApproval } from "../crypto/deviceTrust";
 import { api, getSocket, setSocketBase } from "../net/api";
 import { useStore } from "../store/useStore";
 
@@ -108,6 +109,34 @@ describe("phone ↔ web relay interlock", () => {
     expect(reg.ok).toBe(true);
     gwToken = reg.token;
     gwSid = reg.sid;
+
+    // New devices are intentionally isolated until an already-approved
+    // device cross-signs their registration. Complete that trust ceremony
+    // here so the remainder of this relay interlock exercises an approved
+    // Android gateway rather than bypassing the security model.
+    const devices = await fetchJson(`${BASE}/api/devices`, {
+      headers: { Authorization: `Bearer ${api.token}` },
+    });
+    expect(devices.ok).toBe(true);
+    const pending = (devices.devices as Array<any>).find((d) => d.sid === gwSid);
+    expect(pending?.trust_state).toBe("pending");
+    const approver = useStore.getState().keypair;
+    expect(approver?.sign?.sk).toBeTruthy();
+    const signature = signDeviceApproval({
+      uid: devices.uid ?? useStore.getState().uid!,
+      subjectSid: gwSid,
+      pubKey: gwKeys.box.pk,
+      sigPub: gwKeys.sign.pk,
+      kind: "android_gateway",
+      challenge: pending.challenge,
+      parentEpoch: devices.security_epoch,
+    }, approver!.sign.sk);
+    const approved = await fetchJson(`${BASE}/api/device-approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${api.token}` },
+      body: JSON.stringify({ subject_sid: gwSid, parent_epoch: devices.security_epoch, signature }),
+    });
+    expect(approved.ok).toBe(true);
 
     gwSocket = io(BASE, { auth: { token: gwToken }, transports: ["websocket", "polling"] });
     await new Promise<void>((resolve, reject) => {

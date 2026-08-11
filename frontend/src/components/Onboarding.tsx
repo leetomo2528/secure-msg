@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../store/useStore";
 import BrandMark from "./BrandMark";
+import OnboardingPolicyNotice from "./OnboardingPolicyNotice";
 import { Segmented } from "./ui";
 
 type Mode = "login" | "register";
@@ -57,6 +58,8 @@ export default function Onboarding() {
           value={mode}
           onChange={setMode}
         />
+
+        <OnboardingPolicyNotice />
 
         <div className="space-y-2">
           <label className="form-label" htmlFor="ob-username">아이디 (3-20자, 영소문자/숫자/_)</label>

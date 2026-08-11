@@ -72,7 +72,7 @@ describe("Api 401 handling", () => {
   });
 
   it("posts logout with the current bearer token", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true }));
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(200, { ok: true }));
     vi.stubGlobal("fetch", fetchMock);
     const api = new Api();
     api.setToken("jwt-token");
@@ -98,5 +98,65 @@ describe("Api 401 handling", () => {
     expect(result.ok).toBe(false);
     expect(result.status).toBe(401);
     expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+});
+
+describe("trusted-device API contract", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("posts the server's exact approval field names", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new Api();
+    client.setToken("approved-device-token");
+
+    await client.deviceApprove("subject-sid", "covered-challenge", 12, "detached-signature");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/device-approve", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({
+        subject_sid: "subject-sid",
+        parent_epoch: 12,
+        signature: "detached-signature",
+      }),
+    }));
+  });
+
+  it("uses pending-only status and approved key-directory routes", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new Api();
+    client.setToken("token");
+
+    await client.deviceApprovalStatus();
+    await client.keyDirectory();
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/device-pending-status",
+      "/api/key-directory",
+    ]);
+  });
+
+  it("posts signed revoke fields and supports pending self-cancel", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => jsonResponse(200, { ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new Api();
+    client.setToken("token");
+
+    await client.deviceRevoke("subject", 9, "signed-revoke");
+    await client.pendingDeviceRevoke();
+    await client.deviceRejectPending("pending", "challenge", 9);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/device-revoke", expect.objectContaining({
+      body: JSON.stringify({
+        sid: "subject", parent_epoch: 9, signature: "signed-revoke", reason: "user_revoked",
+      }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/device-pending-revoke", expect.objectContaining({
+      body: "{}",
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/device-reject-pending", expect.objectContaining({
+      body: JSON.stringify({ sid: "pending", challenge: "challenge", parent_epoch: 9 }),
+    }));
   });
 });

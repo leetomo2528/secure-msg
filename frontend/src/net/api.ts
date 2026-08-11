@@ -29,6 +29,11 @@ export interface DeviceRegisterResult {
   sid?: string;
   token?: string;
   uid?: number;
+  trust_state?: DeviceTrustState;
+  challenge?: string;
+  security_epoch?: number;
+  directory_hash?: string;
+  identity_sig_pub?: string;
 }
 
 export interface ConvMember {
@@ -37,7 +42,127 @@ export interface ConvMember {
   sid: string;
   name: string;
   pub_key: string;
-  kind?: "web" | "android_gateway";
+  sig_pub: string;
+  kind: "web" | "android_gateway";
+}
+
+export interface DirectoryCheckpoint {
+  user_id: number;
+  identity_sig_pub: string;
+  security_epoch: number;
+  directory_hash: string;
+  security_mode?: "legacy_v1" | "verified_v2";
+}
+
+export interface DeviceHistoryEntry {
+  sid: string;
+  kind: "web" | "android_gateway";
+  pub_key: string;
+  sig_pub: string;
+  fingerprint: string;
+  trust_state: "approved" | "revoked";
+  challenge: string;
+  approved_by_sid: string;
+  approved_at?: number | null;
+  approval_signature?: string | null;
+  revoked_at?: number | null;
+  verification_state?: "legacy_unverified" | "verified";
+}
+
+export interface ApprovalCertificate {
+  subject_sid: string;
+  approver_sid: string;
+  parent_epoch: number;
+  resulting_epoch: number;
+  statement: string;
+  signature: string;
+  created_at: number;
+}
+
+export interface RevocationCertificate {
+  subject_sid: string;
+  actor_sid: string;
+  parent_epoch: number;
+  resulting_epoch: number;
+  reason: "user_revoked";
+  statement: string;
+  signature: string;
+  created_at: number;
+}
+
+export interface SecurityUpgradeCertificate {
+  identity_sid: string;
+  parent_epoch: number;
+  resulting_epoch: number;
+  statement: string;
+  signature: string;
+  created_at: number;
+}
+
+export interface DirectoryProof extends DirectoryCheckpoint {
+  trust_enforced_at?: number | null;
+  device_history: DeviceHistoryEntry[];
+  approval_certificates: ApprovalCertificate[];
+  revocation_certificates: RevocationCertificate[];
+  security_upgrade_certificates: SecurityUpgradeCertificate[];
+}
+
+export interface ConversationMembersResult extends ApiResult {
+  conv_id?: number;
+  cid?: string;
+  recipient_keyset_hash?: string;
+  directory_checkpoints?: DirectoryCheckpoint[];
+  directory_proofs?: DirectoryProof[];
+  members?: ConvMember[];
+}
+
+export type DeviceTrustState = "pending" | "approved" | "rejected" | "revoked";
+
+export interface AccountDevice {
+  sid: string;
+  name: string;
+  kind: "web" | "android_gateway";
+  pub_key: string;
+  sig_pub: string;
+  key_fingerprint?: string;
+  fingerprint?: string;
+  trust_state?: DeviceTrustState;
+  created_at: number;
+  last_seen: number;
+  approved_at?: number | null;
+  approved_by_sid?: string | null;
+  approval_epoch?: number | null;
+  challenge?: string;
+  parent_epoch?: number;
+}
+
+export interface DeviceDirectoryResult extends ApiResult {
+  devices?: AccountDevice[];
+  security_epoch?: number;
+  directory_hash?: string;
+  identity_sig_pub?: string;
+  security_mode?: "legacy_v1" | "verified_v2";
+}
+
+export interface KeyDirectoryResult extends ApiResult {
+  user_id?: number;
+  devices?: AccountDevice[];
+  security_epoch?: number;
+  directory_hash?: string;
+  identity_sig_pub?: string;
+  trust_enforced_at?: number | null;
+  security_mode?: "legacy_v1" | "verified_v2";
+  device_history?: DeviceHistoryEntry[];
+  approval_certificates?: ApprovalCertificate[];
+  revocation_certificates?: RevocationCertificate[];
+  security_upgrade_certificates?: SecurityUpgradeCertificate[];
+}
+
+export interface DeviceApprovalStatusResult extends ApiResult {
+  trust_state?: DeviceTrustState;
+  sid?: string;
+  challenge?: string;
+  parent_epoch?: number;
 }
 
 export type BlockRuleType = "keyword" | "sender";
@@ -146,15 +271,34 @@ export class Api {
   deviceRegister(username: string, pwHash: string, deviceName: string, pubKey: string, sigPub: string): Promise<DeviceRegisterResult> {
     return this.post("/device-register", { username, pw_hash: pwHash, device_name: deviceName, pub_key: pubKey, sig_pub: sigPub });
   }
-  deviceLogin(username: string, pwHash: string, sid: string) {
+  deviceLogin(username: string, pwHash: string, sid: string): Promise<DeviceRegisterResult> {
     return this.post("/device-login", { username, pw_hash: pwHash, sid });
   }
   /** Invalidate the current bearer token without recursively firing onUnauthorized. */
   logout(): Promise<ApiResult> {
     return this.request("/logout", { method: "POST", body: JSON.stringify({}) }, false);
   }
-  listDevices() { return this.get("/devices"); }
-  deviceRevoke(sid: string) { return this.post("/device-revoke", { sid }); }
+  listDevices(): Promise<DeviceDirectoryResult> { return this.get("/devices"); }
+  keyDirectory(): Promise<KeyDirectoryResult> { return this.get("/key-directory"); }
+  deviceApprovalStatus(): Promise<DeviceApprovalStatusResult> { return this.get("/device-pending-status"); }
+  pendingDeviceRevoke(): Promise<ApiResult> { return this.post("/device-pending-revoke", {}); }
+  deviceApprove(sid: string, challenge: string, parentEpoch: number, signature: string): Promise<ApiResult> {
+    // challenge is covered by the signature and retained in this method's
+    // interface for callers; the server resolves it from the pending row.
+    void challenge;
+    return this.post("/device-approve", { subject_sid: sid, parent_epoch: parentEpoch, signature });
+  }
+  deviceRevoke(sid: string, parentEpoch: number, signature: string): Promise<ApiResult> {
+    return this.post("/device-revoke", {
+      sid, parent_epoch: parentEpoch, signature, reason: "user_revoked",
+    });
+  }
+  deviceRejectPending(sid: string, challenge: string, parentEpoch: number): Promise<ApiResult> {
+    return this.post("/device-reject-pending", { sid, challenge, parent_epoch: parentEpoch });
+  }
+  securityUpgrade(parentEpoch: number, signature: string): Promise<ApiResult> {
+    return this.post("/security-upgrade", { parent_epoch: parentEpoch, signature });
+  }
   listBlockRules(): Promise<BlocklistResult> { return this.get("/blocklist"); }
   addBlockRule(type: BlockRuleType, value: string): Promise<BlocklistResult> {
     return this.post("/blocklist", { type, value });
@@ -169,7 +313,7 @@ export class Api {
     return this.post("/conversation", { members, ...(name ? { name } : {}) });
   }
   listConversations() { return this.get("/conversations"); }
-  convMembers(cid: string): Promise<{ ok: boolean; members?: ConvMember[]; error?: string }> {
+  convMembers(cid: string): Promise<ConversationMembersResult> {
     return this.get(`/conversation/${encodeURIComponent(cid)}/members`);
   }
   fetchMessages(cid: string, since: number, limit = 200): Promise<{ ok: boolean; messages?: ServerMessage[]; error?: string }> {

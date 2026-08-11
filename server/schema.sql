@@ -13,7 +13,12 @@ CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    NOT NULL UNIQUE,
     pw_hash       TEXT    NOT NULL,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    identity_sig_pub TEXT NOT NULL DEFAULT '',
+    security_epoch INTEGER NOT NULL DEFAULT 0,
+    directory_hash TEXT NOT NULL DEFAULT '',
+    trust_enforced_at INTEGER
+    ,security_mode TEXT NOT NULL DEFAULT 'verified_v2'
 );
 
 -- Devices: one user can have many devices. Each device owns its keypair (private key stays client-side).
@@ -29,10 +34,70 @@ CREATE TABLE IF NOT EXISTS devices (
     pub_key       TEXT    NOT NULL,                 -- base64 X25519
     sig_pub       TEXT    NOT NULL,                 -- base64 Ed25519
     session_version INTEGER NOT NULL DEFAULT 1,     -- rotated to revoke issued JWTs
+    trust_state   TEXT NOT NULL DEFAULT 'approved' CHECK(trust_state IN ('pending','approved','revoked')),
+    challenge     TEXT NOT NULL DEFAULT '',
+    approved_by_sid TEXT,
+    approved_at   INTEGER,
+    approval_signature TEXT,
+    fingerprint   TEXT NOT NULL DEFAULT '',
+    revoked_at    INTEGER,
+    verification_state TEXT NOT NULL DEFAULT 'verified',
     created_at    INTEGER NOT NULL,
     last_seen     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+
+CREATE TABLE IF NOT EXISTS device_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subject_sid TEXT NOT NULL,
+    approver_sid TEXT NOT NULL,
+    parent_epoch INTEGER NOT NULL,
+    resulting_epoch INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(user_id, subject_sid)
+);
+
+CREATE TABLE IF NOT EXISTS security_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    actor_sid TEXT,
+    subject_sid TEXT,
+    security_epoch INTEGER NOT NULL,
+    event_json TEXT NOT NULL,
+    previous_hash TEXT NOT NULL,
+    event_hash TEXT NOT NULL,
+    server_signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS device_revocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subject_sid TEXT NOT NULL,
+    actor_sid TEXT NOT NULL,
+    parent_epoch INTEGER NOT NULL,
+    resulting_epoch INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(user_id, subject_sid)
+);
+CREATE TABLE IF NOT EXISTS security_upgrades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    identity_sid TEXT NOT NULL,
+    parent_epoch INTEGER NOT NULL,
+    resulting_epoch INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_security_events_user_id ON security_events(user_id, id);
 
 -- Conversations: identified by opaque cid. Membership list stored separately.
 CREATE TABLE IF NOT EXISTS conversations (

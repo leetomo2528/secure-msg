@@ -1,11 +1,15 @@
 import hashlib
+import base64
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
+
+from nacl.signing import SigningKey
 
 with tempfile.NamedTemporaryFile(
     prefix="securemsg-test-",
@@ -18,6 +22,8 @@ os.environ["SECUREMSG_JWT_SECRET"] = "test-secret-for-unit-tests-32-bytes-minimu
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app, socketio
+from auth import approval_statement, revoke_statement
+import store
 
 app.config["TESTING"] = True
 
@@ -31,6 +37,11 @@ class ServerSmokeTest(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
         self.pw_hash = "A" * 43
+        self.signing_key = SigningKey(bytes([7]) * 32)
+        self.sig_pub = base64.urlsafe_b64encode(
+            bytes(self.signing_key.verify_key)
+        ).decode("ascii").rstrip("=")
+        self.device_signing_keys = {}
         method_id = hashlib.sha256(self._testMethodName.encode()).hexdigest()[:12]
         self.username = "alice_" + method_id
         register = self.client.post(
@@ -45,12 +56,14 @@ class ServerSmokeTest(unittest.TestCase):
                 "pw_hash": self.pw_hash,
                 "device_name": "test",
                 "pub_key": "A" * 43,
-                "sig_pub": "B" * 43,
+                "sig_pub": self.sig_pub,
             },
         )
         self.assertEqual(device.status_code, 200, device.json)
         self.token = device.json["token"]
         self.sid = device.json["sid"]
+        self.uid = device.json["uid"]
+        self.device_signing_keys[self.sid] = self.signing_key
 
     @property
     def headers(self):
@@ -64,6 +77,60 @@ class ServerSmokeTest(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 200, created.json)
         return created.json
+
+    def register_and_approve_device(self, payload):
+        """Register another device and cross-sign it with the bootstrap device."""
+        payload = dict(payload)
+        seed = hashlib.sha256(
+            f"{self._testMethodName}:{payload['device_name']}".encode()
+        ).digest()[:32]
+        device_signing_key = SigningKey(seed)
+        payload["sig_pub"] = base64.urlsafe_b64encode(
+            bytes(device_signing_key.verify_key)
+        ).decode("ascii").rstrip("=")
+        response = self.client.post("/api/device-register", json=payload)
+        self.assertEqual(response.status_code, 200, response.json)
+        self.device_signing_keys[response.json["sid"]] = device_signing_key
+        if response.json.get("trust_state") == "pending":
+            approved = self.client.post(
+                "/api/device-approve",
+                headers=self.headers,
+                json=self.approval_payload(response),
+            )
+            self.assertEqual(approved.status_code, 200, approved.json)
+        return response
+
+    def approval_payload(self, registration):
+        subject = store.get_device_by_sid(registration.json["sid"])
+        statement = approval_statement(
+            self.uid, subject, registration.json["security_epoch"]
+        )
+        signature = base64.urlsafe_b64encode(
+            bytes(self.signing_key.sign(statement.encode("utf-8")).signature)
+        ).decode("ascii").rstrip("=")
+        return {
+            "subject_sid": registration.json["sid"],
+            "parent_epoch": registration.json["security_epoch"],
+            "signature": signature,
+        }
+
+    def revoke_payload(self, subject_sid, actor_sid):
+        subject = store.get_device_by_sid(subject_sid)
+        parent_epoch = store.get_user(self.uid)["security_epoch"]
+        statement = revoke_statement(self.uid, subject, actor_sid, parent_epoch)
+        signature = base64.urlsafe_b64encode(
+            bytes(
+                self.device_signing_keys[actor_sid]
+                .sign(statement.encode("utf-8"))
+                .signature
+            )
+        ).decode("ascii").rstrip("=")
+        return {
+            "sid": subject_sid,
+            "parent_epoch": parent_epoch,
+            "reason": "user_revoked",
+            "signature": signature,
+        }
 
     def test_sms_conversation_name_is_returned(self):
         self.create_conversation()
@@ -82,7 +149,9 @@ class ServerSmokeTest(unittest.TestCase):
         ) as legacy_file:
             legacy_path = Path(legacy_file.name)
         try:
-            with sqlite3.connect(legacy_path) as connection:
+            # sqlite3.Connection's context manager commits/rolls back but does
+            # not close the handle; closing() prevents Python 3.13+ warnings.
+            with closing(sqlite3.connect(legacy_path)) as connection:
                 connection.execute(
                     "CREATE TABLE conversations ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -94,6 +163,7 @@ class ServerSmokeTest(unittest.TestCase):
                     "INSERT INTO conversations(cid, name, created_at) VALUES (?, ?, ?)",
                     ("legacy-contact", "+821012345678", 1),
                 )
+                connection.commit()
             with mock.patch.object(store, "DB_PATH", legacy_path):
                 store.init_schema()
                 with store.conn_ctx() as connection:
@@ -147,10 +217,19 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(store.get_cursor(device["id"], created["conv_id"]), 9)
 
     def test_revoked_device_token_is_rejected(self):
+        second = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "revocation-authorizer",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            }
+        )
         revoked = self.client.post(
             "/api/device-revoke",
-            headers=self.headers,
-            json={"sid": self.sid},
+            headers={"Authorization": f"Bearer {second.json['token']}"},
+            json=self.revoke_payload(self.sid, second.json["sid"]),
         )
         self.assertEqual(revoked.status_code, 200, revoked.json)
         after = self.client.get("/api/devices", headers=self.headers)
@@ -201,9 +280,8 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(restored.status_code, 200, restored.json)
 
     def test_device_login_rotates_only_that_devices_session(self):
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "second-session",
@@ -211,7 +289,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         second_headers = {
             "Authorization": f"Bearer {second.json['token']}"
         }
@@ -431,9 +508,8 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.json)
 
     def test_only_one_android_sms_gateway_per_account(self):
-        first = self.client.post(
-            "/api/device-register",
-            json={
+        first = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "android-one",
@@ -442,7 +518,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(first.status_code, 200, first.json)
         second = self.client.post(
             "/api/device-register",
             json={
@@ -454,12 +529,21 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "F" * 43,
             },
         )
-        self.assertEqual(second.status_code, 409, second.json)
+        self.assertEqual(second.status_code, 200, second.json)
+        self.assertEqual(second.json["trust_state"], "pending")
+        rejected = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json=self.approval_payload(second),
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.json)
+        self.assertEqual(
+            rejected.json["error"], "an Android SMS gateway is already approved"
+        )
 
     def test_socket_fanout_is_once_per_device(self):
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "second",
@@ -467,7 +551,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         created = self.create_conversation()
 
         first_socket = socketio.test_client(app, auth={"token": self.token})
@@ -501,9 +584,8 @@ class ServerSmokeTest(unittest.TestCase):
         # A retry must still acknowledge the original message after the device
         # set changes. Requiring a newly wrapped key here would make a lost ACK
         # impossible to recover safely.
-        third = self.client.post(
-            "/api/device-register",
-            json={
+        third = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "third-after-send",
@@ -511,7 +593,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "F" * 43,
             },
         )
-        self.assertEqual(third.status_code, 200, third.json)
         duplicate_ack = first_socket.emit(
             "message_send",
             {"cid": created["cid"], "mid": "test-message-id-0001", "payload": payload},
@@ -576,9 +657,8 @@ class ServerSmokeTest(unittest.TestCase):
 
         import store
 
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "history-reader",
@@ -586,7 +666,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         created = self.create_conversation()
         user = store.get_user_by_name(self.username)
         payload = {
@@ -607,7 +686,7 @@ class ServerSmokeTest(unittest.TestCase):
         revoked = self.client.post(
             "/api/device-revoke",
             headers=second_headers,
-            json={"sid": self.sid},
+            json=self.revoke_payload(self.sid, second.json["sid"]),
         )
         self.assertEqual(revoked.status_code, 200, revoked.json)
         history = self.client.get(
@@ -618,9 +697,8 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(history.json["messages"][0]["sender_pub_key"], "A" * 43)
 
     def test_carrier_status_requires_gateway_and_is_persisted(self):
-        gateway = self.client.post(
-            "/api/device-register",
-            json={
+        gateway = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "android-gateway",
@@ -629,7 +707,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(gateway.status_code, 200, gateway.json)
         created = self.create_conversation()
         gateway_socket = socketio.test_client(
             app, auth={"token": gateway.json["token"]}
@@ -812,9 +889,8 @@ class ServerSmokeTest(unittest.TestCase):
             app.testing = was_testing
 
     def test_typing_reaches_the_senders_other_devices(self):
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "second-tab",
@@ -822,7 +898,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         created = self.create_conversation()
         first_socket = socketio.test_client(app, auth={"token": self.token})
         second_socket = socketio.test_client(
@@ -846,12 +921,21 @@ class ServerSmokeTest(unittest.TestCase):
 
     def test_socket_is_closed_when_its_device_is_revoked(self):
         created = self.create_conversation()
+        second = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "socket-revocation-authorizer",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            }
+        )
         client = socketio.test_client(app, auth={"token": self.token})
         self.assertTrue(client.is_connected())
         revoked = self.client.post(
             "/api/device-revoke",
-            headers=self.headers,
-            json={"sid": self.sid},
+            headers={"Authorization": f"Bearer {second.json['token']}"},
+            json=self.revoke_payload(self.sid, second.json["sid"]),
         )
         self.assertEqual(revoked.status_code, 200, revoked.json)
         # The next event from the revoked device must terminate the socket.
@@ -861,9 +945,8 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertFalse(client.is_connected())
 
     def test_live_envelope_created_at_matches_stored_history(self):
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "history-reader",
@@ -871,7 +954,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         created = self.create_conversation()
         first_socket = socketio.test_client(app, auth={"token": self.token})
         second_socket = socketio.test_client(
@@ -974,9 +1056,8 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(peer_rules, [])
 
     def test_blocklist_add_fans_out_to_other_devices(self):
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "second",
@@ -984,7 +1065,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "D" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         origin_socket = socketio.test_client(app, auth={"token": self.token})
         other_socket = socketio.test_client(app, auth={"token": second.json["token"]})
 
@@ -1010,9 +1090,8 @@ class ServerSmokeTest(unittest.TestCase):
     def test_bulk_contact_names_sync_is_atomic_and_fans_out_once(self):
         first = self.create_conversation("+821011110001")
         second = self.create_conversation("+821011110002")
-        gateway = self.client.post(
-            "/api/device-register",
-            json={
+        gateway = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "contacts-gateway",
@@ -1021,7 +1100,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "P" * 43,
             },
         )
-        self.assertEqual(gateway.status_code, 200, gateway.json)
         gateway_headers = {"Authorization": f"Bearer {gateway.json['token']}"}
         origin_socket = socketio.test_client(
             app, auth={"token": gateway.json["token"]}
@@ -1092,9 +1170,8 @@ class ServerSmokeTest(unittest.TestCase):
         )
         self.assertEqual(denied.status_code, 403, denied.json)
 
-        gateway = self.client.post(
-            "/api/device-register",
-            json={
+        gateway = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "validation-gateway",
@@ -1156,9 +1233,8 @@ class ServerSmokeTest(unittest.TestCase):
         store.add_member(multi_conv_id, current_user["id"])
         store.add_member(multi_conv_id, other_user["id"])
 
-        gateway = self.client.post(
-            "/api/device-register",
-            json={
+        gateway = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "atomic-gateway",
@@ -1193,9 +1269,8 @@ class ServerSmokeTest(unittest.TestCase):
 
     def test_rename_conversation_updates_and_fans_out(self):
         created = self.create_conversation("+821055556666")
-        second = self.client.post(
-            "/api/device-register",
-            json={
+        second = self.register_and_approve_device(
+            {
                 "username": self.username,
                 "pw_hash": self.pw_hash,
                 "device_name": "second",
@@ -1203,7 +1278,6 @@ class ServerSmokeTest(unittest.TestCase):
                 "sig_pub": "H" * 43,
             },
         )
-        self.assertEqual(second.status_code, 200, second.json)
         other_socket = socketio.test_client(app, auth={"token": second.json["token"]})
 
         renamed = self.client.post(

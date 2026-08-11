@@ -10,6 +10,9 @@ from __future__ import annotations
 import re
 import secrets
 import unicodedata
+import base64
+import hashlib
+import json
 
 import store
 from auth import _err, _ok, auth_required
@@ -219,9 +222,32 @@ def conv_members(cid: str):
     # Verify the requesting user is a member.
     if not any(d["user_id"] == g.auth["uid"] for d in members):
         return _err("forbidden", 403)
+    key_records = sorted(
+        (int(d["user_id"]), d["sid"], d["pub_key"], d["sig_pub"])
+        for d in members
+    )
+    canonical = json.dumps(key_records, separators=(",", ":"), ensure_ascii=True)
+    recipient_keyset_hash = base64.urlsafe_b64encode(
+        hashlib.sha256(canonical.encode()).digest()
+    ).decode().rstrip("=")
+    directories = {}
+    directory_proofs = {}
+    for user_id in store.list_member_user_ids(conv["id"]):
+        user = store.get_user(user_id)
+        directories[str(user_id)] = {
+            "user_id": user_id,
+            "identity_sig_pub": user["identity_sig_pub"],
+            "security_epoch": user["security_epoch"],
+            "directory_hash": user["directory_hash"],
+            "security_mode": user["security_mode"],
+        }
+        directory_proofs[str(user_id)] = store.get_directory_proof(user_id)
     return _ok(
         conv_id=conv["id"],
         cid=cid,
+        recipient_keyset_hash=recipient_keyset_hash,
+        directory_checkpoints=list(directories.values()),
+        directory_proofs=list(directory_proofs.values()),
         members=[
             {
                 "user_id": d["user_id"],
@@ -229,6 +255,7 @@ def conv_members(cid: str):
                 "sid": d["sid"],
                 "name": d["name"],
                 "pub_key": d["pub_key"],
+                "sig_pub": d["sig_pub"],
                 "kind": d["kind"],
             }
             for d in members

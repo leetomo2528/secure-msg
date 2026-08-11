@@ -50,6 +50,26 @@ object CryptoUtil {
         )
     }
 
+    fun signDetached(message: ByteArray, signSecretKeyB64: String): String {
+        val secretKey = unb64u(signSecretKeyB64)
+        require(secretKey.size == Sign.ED25519_SECRETKEYBYTES) { "invalid signing secret key" }
+        val signature = ByteArray(Sign.BYTES)
+        check(sodium.cryptoSignDetached(signature, message, message.size.toLong(), secretKey)) {
+            "detached signature failed"
+        }
+        return b64u(signature)
+    }
+
+    fun verifyDetached(message: ByteArray, signatureB64: String, signPublicKeyB64: String): Boolean =
+        try {
+            val signature = unb64u(signatureB64)
+            val publicKey = unb64u(signPublicKeyB64)
+            signature.size == Sign.BYTES && publicKey.size == Sign.ED25519_PUBLICKEYBYTES &&
+                sodium.cryptoSignVerifyDetached(signature, message, message.size, publicKey)
+        } catch (_: Exception) {
+            false
+        }
+
     fun hashPassword(password: String, saltB64: String): String {
         val salt = unb64u(saltB64)
         // NOTE: Lazysodium's String overload base64-encodes with android.util.Base64

@@ -34,6 +34,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -42,10 +44,19 @@ import com.yunjelee.securemsg.BuildConfig
 import com.yunjelee.securemsg.ContactSync
 import com.yunjelee.securemsg.ContactSyncStatus
 import com.yunjelee.securemsg.Credentials
+import com.yunjelee.securemsg.DeviceSecurityController
+import com.yunjelee.securemsg.DeviceSecurityView
+import com.yunjelee.securemsg.DeviceTrustCrypto
+import com.yunjelee.securemsg.DeviceTrustRepository
+import com.yunjelee.securemsg.PendingDeviceApproval
 import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.RelayApi
+import com.yunjelee.securemsg.RelayTrustedDeviceApi
+import com.yunjelee.securemsg.SavedCredentials
 import com.yunjelee.securemsg.ServerConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
@@ -84,6 +95,7 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
 /** "차단·설정 (Block·Settings)" tab: shared block rules, update controls, quarantined SMS, dev tools. */
 @Composable
 fun SettingsPane(
+    creds: SavedCredentials,
     update: UpdateFlow,
     notificationPermissionGranted: Boolean,
     onRequestNotificationPermission: () -> Unit,
@@ -97,6 +109,10 @@ fun SettingsPane(
     val blocklist by db.blocklistDao().observeAll().collectAsState(initial = emptyList())
     val blockedSenders by db.blockedSenderDao().observeAll().collectAsState(initial = emptyList())
     val blockedSms by db.blockedSmsDao().observeAll().collectAsState(initial = emptyList())
+    val trustRepo = remember(db) { DeviceTrustRepository(db) }
+    val trustPins by trustRepo.observePins(creds.uid.toLong()).collectAsState(initial = emptyList())
+    val trustState by trustRepo.observeState(creds.uid.toLong()).collectAsState(initial = null)
+    val clipboard = LocalClipboardManager.current
     var newKw by remember { mutableStateOf("") }
     var newBlockedPhone by remember { mutableStateOf("") }
     // Server-side shared block rules cache (rules added on other devices).
@@ -104,6 +120,70 @@ fun SettingsPane(
     var contactStatus by remember { mutableStateOf(ContactSync.loadStatus(context)) }
     var contactMessage by remember { mutableStateOf<String?>(null) }
     var contactSyncing by remember { mutableStateOf(false) }
+    var deviceSecurity by remember { mutableStateOf(DeviceSecurityView()) }
+    var deviceSecurityLoading by remember { mutableStateOf(false) }
+    var deviceActionMessage by remember { mutableStateOf<String?>(null) }
+
+    fun securityController(): DeviceSecurityController {
+        val relay = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }
+        return DeviceSecurityController(
+            RelayTrustedDeviceApi(relay, creds.uid.toLong()), creds, trustRepo,
+        )
+    }
+
+    fun refreshDeviceSecurity() {
+        if (deviceSecurityLoading) return
+        deviceSecurityLoading = true
+        scope.launch(Dispatchers.IO) {
+            val result = securityController().refresh()
+            withContext(Dispatchers.Main) {
+                deviceSecurity = result
+                deviceSecurityLoading = false
+            }
+        }
+    }
+
+    fun actOnPending(device: PendingDeviceApproval, approve: Boolean) {
+        deviceActionMessage = null
+        scope.launch(Dispatchers.IO) {
+            val ok = try {
+                val controller = securityController()
+                if (approve) controller.approve(device) else controller.reject(device)
+            } catch (e: Exception) {
+                Log.w("SettingsPane", "pending device action failed", e)
+                false
+            }
+            withContext(Dispatchers.Main) {
+                deviceActionMessage = if (ok) {
+                    if (approve) "기기를 승인했습니다." else "기기 요청을 거절했습니다."
+                } else {
+                    "기기 요청 처리에 실패했습니다. 서버 상태를 확인해 주세요."
+                }
+                refreshDeviceSecurity()
+            }
+        }
+    }
+
+    fun cancelOwnPending() {
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching { securityController().cancelOwnPending() }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                if (ok) onLogout()
+                else deviceActionMessage = "승인 요청 취소에 실패했습니다. 서버 연결을 확인해 주세요."
+            }
+        }
+    }
+
+    fun upgradeLegacySecurity() {
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching { securityController().upgradeLegacySecurity() }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                deviceActionMessage = if (ok) "계정 기기 보안을 verified_v2로 업그레이드했습니다."
+                    else "보안 업그레이드 실패: identity 기기에서 다시 시도해 주세요."
+                refreshDeviceSecurity()
+            }
+        }
+    }
 
     fun syncContacts() {
         if (contactSyncing) return
@@ -149,7 +229,14 @@ fun SettingsPane(
         sharedRules = BlocklistSync.load(context)
     }
 
-    LaunchedEffect(Unit) { reloadShared() }
+    LaunchedEffect(creds.sid) {
+        reloadShared()
+        refreshDeviceSecurity()
+        while (isActive) {
+            delay(15_000)
+            refreshDeviceSecurity()
+        }
+    }
 
     Column(
         Modifier
@@ -167,6 +254,98 @@ fun SettingsPane(
                     onClick = onRequestNotificationPermission,
                     modifier = Modifier.fillMaxWidth(),
                 )
+            }
+        }
+        SmCard {
+            SectionTitle("기기 보안")
+            Caption(
+                "새 기기는 기존 기기의 Ed25519 승인을 받아야 합니다. 키가 바뀌거나 보안 epoch가 " +
+                    "되돌아가면 로컬 pin을 덮어쓰지 않고 동기화를 차단합니다.",
+            )
+            deviceSecurity.trustWarning?.let {
+                Text(it, color = Sm.danger, fontSize = 12.sp, lineHeight = 16.sp)
+            }
+            when {
+                deviceSecurity.selfPending -> Text(
+                    "이 기기는 승인 대기 중입니다. 이미 승인된 다른 기기의 설정에서 요청을 확인하세요.",
+                    color = Sm.warning, fontSize = 12.sp, lineHeight = 16.sp,
+                )
+                deviceSecurity.serverUnsupported -> Caption("현재 서버가 기기 승인 API를 아직 지원하지 않습니다.")
+                deviceSecurity.error != null -> Text(
+                    "조회 실패: ${deviceSecurity.error}", color = Sm.warning, fontSize = 12.sp,
+                )
+                deviceSecurity.pending.isEmpty() -> Caption("승인 대기 중인 기기가 없습니다.")
+            }
+            if (deviceSecurity.selfPending) {
+                SmGhostButton(
+                    text = "이 기기의 승인 요청 취소",
+                    onClick = ::cancelOwnPending,
+                    modifier = Modifier.fillMaxWidth(),
+                    textColor = Sm.danger,
+                )
+            }
+            if (deviceSecurity.securityMode == "legacy_v1") {
+                Text(
+                    "레거시 기기들은 검증되지 않았습니다. 업그레이드하면 현재 identity 기기 외의 " +
+                        "레거시 기기는 다시 승인을 받아야 합니다.",
+                    color = Sm.warning, fontSize = 12.sp, lineHeight = 16.sp,
+                )
+                SmGradientButton(
+                    text = "기기 보안 업그레이드",
+                    onClick = ::upgradeLegacySecurity,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            deviceSecurity.pending.forEach { pending ->
+                PendingDeviceRow(
+                    device = pending,
+                    fingerprint = runCatching {
+                        DeviceTrustCrypto.deviceFingerprint(pending.pubKey, pending.sigPub)
+                    }.getOrElse { "유효하지 않은 공개키" },
+                    onApprove = { actOnPending(pending, true) },
+                    onReject = { actOnPending(pending, false) },
+                )
+            }
+            deviceActionMessage?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
+            SmGhostButton(
+                text = if (deviceSecurityLoading) "확인 중…" else "기기 보안 새로고침",
+                onClick = ::refreshDeviceSecurity,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            trustState?.let { state ->
+                Caption("보안 epoch ${state.epoch} · 디렉터리 ${state.directoryHash.take(12)}…")
+                Text(
+                    state.safetyNumber,
+                    color = Sm.text1,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+                Caption("안전 번호는 계정 identity key에서 계산되며 서버가 바뀌어도 동일해야 합니다.")
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SmGhostButton(
+                        text = "안전 번호 복사",
+                        onClick = { clipboard.setText(AnnotatedString(state.safetyNumber)) },
+                        modifier = Modifier.weight(1f),
+                    )
+                    SmGhostButton(
+                        text = "QR 데이터 복사",
+                        onClick = {
+                            clipboard.setText(AnnotatedString(
+                                DeviceTrustCrypto.safetyQrPayload(state.accountUid, state.identityKey),
+                            ))
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+            trustPins.forEach { pin ->
+                Column(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                        .background(Sm.surfaceAlt).padding(10.dp),
+                ) {
+                    Text("${pin.name} · ${pin.kind}", color = Sm.text2, fontSize = 12.sp)
+                    Text(pin.fingerprint, color = Sm.text4, fontSize = 10.sp)
+                }
             }
         }
         SmCard {
@@ -398,6 +577,27 @@ fun SettingsPane(
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun PendingDeviceRow(
+    device: PendingDeviceApproval,
+    fingerprint: String,
+    onApprove: () -> Unit,
+    onReject: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(Sm.warning.copy(alpha = 0.08f)).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Text("새 기기 승인 요청: ${device.name}", color = Sm.warning, fontSize = 13.sp)
+        Caption("${device.kind} · ${device.sid}\n$fingerprint")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SmGradientButton("승인", onApprove, Modifier.weight(1f))
+            SmGhostButton("거절", onReject, Modifier.weight(1f), Sm.danger)
+        }
     }
 }
 

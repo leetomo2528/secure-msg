@@ -21,6 +21,7 @@ class RelayClient(val baseUrl: String) {
     var onBlocklistUpdated: (() -> Unit)? = null
     var onConvUpdated: ((data: JSONObject) -> Unit)? = null
     var onContactsUpdated: ((data: JSONObject) -> Unit)? = null
+    var onDevicePending: ((data: JSONObject) -> Unit)? = null
     var token: String? = null
 
     fun connect(token: String) {
@@ -71,6 +72,11 @@ class RelayClient(val baseUrl: String) {
             if (args.isNotEmpty() && args[0] is JSONObject) {
                 onContactsUpdated?.invoke(args[0] as JSONObject)
             }
+        })
+        socket?.on("device_pending", Emitter.Listener { args ->
+            onDevicePending?.invoke(
+                if (args.isNotEmpty() && args[0] is JSONObject) args[0] as JSONObject else JSONObject(),
+            )
         })
         socket?.connect()
     }

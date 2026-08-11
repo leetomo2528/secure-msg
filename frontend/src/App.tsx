@@ -8,10 +8,11 @@ import DeviceManager from "./components/DeviceManager";
 import NewConversationModal from "./components/NewConversationModal";
 import BrandMark from "./components/BrandMark";
 import NotifyToggle from "./components/NotifyToggle";
+import PendingDeviceApproval from "./components/PendingDeviceApproval";
 import { getThemeMode, setThemeMode, subscribeTheme, type ThemeMode } from "./theme";
 
 export default function App() {
-  const { ready, authed, activeCid, error } = useStore();
+  const { ready, authed, approvalPending, securityLocked, activeCid, error } = useStore();
 
   if (!ready) {
     return (
@@ -24,6 +25,8 @@ export default function App() {
     );
   }
   if (!authed) return <Onboarding />;
+  if (approvalPending) return <PendingDeviceApproval />;
+  if (securityLocked) return <SecurityLocked />;
 
   return (
     <div className="relative grid h-full grid-cols-1 md:grid-cols-[340px_1fr] bg-night">
@@ -69,6 +72,24 @@ export default function App() {
       >
         {activeCid ? <ChatView cid={activeCid} /> : <EmptyChat />}
       </main>
+    </div>
+  );
+}
+
+function SecurityLocked() {
+  const logout = useStore((state) => state.logout);
+  const error = useStore((state) => state.error);
+  return (
+    <div className="grid h-full place-items-center px-6">
+      <div role="alert" className="w-full max-w-md space-y-4 rounded-2xl border border-red-400/40 bg-red-500/10 p-6 text-center">
+        <div className="text-3xl" aria-hidden>🛑</div>
+        <h1 className="text-lg font-bold text-danger-tx">키 디렉터리 보안 잠금</h1>
+        <p className="text-xs leading-relaxed text-tx-2">{error ?? "고정된 기기 공개키와 서버 응답이 일치하지 않습니다."}</p>
+        <p className="text-[10px] leading-relaxed text-tx-4">
+          공격 또는 서버 복원 오류일 수 있습니다. 기존 신뢰 기록을 자동으로 덮어쓰지 않았습니다.
+        </p>
+        <button type="button" onClick={() => void logout()} className="btn-primary">안전하게 로그아웃</button>
+      </div>
     </div>
   );
 }

@@ -187,6 +187,7 @@ fun MainScreen(
         } else {
             Column(Modifier.fillMaxWidth().weight(1f)) {
                     SettingsPane(
+                        creds = creds,
                         update = update,
                         notificationPermissionGranted = notificationPermissionGranted,
                         onRequestNotificationPermission = requestNotificationPermission,

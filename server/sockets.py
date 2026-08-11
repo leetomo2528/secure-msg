@@ -52,6 +52,8 @@ def emit_to_user_devices(
     if _socketio_ref is None:
         return
     for device in store.list_user_devices(user_id):
+        if device["trust_state"] != "approved":
+            continue
         sid = device["sid"]
         if sid == exclude_sid:
             continue
@@ -89,6 +91,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             or device["user_id"] != uid
             or device["id"] != device_id
             or device["session_version"] != session_version
+            or device["trust_state"] != "approved"
         ):
             clients.pop(request.sid, None)
             # Same contract as the expiry branch above: a revoked/unknown device
@@ -137,6 +140,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             not dev
             or dev["user_id"] != uid
             or dev["session_version"] != session_version
+            or dev["trust_state"] != "approved"
         ):
             raise ConnectionRefusedError("device unknown")
         store.touch_device(dev["id"])

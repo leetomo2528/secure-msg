@@ -1,5 +1,6 @@
 import "fake-indexeddb/auto";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { initCrypto } from "../crypto/keys";
 import {
   addBlockKeyword,
   addBlockedSender,
@@ -14,6 +15,10 @@ import {
   setCursor,
   setMeta,
   type MessageRow,
+  getAccountTrust,
+  listTrustedDevices,
+  pinTrustedDirectory,
+  TrustViolationError,
 } from "./db";
 
 function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): MessageRow {
@@ -140,5 +145,64 @@ describe("meta persistence", () => {
       keypair: { box: { pk: "bp2", sk: "bs2" }, sign: { pk: "sp2", sk: "ss2" } },
     });
     expect((await getMeta())?.sid).toBe("dev_meta2");
+  });
+});
+
+describe("trusted key directory", () => {
+  beforeAll(async () => { await initCrypto(); });
+  const initial = {
+    uid: 801,
+    identity_sig_pub: "identity-A",
+    security_epoch: 4,
+    directory_hash: "n7p8XOhJkZYBzeWxliNKrn0xqRGrDrsMG6wmYK_p9E0",
+    devices: [{
+      sid: "sid-a", pub_key: "box-a", sig_pub: "sign-a", kind: "web", fingerprint: "fp-a",
+    }],
+  };
+
+  it("pins a complete snapshot", async () => {
+    await pinTrustedDirectory(initial);
+    expect(await getAccountTrust(801)).toMatchObject({ security_epoch: 4, directory_hash: initial.directory_hash });
+    expect(await listTrustedDevices(801)).toHaveLength(1);
+  });
+
+  it("rejects rollback without overwriting the pin", async () => {
+    await expect(pinTrustedDirectory({ ...initial, security_epoch: 3, directory_hash: "old" }))
+      .rejects.toMatchObject({ code: "rollback" } satisfies Partial<TrustViolationError>);
+    expect(await getAccountTrust(801)).toMatchObject({ security_epoch: 4, directory_hash: initial.directory_hash });
+  });
+
+  it("rejects same-epoch equivocation", async () => {
+    await expect(pinTrustedDirectory({ ...initial, directory_hash: "split-view" }))
+      .rejects.toMatchObject({ code: "equivocation" } satisfies Partial<TrustViolationError>);
+  });
+
+  it("rejects account identity replacement", async () => {
+    await expect(pinTrustedDirectory({ ...initial, security_epoch: 5, identity_sig_pub: "identity-B" }))
+      .rejects.toMatchObject({ code: "identity_changed" } satisfies Partial<TrustViolationError>);
+  });
+
+  it("rejects same-SID box or signing key changes, even at a newer epoch", async () => {
+    await expect(pinTrustedDirectory({
+      ...initial,
+      security_epoch: 5,
+      directory_hash: "invalid-for-changed-key",
+      devices: [{ ...initial.devices[0], sig_pub: "sign-attacker" }],
+    })).rejects.toMatchObject({ code: "device_key_changed" } satisfies Partial<TrustViolationError>);
+    expect((await listTrustedDevices(801))[0].sig_pub).toBe("sign-a");
+    expect((await getAccountTrust(801))?.security_epoch).toBe(4);
+  });
+
+  it("accepts an unchanged SID plus a new trusted SID at a newer epoch", async () => {
+    await pinTrustedDirectory({
+      ...initial,
+      security_epoch: 5,
+      directory_hash: "j-eBv3P7yrvagsJRF-JauFbmoq1RnlceFCmPex-5how",
+      devices: [...initial.devices, {
+        sid: "sid-b", pub_key: "box-b", sig_pub: "sign-b", kind: "android_gateway", fingerprint: "fp-b",
+      }],
+    });
+    expect(await listTrustedDevices(801)).toHaveLength(2);
+    expect((await getAccountTrust(801))?.security_epoch).toBe(5);
   });
 });

@@ -23,6 +23,8 @@ import bcrypt
 import config
 import jwt
 import store
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 from flask import Blueprint, g, jsonify, request
 from rate_limit import check as rate_limit
 
@@ -133,12 +135,38 @@ def auth_required(fn):
             or device["session_version"] != session_version
         ):
             return _err("device revoked or unknown", 401)
+        if device["trust_state"] != "approved":
+            return _err("device approval required", 403)
         g.auth = {
             "uid": uid,
             "sid": sid,
             "device_id": device["id"],
             "session_version": session_version,
         }
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def pending_auth_required(fn):
+    """Authenticate a device token without granting application access."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        header = request.headers.get("Authorization", "")
+        decoded = verify_jwt(header[7:]) if header.startswith("Bearer ") else None
+        if not decoded:
+            return _err("invalid token", 401)
+        try:
+            uid, sid, sv = int(decoded["uid"]), str(decoded["sid"]), int(decoded["sv"])
+        except (KeyError, TypeError, ValueError):
+            return _err("invalid token", 401)
+        device = store.get_device_by_sid(sid)
+        if not device or device["user_id"] != uid or device["session_version"] != sv or device["trust_state"] == "revoked":
+            return _err("device revoked or unknown", 401)
+        g.auth = {"uid": uid, "sid": sid, "device_id": device["id"], "session_version": sv}
+        g.device = device
         return fn(*args, **kwargs)
 
     return wrapper
@@ -205,10 +233,13 @@ def login():
     # Token must be paired with a device. If user has devices, client picks one
     # via /device-login. If user has none, client must run /device-register first
     # (which is anonymous-ish — only requires the username to exist).
+    user_devices = store.list_user_devices(user["id"])
     return _ok(
         uid=user["id"],
         username=user["username"],
-        has_devices=bool(store.list_user_devices(user["id"])),
+        has_devices=any(d["trust_state"] != "revoked" for d in user_devices),
+        has_approved_devices=any(d["trust_state"] == "approved" for d in user_devices),
+        has_pending_devices=any(d["trust_state"] == "pending" for d in user_devices),
     )
 
 
@@ -264,7 +295,35 @@ def device_register():
         return _err("device registration conflict; retry", 409)
     device = store.get_device_by_sid(sid)
     token = issue_jwt(user["id"], sid, device["session_version"])
-    return _ok(sid=sid, token=token, uid=user["id"])
+    if device["trust_state"] == "pending":
+        # Import lazily to avoid the auth <-> sockets module cycle. Only
+        # approved devices have versioned rooms, and the helper filters again.
+        from sockets import emit_to_user_devices
+
+        emit_to_user_devices(
+            user["id"],
+            "device_pending",
+            {
+                "sid": sid,
+                "name": device["name"],
+                "kind": device["kind"],
+                "fingerprint": device["fingerprint"],
+                "challenge": device["challenge"],
+                "security_epoch": device["security_epoch"],
+            },
+            exclude_sid=sid,
+        )
+    return _ok(
+        sid=sid,
+        token=token,
+        uid=user["id"],
+        trust_state=device["trust_state"],
+        challenge=device["challenge"],
+        security_epoch=device["security_epoch"],
+        directory_hash=device["directory_hash"],
+        identity_sig_pub=device["identity_sig_pub"],
+        security_mode=device["security_mode"],
+    )
 
 
 @bp.post("/device-login")
@@ -296,11 +355,13 @@ def device_login():
     dev = store.get_device_by_sid(sid)
     if not dev or dev["user_id"] != user["id"]:
         return _err("device not found", 404)
+    if dev["trust_state"] == "revoked":
+        return _err("device revoked", 403)
     session_version = store.rotate_device_session(dev["id"], user["id"])
     if session_version is None:
         return _err("device not found", 404)
     token = issue_jwt(user["id"], sid, session_version)
-    return _ok(sid=sid, token=token, uid=user["id"])
+    return _ok(sid=sid, token=token, uid=user["id"], trust_state=dev["trust_state"])
 
 
 @bp.post("/logout")
@@ -322,12 +383,29 @@ def logout():
 def devices_list():
     """List current user's devices. Auth required."""
     devs = store.list_user_devices(g.auth["uid"])
+    user = store.get_user(g.auth["uid"])
     return _ok(
+        security_epoch=user["security_epoch"],
+        directory_hash=user["directory_hash"],
+        identity_sig_pub=user["identity_sig_pub"],
+        security_mode=user["security_mode"],
         devices=[
             {
                 "sid": d["sid"],
                 "name": d["name"],
                 "kind": d["kind"],
+                "pub_key": d["pub_key"],
+                "sig_pub": d["sig_pub"],
+                "fingerprint": d["fingerprint"],
+                "trust_state": d["trust_state"],
+                # The registration challenge is certificate material: clients
+                # need it later to verify the persisted approval signature,
+                # including for revoked tombstones. It is a public nonce.
+                "challenge": d["challenge"],
+                "approved_by_sid": d["approved_by_sid"],
+                "approved_at": d["approved_at"],
+                "revoked_at": d["revoked_at"],
+                "verification_state": d["verification_state"],
                 "created_at": d["created_at"],
                 "last_seen": d["last_seen"],
             }
@@ -343,10 +421,273 @@ def device_revoke():
     if body is None:
         return _err("JSON object required", 400)
     sid = _text(body, "sid")
-    if not SID_RE.fullmatch(sid):
-        return _err("sid required", 400)
+    signature = _text(body, "signature")
+    reason = _text(body, "reason")
+    parent_epoch = body.get("parent_epoch")
+    if (
+        not SID_RE.fullmatch(sid)
+        or not _valid_b64u(signature, 64)
+        or reason != "user_revoked"
+        or not isinstance(parent_epoch, int)
+        or isinstance(parent_epoch, bool)
+        or parent_epoch < 0
+    ):
+        return _err("sid, parent_epoch, user_revoked reason and Ed25519 signature required", 400)
     dev = store.get_device_by_sid(sid)
     if not dev or dev["user_id"] != g.auth["uid"]:
         return _err("device not found", 404)
-    store.revoke_device(dev["id"], g.auth["uid"])
+    actor = store.get_device_by_sid(g.auth["sid"])
+    statement = revoke_statement(g.auth["uid"], dev, g.auth["sid"], parent_epoch)
+    try:
+        VerifyKey(_decode_b64u(actor["sig_pub"])).verify(
+            statement.encode(), _decode_b64u(signature)
+        )
+    except (BadSignatureError, ValueError):
+        return _err("invalid revoke signature", 403)
+    try:
+        changed = store.revoke_device(
+            dev["id"],
+            g.auth["uid"],
+            g.auth["sid"],
+            g.auth["session_version"],
+            parent_epoch,
+            statement,
+            signature,
+        )
+    except PermissionError:
+        return _err("actor is no longer approved", 401)
+    except ValueError as exc:
+        return _err(str(exc), 409)
+    except RuntimeError:
+        return _err("security epoch changed", 409)
+    if not changed:
+        return _err("device already revoked", 409)
+    from sockets import emit_to_user_devices
+
+    refreshed = store.get_user(g.auth["uid"])
+    emit_to_user_devices(
+        g.auth["uid"],
+        "device_revoked",
+        {
+            "sid": sid,
+            "security_epoch": refreshed["security_epoch"],
+            "directory_hash": refreshed["directory_hash"],
+        },
+    )
     return _ok(revoked=sid)
+
+
+def revoke_statement(uid: int, subject: dict, actor_sid: str, parent_epoch: int) -> str:
+    return (
+        "securemsg-device-revoke-v1\n"
+        f"uid={uid}\n"
+        f"subject_sid={subject['sid']}\n"
+        f"subject_pub_key={subject['pub_key']}\n"
+        f"subject_sig_pub={subject['sig_pub']}\n"
+        f"actor_sid={actor_sid}\n"
+        f"parent_epoch={parent_epoch}\n"
+        "reason=user_revoked\n"
+    )
+
+
+@bp.post("/device-pending-revoke")
+@pending_auth_required
+def pending_device_revoke():
+    """Cancel only the pending device represented by this bearer token."""
+    device = store.get_device_by_sid(g.auth["sid"])
+    if device["trust_state"] != "pending":
+        return _err("device is not pending", 409)
+    if not store.cancel_pending_device(
+        device["id"], g.auth["uid"], g.auth["sid"], g.auth["session_version"]
+    ):
+        return _err("device is no longer pending", 409)
+    from sockets import emit_to_user_devices
+
+    user = store.get_user(g.auth["uid"])
+    emit_to_user_devices(
+        g.auth["uid"],
+        "device_revoked",
+        {
+            "sid": g.auth["sid"],
+            "security_epoch": user["security_epoch"],
+            "directory_hash": user["directory_hash"],
+        },
+    )
+    return _ok(revoked=g.auth["sid"])
+
+
+@bp.post("/device-reject-pending")
+@auth_required
+def reject_pending_device():
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    sid = _text(body, "sid")
+    challenge = _text(body, "challenge")
+    parent_epoch = body.get("parent_epoch")
+    if not SID_RE.fullmatch(sid) or not _valid_b64u(challenge, 32) or not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0:
+        return _err("sid, challenge and parent_epoch required", 400)
+    try:
+        changed = store.reject_pending_device(
+            g.auth["uid"], g.auth["sid"], g.auth["session_version"], sid, challenge, parent_epoch
+        )
+    except PermissionError:
+        return _err("actor is no longer approved", 401)
+    except RuntimeError:
+        return _err("security epoch changed", 409)
+    if not changed:
+        return _err("pending device or challenge not found", 404)
+    return _ok(rejected=sid)
+
+
+@bp.get("/device-pending-status")
+@pending_auth_required
+def pending_status():
+    device = store.get_device_by_sid(g.auth["sid"])
+    return _ok(
+        sid=device["sid"],
+        trust_state=device["trust_state"],
+        challenge=device["challenge"],
+        fingerprint=device["fingerprint"],
+        security_epoch=device["security_epoch"],
+        directory_hash=device["directory_hash"],
+        identity_sig_pub=device["identity_sig_pub"],
+        security_mode=device["security_mode"],
+    )
+
+
+def approval_statement(uid: int, subject: dict, parent_epoch: int) -> str:
+    return (
+        "securemsg-device-approval-v1\n"
+        f"uid={uid}\n"
+        f"subject_sid={subject['sid']}\n"
+        f"pub_key={subject['pub_key']}\n"
+        f"sig_pub={subject['sig_pub']}\n"
+        f"kind={subject['kind']}\n"
+        f"challenge={subject['challenge']}\n"
+        f"parent_epoch={parent_epoch}\n"
+    )
+
+
+def legacy_upgrade_statement(uid: int, identity_sid: str, identity_sig_pub: str, parent_epoch: int) -> str:
+    return (
+        "securemsg-legacy-upgrade-v1\n"
+        f"uid={uid}\n"
+        f"identity_sid={identity_sid}\n"
+        f"identity_sig_pub={identity_sig_pub}\n"
+        f"parent_epoch={parent_epoch}\n"
+    )
+
+
+@bp.post("/security-upgrade")
+@auth_required
+def security_upgrade():
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    parent_epoch = body.get("parent_epoch")
+    signature = _text(body, "signature")
+    if not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0 or not _valid_b64u(signature, 64):
+        return _err("parent_epoch and Ed25519 signature required", 400)
+    device = store.get_device_by_sid(g.auth["sid"])
+    statement = legacy_upgrade_statement(g.auth["uid"], device["sid"], device["sig_pub"], parent_epoch)
+    try:
+        VerifyKey(_decode_b64u(device["sig_pub"])).verify(statement.encode(), _decode_b64u(signature))
+    except (BadSignatureError, ValueError):
+        return _err("invalid upgrade signature", 403)
+    try:
+        result = store.upgrade_legacy_security(g.auth["uid"], g.auth["sid"], g.auth["session_version"], parent_epoch, statement, signature)
+    except PermissionError:
+        return _err("legacy identity anchor required", 403)
+    except ValueError:
+        return _err("account is not legacy", 409)
+    except RuntimeError:
+        return _err("security epoch changed", 409)
+    return _ok(security_mode="verified_v2", **result)
+
+
+@bp.post("/device-approve")
+@auth_required
+def device_approve():
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    subject_sid = _text(body, "subject_sid")
+    signature = _text(body, "signature")
+    parent_epoch = body.get("parent_epoch")
+    if not SID_RE.fullmatch(subject_sid) or not _valid_b64u(signature, 64) or not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0:
+        return _err("subject_sid, parent_epoch and Ed25519 signature required", 400)
+    subject = store.get_device_by_sid(subject_sid)
+    if not subject or subject["user_id"] != g.auth["uid"]:
+        return _err("device not found", 404)
+    if subject["trust_state"] != "pending":
+        return _err("device is not pending", 409)
+    user = store.get_user(g.auth["uid"])
+    if int(user["security_epoch"]) != parent_epoch:
+        return _err("security epoch changed", 409)
+    approver = store.get_device_by_sid(g.auth["sid"])
+    statement = approval_statement(g.auth["uid"], subject, parent_epoch)
+    try:
+        VerifyKey(_decode_b64u(approver["sig_pub"])).verify(statement.encode(), _decode_b64u(signature))
+    except (BadSignatureError, ValueError):
+        return _err("invalid approval signature", 403)
+    try:
+        result = store.approve_pending_device(
+            g.auth["uid"],
+            g.auth["sid"],
+            subject_sid,
+            parent_epoch,
+            statement,
+            signature,
+            g.auth["session_version"],
+        )
+    except sqlite3.IntegrityError:
+        return _err("an Android SMS gateway is already approved", 409)
+    except PermissionError:
+        return _err("approver is no longer approved", 401)
+    except LookupError:
+        return _err("device not found", 404)
+    except ValueError:
+        return _err("device is not pending", 409)
+    except RuntimeError:
+        return _err("security epoch changed", 409)
+    from sockets import emit_to_user_devices
+
+    emit_to_user_devices(
+        g.auth["uid"],
+        "device_approved",
+        {"sid": subject_sid, **result},
+    )
+    return _ok(approved=subject_sid, **result)
+
+
+def _decode_b64u(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+@bp.get("/key-directory")
+@auth_required
+def key_directory():
+    return _ok(**store.get_key_directory(g.auth["uid"]))
+
+
+@bp.get("/security-log")
+@auth_required
+def security_log():
+    try:
+        limit = int(request.args.get("limit", "200"))
+        before_raw = request.args.get("before_id")
+        before_id = int(before_raw) if before_raw is not None else None
+    except ValueError:
+        return _err("limit and before_id must be integers", 400)
+    if not 1 <= limit <= 1000 or (before_id is not None and before_id <= 0):
+        return _err("limit must be 1-1000 and before_id positive", 400)
+    events = store.list_security_events(g.auth["uid"], limit, before_id)
+    older_than = events[0]["id"] if events else (before_id or 1)
+    older_count = store.count_security_events_before(g.auth["uid"], older_than)
+    return _ok(
+        events=events,
+        anchor_previous_hash=events[0]["previous_hash"] if events else "",
+        has_more=older_count > 0,
+        next_before_id=older_than if older_count > 0 else None,
+    )

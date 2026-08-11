@@ -12,6 +12,7 @@
  */
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 import type { DeviceKeypair } from "../crypto/keys";
+import { serverDirectoryHash } from "../crypto/deviceTrust";
 import { normalizePhone } from "./conversationPolicy";
 
 interface MetaRow {
@@ -30,6 +31,50 @@ export interface DeviceRow {
   user_id: number;
   name: string;
   pub_key: string;
+  sig_pub?: string;
+}
+
+export interface AccountTrustRow {
+  uid: number;
+  identity_sig_pub: string;
+  security_epoch: number;
+  directory_hash: string;
+  updated_at: number;
+}
+
+export interface TrustedDeviceRow {
+  id: string;
+  uid: number;
+  sid: string;
+  pub_key: string;
+  sig_pub: string;
+  kind: string;
+  fingerprint: string;
+  first_seen_at: number;
+  updated_at: number;
+}
+
+export interface TrustedDirectorySnapshot {
+  uid: number;
+  identity_sig_pub: string;
+  security_epoch: number;
+  directory_hash: string;
+  devices: Array<{
+    sid: string;
+    pub_key: string;
+    sig_pub: string;
+    kind: string;
+    fingerprint: string;
+  }>;
+}
+
+export type TrustViolationCode = "identity_changed" | "rollback" | "equivocation" | "device_key_changed";
+
+export class TrustViolationError extends Error {
+  constructor(public readonly code: TrustViolationCode, message: string) {
+    super(message);
+    this.name = "TrustViolationError";
+  }
 }
 
 export interface MessageRow {
@@ -84,13 +129,15 @@ interface SecureMsgDB extends DBSchema {
   cursors: { key: string; value: CursorRow };
   blocklist: { key: string; value: BlockRow; indexes: { "by-keyword": string } };
   blockedSenders: { key: string; value: SenderRow; indexes: { "by-sender": string } };
+  accountTrust: { key: number; value: AccountTrustRow };
+  trustedDevices: { key: string; value: TrustedDeviceRow; indexes: { "by-account": number } };
 }
 
 let _db: Promise<IDBPDatabase<SecureMsgDB>> | null = null;
 
 export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
   if (!_db) {
-    _db = openDB<SecureMsgDB>("secure-msg", 2, {
+    _db = openDB<SecureMsgDB>("secure-msg", 3, {
       upgrade(d, oldVersion) {
         if (oldVersion < 1) {
           d.createObjectStore("meta");
@@ -107,6 +154,11 @@ export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
         if (oldVersion < 2) {
           const senders = d.createObjectStore("blockedSenders", { keyPath: "id" });
           senders.createIndex("by-sender", "sender");
+        }
+        if (oldVersion < 3) {
+          d.createObjectStore("accountTrust", { keyPath: "uid" });
+          const trust = d.createObjectStore("trustedDevices", { keyPath: "id" });
+          trust.createIndex("by-account", "uid");
         }
       },
     });
@@ -152,7 +204,7 @@ export async function clearSessionData(): Promise<void> {
 export async function clearAllData(): Promise<void> {
   const d = await db();
   const tx = d.transaction(
-    ["meta", "devices", "messages", "cursors", "blocklist"],
+    ["meta", "devices", "messages", "cursors", "blocklist", "blockedSenders", "accountTrust", "trustedDevices"],
     "readwrite",
   );
   await Promise.all([
@@ -161,6 +213,9 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore("messages").clear(),
     tx.objectStore("cursors").clear(),
     tx.objectStore("blocklist").clear(),
+    tx.objectStore("blockedSenders").clear(),
+    tx.objectStore("accountTrust").clear(),
+    tx.objectStore("trustedDevices").clear(),
   ]);
   await tx.done;
 }
@@ -182,6 +237,93 @@ export async function cacheDevices(rows: DeviceRow[]): Promise<void> {
   const tx = d.transaction("devices", "readwrite");
   await Promise.all(rows.map((r) => tx.store.put(r)));
   await tx.done;
+}
+
+// ----- trusted key directory ------------------------------------------
+
+function trustedDeviceId(uid: number, sid: string): string {
+  return `${uid}:${sid}`;
+}
+
+/**
+ * Atomically pins an authenticated directory snapshot. It never silently
+ * accepts identity changes, epoch rollback, a split view at the same epoch,
+ * or changed keys for an already-pinned SID.
+ */
+export async function pinTrustedDirectory(snapshot: TrustedDirectorySnapshot): Promise<void> {
+  if (!Number.isSafeInteger(snapshot.uid) || snapshot.uid < 0) throw new Error("invalid uid");
+  if (!Number.isSafeInteger(snapshot.security_epoch) || snapshot.security_epoch < 0) throw new Error("invalid security epoch");
+  if (!snapshot.identity_sig_pub || !snapshot.directory_hash) throw new Error("incomplete directory snapshot");
+  const d = await db();
+  const tx = d.transaction(["accountTrust", "trustedDevices"], "readwrite");
+  const accountStore = tx.objectStore("accountTrust");
+  const deviceStore = tx.objectStore("trustedDevices");
+  const existingAccount = await accountStore.get(snapshot.uid);
+  if (existingAccount) {
+    if (existingAccount.identity_sig_pub !== snapshot.identity_sig_pub) {
+      throw new TrustViolationError("identity_changed", "계정 신원 키가 변경되었습니다.");
+    }
+    if (snapshot.security_epoch < existingAccount.security_epoch) {
+      throw new TrustViolationError("rollback", "키 디렉터리 롤백이 감지되었습니다.");
+    }
+    if (snapshot.security_epoch === existingAccount.security_epoch
+      && snapshot.directory_hash !== existingAccount.directory_hash) {
+      throw new TrustViolationError("equivocation", "같은 보안 버전에서 서로 다른 키 목록이 감지되었습니다.");
+    }
+  }
+
+  const now = Date.now();
+  const seen = new Set<string>();
+  for (const candidate of snapshot.devices) {
+    if (!candidate.sid || seen.has(candidate.sid)) {
+      throw new Error("duplicate or empty device sid");
+    }
+    seen.add(candidate.sid);
+    const id = trustedDeviceId(snapshot.uid, candidate.sid);
+    const pinned = await deviceStore.get(id);
+    if (pinned && (pinned.pub_key !== candidate.pub_key || pinned.sig_pub !== candidate.sig_pub)) {
+      throw new TrustViolationError("device_key_changed", `기기 ${candidate.sid}의 공개키가 변경되었습니다.`);
+    }
+  }
+
+  const calculatedHash = serverDirectoryHash(snapshot.devices.map((device) => ({
+    sid: device.sid,
+    pub_key: device.pub_key,
+    sig_pub: device.sig_pub,
+    kind: device.kind,
+  })));
+  if (calculatedHash !== snapshot.directory_hash) {
+    throw new TrustViolationError("equivocation", "서버 디렉터리 해시와 공개키 목록이 일치하지 않습니다.");
+  }
+
+  // Validation is complete. No trust row is written before this point.
+  for (const candidate of snapshot.devices) {
+    const id = trustedDeviceId(snapshot.uid, candidate.sid);
+    const pinned = await deviceStore.get(id);
+    await deviceStore.put({
+      id,
+      uid: snapshot.uid,
+      ...candidate,
+      first_seen_at: pinned?.first_seen_at ?? now,
+      updated_at: now,
+    });
+  }
+  await accountStore.put({
+    uid: snapshot.uid,
+    identity_sig_pub: snapshot.identity_sig_pub,
+    security_epoch: snapshot.security_epoch,
+    directory_hash: snapshot.directory_hash,
+    updated_at: now,
+  });
+  await tx.done;
+}
+
+export async function getAccountTrust(uid: number): Promise<AccountTrustRow | null> {
+  return (await (await db()).get("accountTrust", uid)) ?? null;
+}
+
+export async function listTrustedDevices(uid: number): Promise<TrustedDeviceRow[]> {
+  return await (await db()).getAllFromIndex("trustedDevices", "by-account", uid);
 }
 
 // ----- messages ---------------------------------------------------------
