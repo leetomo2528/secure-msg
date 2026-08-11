@@ -30,7 +30,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
-import com.yunjelee.securemsg.BuildConfig
 import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.SavedCredentials
@@ -127,7 +126,6 @@ fun MainScreen(
                     letterSpacing = (-0.3).sp,
                 ),
             )
-            SmChip("v${BuildConfig.VERSION_NAME}", Sm.text4)
         }
         SmChip(
             status,
@@ -136,14 +134,6 @@ fun MainScreen(
                 status == "연결 확인 중…" -> Sm.sky
                 else -> Sm.warning
             },
-        )
-        UpdateBanner(
-            state = update.state,
-            onUpdate = update.onUpdate,
-            onInstall = update.onInstall,
-            onRetry = update.onRetry,
-            onCloseInstallBlocked = update.onCloseInstallBlocked,
-            onDismiss = update.onDismiss,
         )
         if (pendingApprovalCount > 0) {
             Column(
@@ -159,10 +149,6 @@ fun MainScreen(
                     "새 기기 승인 요청 ${pendingApprovalCount}건",
                     color = Sm.teal, fontSize = 14.sp, fontWeight = FontWeight.Bold,
                 )
-                Text(
-                    "웹에서 로그인한 기기를 확인하려면 기기 보안 화면에서 승인하세요.",
-                    color = Sm.text2, fontSize = 12.sp, lineHeight = 17.sp,
-                )
                 SmGradientButton(
                     text = "기기 보안 열기",
                     onClick = { selectedSection = 1 },
@@ -171,52 +157,19 @@ fun MainScreen(
             }
         }
         if (!smsRoleHeld) {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Sm.warning.copy(alpha = 0.07f))
-                    .border(1.dp, Sm.warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text(
-                    "자동 차단과 SMS 발신을 사용하려면 SecureMsg를 기본 SMS 앱으로 설정하세요.",
-                    color = Sm.warning, fontSize = 12.sp, lineHeight = 17.sp,
-                )
-                SmGradientButton(
-                    text = "기본 SMS 앱으로 설정",
-                    onClick = requestSmsRole,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            SmCard {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("기본 SMS 앱 설정이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    SmGhostButton(text = "설정", onClick = requestSmsRole)
+                }
             }
         }
         if (smsRoleHeld && !smsPermissionsGranted) {
-            SmGradientButton(
-                text = "SMS 권한 요청",
-                onClick = requestPerms,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-        if (!notificationPermissionGranted) {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Sm.warning.copy(alpha = 0.07f))
-                    .border(1.dp, Sm.warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text(
-                    "알림 권한이 꺼져 있어 새 SMS 알림을 표시할 수 없습니다. SMS 브리지는 계속 사용할 수 있습니다.",
-                    color = Sm.warning, fontSize = 12.sp, lineHeight = 17.sp,
-                )
-                SmGradientButton(
-                    text = "알림 권한 요청",
-                    onClick = requestNotificationPermission,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            SmCard {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("SMS 권한이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    SmGhostButton(text = "허용", onClick = requestPerms)
+                }
             }
         }
 
