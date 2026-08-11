@@ -52,6 +52,54 @@ body {
   transition: background-color 0.25s ease, color 0.25s ease;
 }
 
+/* Dark-first onboarding surface: security products should feel intentional,
+   not washed out by the user's default light theme. */
+.onboarding-shell {
+  --fg: 255 255 255;
+  --tx-1: 248 250 252;
+  --tx-2: 203 213 225;
+  --tx-3: 148 163 184;
+  --tx-4: 100 116 139;
+  --accent-tx: 94 234 212;
+  background: #071018;
+  color: #f8fafc;
+}
+
+.onboarding-orb {
+  border-radius: 999px;
+  filter: blur(2px);
+  pointer-events: none;
+}
+
+.onboarding-orb-a {
+  top: -180px;
+  left: 8%;
+  width: 560px;
+  height: 560px;
+  background: radial-gradient(circle, rgba(20, 184, 166, .2), transparent 68%);
+}
+
+.onboarding-orb-b {
+  right: -180px;
+  bottom: -240px;
+  width: 620px;
+  height: 620px;
+  background: radial-gradient(circle, rgba(14, 165, 233, .12), transparent 68%);
+}
+
+.onboarding-card {
+  padding: 1.5rem;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 1.5rem;
+  background: linear-gradient(145deg, rgba(20, 35, 49, .92), rgba(10, 21, 31, .88));
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .34), inset 0 1px 0 rgba(255, 255, 255, .05);
+  backdrop-filter: blur(20px);
+}
+
+@media (max-width: 640px) {
+  .onboarding-card { padding: 1.25rem; }
+}
+
 /* safe-area for iOS PWA */
 :root {
   --safe-top: env(safe-area-inset-top, 0px);
