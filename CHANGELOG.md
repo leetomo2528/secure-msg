@@ -202,3 +202,9 @@
 
 - 최초 구현: Android 기본 SMS 역할 기반 SMS_DELIVER 수신, 키워드·발신번호·오프라인 스팸 차단과 로컬 격리함, 기기별 envelope E2E 암호화 relay(Flask + Socket.IO), 웹 PWA 채팅·새 SMS 작성
 - 서버/웹/Android 테스트 통과, Caddy 자동 TLS로 Oracle Cloud 배포(msg.yunjelee.com)
+## v0.10.1 (2026-08-11) — 신규 기기 승인 요청 표시 개선
+
+- Android 메인 화면에서 승인 대기 중인 새 기기를 자동 조회하고 승인 요청 배너 표시
+- `기기 보안 열기` 버튼으로 승인 화면에 바로 진입
+- 웹의 기기 승인 대기 화면에 Android 승인 경로 안내 추가
+- Android `testDebugUnitTest` 및 Debug APK 빌드 통과
