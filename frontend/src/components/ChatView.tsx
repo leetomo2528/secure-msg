@@ -168,7 +168,7 @@ export default function ChatView({ cid }: { cid: string }) {
             <div className="truncate text-sm font-semibold text-tx-1">{title}</div>
           )}
           <div className="text-[10px] text-tx-4">
-            {conversation?.name ? "SMS · Android 게이트웨이 경유 발신" : "E2E 암호화 대화"}
+            {conversation?.name ? "SMS · Android 게이트웨이" : "E2E 암호화"}
           </div>
         </div>
         <div className="ml-auto flex items-center gap-1">
@@ -216,7 +216,7 @@ export default function ChatView({ cid }: { cid: string }) {
       <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto px-4 py-5">
         {activeMessages.length === 0 && (
           <div className="pt-14 text-center text-xs leading-relaxed text-tx-4">
-            메시지가 없습니다.<br />첫 메시지를 보내보세요.
+            메시지가 없습니다.
           </div>
         )}
         {activeMessages.map((m) => {

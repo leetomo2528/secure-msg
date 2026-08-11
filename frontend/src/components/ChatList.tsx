@@ -109,7 +109,7 @@ export default function ChatList() {
         <ul className="space-y-1 px-2 py-2">
       {conversations.length === 0 && (
         <li className="px-4 py-10 text-center text-xs leading-relaxed text-tx-4">
-          아직 대화가 없어요.<br />아래 <span className="text-accent-tx">+ 새 대화</span>에서 시작하세요.
+          아직 대화가 없습니다.
         </li>
       )}
       {conversations.map((c) => {

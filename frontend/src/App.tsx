@@ -1,5 +1,4 @@
 import { useStore } from "./store/useStore";
-import { useSyncExternalStore } from "react";
 import Onboarding from "./components/Onboarding";
 import ChatList from "./components/ChatList";
 import ChatView from "./components/ChatView";
@@ -9,7 +8,6 @@ import NewConversationModal from "./components/NewConversationModal";
 import BrandMark from "./components/BrandMark";
 import NotifyToggle from "./components/NotifyToggle";
 import PendingDeviceApproval from "./components/PendingDeviceApproval";
-import { getThemeMode, setThemeMode, subscribeTheme, type ThemeMode } from "./theme";
 
 export default function App() {
   const { ready, authed, approvalPending, securityLocked, activeCid, error } = useStore();
@@ -29,7 +27,7 @@ export default function App() {
   if (securityLocked) return <SecurityLocked />;
 
   return (
-    <div className="relative grid h-full grid-cols-1 md:grid-cols-[340px_1fr] bg-night">
+    <div className="app-shell relative grid h-full grid-cols-1 md:grid-cols-[320px_1fr] bg-night">
       {error && (
         <div className="absolute top-3 left-1/2 z-50 flex max-w-[92%] -translate-x-1/2 items-center gap-2 rounded-xl bg-red-500/10 px-4 py-2.5 text-xs text-danger-tx shadow-bubble ring-1 ring-red-400/30 backdrop-blur animate-rise">
           <span>{error}</span>
@@ -50,16 +48,15 @@ export default function App() {
             <BrandMark />
             <div>
               <h1 className="text-[15px] font-bold leading-none tracking-tight text-tx-1">Secure Msg</h1>
-              <p className="mt-1 text-[10px] leading-none text-tx-4">E2E 암호화 문자</p>
+              <p className="mt-1 text-[10px] font-medium uppercase leading-none tracking-[0.16em] text-tx-4">Private by default</p>
             </div>
           </div>
           <div className="flex items-center">
-            <ThemeButton />
             <LogoutButton />
           </div>
         </div>
         <ChatList />
-        <div className="mt-auto space-y-2 border-t border-fg/5 p-3">
+        <div className="mt-auto space-y-1.5 border-t border-fg/5 p-3">
           <NewConversationModal />
           <NotifyToggle />
           <BlocklistEditor />
@@ -133,39 +130,5 @@ function LogoutButton() {
         </svg>
       </button>
     </div>
-  );
-}
-
-const THEME_ORDER: ThemeMode[] = ["system", "light", "dark"];
-const THEME_LABEL: Record<ThemeMode, string> = { system: "시스템", light: "라이트", dark: "다크" };
-
-function ThemeButton() {
-  const mode = useSyncExternalStore(subscribeTheme, getThemeMode);
-  const next = THEME_ORDER[(THEME_ORDER.indexOf(mode) + 1) % THEME_ORDER.length];
-  return (
-    <button
-      onClick={() => setThemeMode(next)}
-      title={`테마: ${THEME_LABEL[mode]} (클릭하여 ${THEME_LABEL[next]}로 변경)`}
-      aria-label={`테마 변경 (현재: ${THEME_LABEL[mode]})`}
-      className="grid h-8 w-8 place-items-center rounded-lg text-tx-4 ring-1 ring-fg/10 transition hover:bg-fg/[0.06] hover:text-tx-1"
-    >
-      {mode === "system" && (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-          <rect x="3" y="4.5" width="18" height="12.5" rx="2" stroke="currentColor" strokeWidth="1.8" />
-          <path d="M9 20.5h6M12 17v3.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-        </svg>
-      )}
-      {mode === "light" && (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-          <circle cx="12" cy="12" r="4.2" stroke="currentColor" strokeWidth="1.8" />
-          <path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-        </svg>
-      )}
-      {mode === "dark" && (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-          <path d="M20.6 14.2A8.8 8.8 0 0 1 9.8 3.4a8.8 8.8 0 1 0 10.8 10.8z" fill="currentColor" />
-        </svg>
-      )}
-    </button>
   );
 }

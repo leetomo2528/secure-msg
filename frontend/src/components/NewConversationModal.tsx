@@ -63,8 +63,8 @@ export default function NewConversationModal() {
             />
             <p className="text-[10px] leading-relaxed text-tx-4">
               {mode === "sms"
-                ? "Android 휴대폰을 통해 발신할 전화번호를 입력하세요. (예: +821012345678)"
-                : "상대방의 SecureMsg 아이디를 쉼표로 구분해 입력하세요."}
+                ? "발신할 전화번호를 입력하세요."
+                : "상대방 아이디를 쉼표로 구분하세요."}
             </p>
             <input
               value={members}

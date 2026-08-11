@@ -34,6 +34,22 @@
   --shadow-bubble: rgba(0, 0, 0, 0.5);
 }
 
+/* Authenticated web surface mirrors the Android palette. */
+.app-shell {
+  --bg: 10 15 22;
+  --bg-soft: 16 24 39;
+  --fg: 255 255 255;
+  --tx-1: 241 245 249;
+  --tx-2: 203 213 225;
+  --tx-3: 148 163 184;
+  --tx-4: 100 116 139;
+  --accent-tx: 45 212 191;
+  --danger-tx: 254 202 202;
+  --glow: rgba(45, 212, 191, 0.42);
+  --shadow-bubble: rgba(0, 0, 0, 0.5);
+  background-image: radial-gradient(900px 520px at 70% -15%, rgba(45, 212, 191, .08), transparent 65%);
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;
