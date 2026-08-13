@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
@@ -56,6 +57,7 @@ class SmsBridgeService : Service() {
         const val EXTRA_PHONE = "phone"
         const val EXTRA_BODY = "body"
         const val EXTRA_PROVIDER_ID = "provider_id"
+        const val EXTRA_PROVIDER_EPOCH = "provider_epoch"
         const val EXTRA_RECEIVED_AT = "received_at"
         private const val TAG = "SmsBridgeService"
         private const val CLAIM_RETRY_GRACE_MS = 30_000L
@@ -89,6 +91,7 @@ class SmsBridgeService : Service() {
                 val phone = intent.getStringExtra(EXTRA_PHONE) ?: return START_STICKY
                 val body = intent.getStringExtra(EXTRA_BODY) ?: return START_STICKY
                 val providerId = intent.getLongExtra(EXTRA_PROVIDER_ID, -1L).takeIf { it > 0 }
+                val providerEpoch = intent.getLongExtra(EXTRA_PROVIDER_EPOCH, 0L)
                 val receivedAt = intent.getLongExtra(
                     EXTRA_RECEIVED_AT,
                     System.currentTimeMillis(),
@@ -96,7 +99,7 @@ class SmsBridgeService : Service() {
                 scope.launch {
                     try {
                         incomingMutex.withLock {
-                            handleIncomingSms(phone, body, providerId, receivedAt)
+                            handleIncomingSms(phone, body, providerId, receivedAt, providerEpoch)
                         }
                         ensureBridgeReady()
                         flushOutbox()
@@ -349,16 +352,22 @@ class SmsBridgeService : Service() {
         body: String,
         providerId: Long? = null,
         receivedAt: Long = System.currentTimeMillis(),
+        providerEpoch: Long = 0,
     ) {
+        val content = RelayContentCodec.text(body)
+        val identity = ProviderIdentity.snapshot(
+            ProviderIdentity.SMS, providerEpoch, providerId, phone, receivedAt,
+            RelayContentCodec.encode(content),
+        )
         if (phone.isBlank() || body.isBlank()) {
             // A malformed provider row can never be relayed; mark it processed
             // so startup imports stop retrying it forever.
-            providerId?.let { db.processedSmsDao().insert(ProcessedSms(it)) }
+            providerId?.let { db.processedSmsDao().insert(ProcessedSms(providerEpoch, it, identity.fingerprint)) }
             return
         }
-        if (providerId != null && db.processedSmsDao().contains(providerId)) return
+        if (providerId != null && db.processedSmsDao().contains(providerEpoch, providerId)) return
         if (providerId != null && db.relayOutboxDao()
-                .getByProviderId(providerId, "incoming_sms") != null
+                .getByProviderId(providerEpoch, providerId, "incoming_sms") != null
         ) {
             flushOutbox()
             return
@@ -376,13 +385,13 @@ class SmsBridgeService : Service() {
                     receivedAt = receivedAt,
                 ),
             )
-            providerId?.let { db.processedSmsDao().insert(ProcessedSms(it)) }
+            providerId?.let { db.processedSmsDao().insert(ProcessedSms(providerEpoch, it, identity.fingerprint)) }
             Log.i(TAG, "SMS not relayed: ${decision.reason}")
             return
         }
 
-        val content = RelayContentCodec.text(body)
-        incomingRepository.persist(
+        incomingRepository.persistCarrier(
+            kind = ProviderIdentity.SMS,
             direction = "incoming_sms",
             phoneNumber = phone,
             content = content,
@@ -393,28 +402,42 @@ class SmsBridgeService : Service() {
     }
 
     private suspend fun processRecentMms() {
-        for (id in MmsProvider.recentInbox(this)) {
-            if (!db.processedMmsDao().contains(id)) processIncomingMms(id)
+        MmsRowProcessor.process(MmsProvider.recentInbox(this), ::processIncomingMms) { id, error ->
+            Log.e(TAG, "failed to process recent MMS id=$id; continuing", error)
         }
     }
 
     private suspend fun processIncomingMms(id: Long) {
-        if (db.processedMmsDao().contains(id)) return
-        if (db.relayOutboxDao().getByProviderId(id, "incoming_mms") != null) {
+        val mms = MmsProvider.read(this, id)
+        if (!IncomingMmsPolicy.isReady(mms)) {
+            // The platform may expose the inbox row before its address and
+            // parts finish downloading. Leave it unprocessed so a later
+            // receiver event or startup scan can retry without losing it.
+            Log.i(TAG, "MMS not ready; deferring id=$id")
+            return
+        }
+        checkNotNull(mms)
+        val phone = PhoneNumberNormalizer.normalize(mms.address)
+        val content = RelayContent(
+            type = RelayContentCodec.TYPE_MMS,
+            text = mms.body,
+            subject = mms.subject,
+            attachments = mms.parts.map {
+                RelayAttachment(it.name, it.contentType, RelayContentCodec.encodeBytes(it.bytes), it.bytes.size)
+            },
+        )
+        val encodedContent = RelayContentCodec.encode(content)
+        val identity = ProviderIdentityResolver.resolve(
+            db, ProviderIdentity.MMS, id, phone, mms.date, encodedContent,
+        )
+        if (db.processedMmsDao().contains(identity.epoch, id)) return
+        if (db.relayOutboxDao().getByProviderId(identity.epoch, id, "incoming_mms") != null) {
             flushOutbox()
             return
         }
-        val mms = MmsProvider.read(this, id)
-        if (mms == null) {
-            // Read failure (deleted row/provider error) is permanent for this id;
-            // mark it processed so startup imports stop retrying it forever.
-            db.processedMmsDao().insert(ProcessedMms(id))
-            return
-        }
-        val phone = PhoneNumberNormalizer.normalize(mms.address)
         if (!isSmsAddress(phone)) {
             Log.w(TAG, "Ignoring MMS with invalid sender id=$id")
-            db.processedMmsDao().insert(ProcessedMms(id))
+            db.processedMmsDao().insert(ProcessedMms(identity.epoch, id, identity.fingerprint))
             return
         }
         val filterText = listOfNotNull(mms.subject, mms.body).joinToString("\n")
@@ -428,32 +451,29 @@ class SmsBridgeService : Service() {
                     receivedAt = mms.date,
                 ),
             )
-            db.processedMmsDao().insert(ProcessedMms(id))
+            db.processedMmsDao().insert(ProcessedMms(identity.epoch, id, identity.fingerprint))
             MmsProvider.delete(this, id)
             Log.i(TAG, "MMS quarantined id=$id: ${decision.reason}")
             return
         }
-        val attachments = mms.parts.map {
-            RelayAttachment(
-                name = it.name,
-                contentType = it.contentType,
-                data = RelayContentCodec.encodeBytes(it.bytes),
-                size = it.bytes.size,
-            )
-        }
-        val content = RelayContent(
-            type = RelayContentCodec.TYPE_MMS,
-            text = mms.body,
-            subject = mms.subject,
-            attachments = attachments,
-        )
-        incomingRepository.persist(
+        val persisted = incomingRepository.persistCarrier(
+            kind = ProviderIdentity.MMS,
             direction = "incoming_mms",
             phoneNumber = phone,
             content = content,
             providerId = id,
             receivedAt = mms.date,
         )
+        if (persisted?.newlyCreated == true) {
+            SmsNotifier.notifyIncoming(
+                context = this,
+                phoneNumber = persisted.conversation.normalizedPhone,
+                body = IncomingNotificationPolicy.preview(content),
+                date = mms.date,
+                cid = persisted.conversation.cid,
+                messageIdentity = persisted.outbox.mid,
+            )
+        }
         flushOutbox()
     }
 
@@ -622,12 +642,10 @@ class SmsBridgeService : Service() {
                     db.threadDao().advanceLastSeq(row.cid, seq)
                     db.relayOutboxDao().markRelaySent(row.id, seq)
                     if (isIncoming) {
-                        if (row.direction == "incoming_mms") {
-                            row.providerId?.let { db.processedMmsDao().insert(ProcessedMms(it)) }
-                        } else {
-                            row.providerId?.let { db.processedSmsDao().insert(ProcessedSms(it)) }
-                        }
-                        db.relayOutboxDao().delete(row.id)
+                        // Tombstone + optional provider ledger + deletion are
+                        // one transaction, so a crash cannot forget a
+                        // provider-less event after its relay ACK.
+                        incomingRepository.acknowledgeIncoming(row)
                     }
                 }
 
@@ -819,9 +837,28 @@ class SmsBridgeService : Service() {
             if (rows.length() == 0) return
             var consumed = 0
             for (i in 0 until rows.length()) {
-                val message = rows.optJSONObject(i) ?: continue
-                val seq = message.optInt("seq")
-                if (seq <= cursor) continue
+                val message = rows.optJSONObject(i) ?: run {
+                    Log.e(TAG, "Malformed relay history row at index=$i; retrying batch")
+                    return
+                }
+                val seq = message.optInt("seq", -1)
+                when (
+                    RelaySyncPolicy.rowAction(
+                        expectedCid = cid,
+                        rowCid = message.optString("cid"),
+                        seq = seq,
+                        cursor = cursor,
+                        senderSid = message.optString("sender_sid"),
+                        payloadIsObject = message.optJSONObject("payload") != null,
+                    )
+                ) {
+                    RelaySyncPolicy.RowAction.RETRY_BATCH -> {
+                        Log.e(TAG, "Invalid relay history row at index=$i seq=$seq; retrying batch")
+                        return
+                    }
+                    RelaySyncPolicy.RowAction.SKIP_ALREADY_CONSUMED -> continue
+                    RelaySyncPolicy.RowAction.PROCESS -> Unit
+                }
                 if (!processRelayEnvelope(message, thread, a, c)) return
                 cursor = seq
                 consumed += 1
@@ -837,11 +874,16 @@ class SmsBridgeService : Service() {
         a: RelayApi,
         c: SavedCredentials,
     ): Boolean {
-        val cid = env.optString("cid").ifBlank { thread.cid }
+        val cid = env.optString("cid")
         val senderSid = env.optString("sender_sid")
-        val seq = env.optInt("seq")
-        if (seq <= 0) return true
+        val seq = env.optInt("seq", -1)
         if (senderSid == c.sid) {
+            val hasLocalServerKey = db.messageDao().hasServerKey("$cid:$seq")
+            val hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(cid, seq)
+            if (!RelaySyncPolicy.canConsumeSelfEcho(hasLocalServerKey, hasAcknowledgedOutbox)) {
+                Log.w(TAG, "Unacknowledged self echo for $cid/$seq; retrying batch")
+                return false
+            }
             val status = env.optString("carrier_status", "none")
             if (status.isNotBlank() && status != "none") {
                 db.messageDao().setCarrierStatus(
@@ -894,17 +936,12 @@ class SmsBridgeService : Service() {
             return false
         }
         if (senderPubKey == null) {
-            if (!memberLookupSucceeded) {
-                // A transient member lookup failure is retryable. Do not advance
-                // the durable sequence cursor and permanently lose this row.
-                return false
-            }
-            // This can happen for history created before sender-key snapshots
-            // and after the sending device was revoked.
-            Log.w(TAG, "Cannot resolve sender pubkey for $senderSid; skipping seq=$seq")
-            db.threadDao().advanceLastSeq(cid, seq)
-            relay?.emitDelivered(cid, seq)
-            return true
+            Log.w(
+                TAG,
+                "Cannot resolve trusted sender pubkey for $senderSid " +
+                    "(memberLookupSucceeded=$memberLookupSucceeded); retrying seq=$seq",
+            )
+            return false
         }
 
         val plaintext = try {
@@ -919,46 +956,67 @@ class SmsBridgeService : Service() {
             null
         }
         if (plaintext == null) {
-            Log.w(TAG, "Message is not decryptable by this device; skipping seq=$seq")
-            db.threadDao().advanceLastSeq(cid, seq)
-            relay?.emitDelivered(cid, seq)
-            return true
+            Log.w(TAG, "Message is not decryptable by this device; retrying seq=$seq")
+            return false
         }
 
-        val content = RelayContentCodec.decode(plaintext)
+        val content = try {
+            RelayContentCodec.decode(plaintext)
+        } catch (e: Exception) {
+            Log.e(TAG, "Relay content decode failed for seq=$seq", e)
+            return false
+        }
 
         // Claim before the irreversible carrier side effect. Repeated socket
         // events, reconnect pulls, and concurrent syncs cannot send twice.
         val claim = db.relayReceiptDao().claim(RelayReceipt(cid, seq))
         if (claim == -1L) {
             val receipt = db.relayReceiptDao().get(cid, seq) ?: return false
-            if (receipt.status == "claimed") {
-                val reclaimed = db.relayReceiptDao().reclaimStale(
-                    cid,
-                    seq,
-                    System.currentTimeMillis() - CLAIM_RETRY_GRACE_MS,
-                )
-                if (reclaimed == 0) return false
-                Log.w(TAG, "Retrying stale carrier claim for $cid/$seq (at-least-once)")
-            } else {
-                relay?.let { client ->
-                    if (client.isConnected) {
-                        client.emitCarrierStatusAwait(
-                            cid,
-                            seq,
-                            receipt.status,
-                            receipt.lastError,
-                        ).takeIf { it.optBoolean("ok") }?.let {
-                            db.relayReceiptDao().markStatusSynced(cid, seq, receipt.status)
+            val cutoff = System.currentTimeMillis() - CLAIM_RETRY_GRACE_MS
+            when (RelayReceiptRetryPolicy.action(receipt.status, receipt.claimedAt <= cutoff)) {
+                RelayReceiptRetryPolicy.Action.WAIT_FOR_ACTIVE_CLAIM -> return false
+                RelayReceiptRetryPolicy.Action.RETRY_STALE_CLAIM -> {
+                    val reclaimed = db.relayReceiptDao().reclaimStale(cid, seq, cutoff)
+                    if (reclaimed == 0) return false
+                    Log.w(TAG, "Retrying stale pre-dispatch carrier claim for $cid/$seq")
+                }
+                RelayReceiptRetryPolicy.Action.REQUIRE_EXPLICIT_RETRY -> {
+                    // Do not move the sequence cursor: this row may already be
+                    // on the carrier network, and automatic redispatch could
+                    // duplicate it. A later framework callback can still move
+                    // the receipt to sent/failed and unblock normal recovery.
+                    Log.e(TAG, "Ambiguous carrier dispatch for $cid/$seq; explicit retry required")
+                    return false
+                }
+                RelayReceiptRetryPolicy.Action.CONSUME_RESOLVED -> {
+                    relay?.let { client ->
+                        if (client.isConnected) {
+                            client.emitCarrierStatusAwait(
+                                cid,
+                                seq,
+                                receipt.status,
+                                receipt.lastError,
+                            ).takeIf { it.optBoolean("ok") }?.let {
+                                db.relayReceiptDao().markStatusSynced(cid, seq, receipt.status)
+                            }
                         }
                     }
+                    db.threadDao().advanceLastSeq(cid, seq)
+                    relay?.emitDelivered(cid, seq)
+                    return true
                 }
-                db.threadDao().advanceLastSeq(cid, seq)
-                relay?.emitDelivered(cid, seq)
-                return true
             }
         }
 
+        // Persist the ambiguous boundary immediately before entering the
+        // irreversible Android carrier API. A crash after this write must
+        // never turn into an automatic second send.
+        db.relayReceiptDao().markStatus(
+            cid,
+            seq,
+            "attempting",
+            "Carrier dispatch outcome pending callback; explicit retry required if unresolved",
+        )
         val dispatchId = "relay-${cid.take(32)}-$seq"
         val dispatched = if (content.type == RelayContentCodec.TYPE_MMS) {
             MmsSender.send(this@SmsBridgeService, thread.phoneNumber, content, dispatchId, cid, seq)
@@ -966,16 +1024,26 @@ class SmsBridgeService : Service() {
             SmsSender.send(this@SmsBridgeService, thread.phoneNumber, content.text, dispatchId, cid, seq)
         }
         if (!dispatched) {
-            db.relayReceiptDao().release(cid, seq)
+            // SmsManager/MmsManager may throw after accepting work. Keep the
+            // attempting receipt so a reconnect cannot duplicate the message.
             return false
         }
 
-        db.relayReceiptDao().markStatus(cid, seq, "dispatched", null)
+        val afterDispatch = db.relayReceiptDao().get(cid, seq) ?: return false
+        if (CarrierState.canAdvance(afterDispatch.status, "dispatched")) {
+            db.relayReceiptDao().markStatus(cid, seq, "dispatched", null)
+        }
+        val effectiveReceipt = db.relayReceiptDao().get(cid, seq) ?: return false
         relay?.let { client ->
             if (client.isConnected) {
-                val ack = client.emitCarrierStatusAwait(cid, seq, "dispatched")
+                val ack = client.emitCarrierStatusAwait(
+                    cid,
+                    seq,
+                    effectiveReceipt.status,
+                    effectiveReceipt.lastError,
+                )
                 if (ack.optBoolean("ok")) {
-                    db.relayReceiptDao().markStatusSynced(cid, seq, "dispatched")
+                    db.relayReceiptDao().markStatusSynced(cid, seq, effectiveReceipt.status)
                 }
             }
         }
@@ -996,7 +1064,10 @@ class SmsBridgeService : Service() {
                     subject = content.subject,
                     attachmentsJson = attachmentsJson(content),
                     serverKey = "$cid:$seq",
-                    carrierStatus = "dispatched",
+                    // A very fast framework callback can resolve the receipt
+                    // before send() returns. Preserve that newer result.
+                    carrierStatus = effectiveReceipt.status,
+                    carrierError = effectiveReceipt.lastError,
                 ),
             )
         } catch (e: Exception) {
@@ -1221,8 +1292,17 @@ class SmsBridgeService : Service() {
 
     private suspend fun importRecentInbox() {
         for (sms in SmsProvider.recentInbox(this)) {
-            if (!db.processedSmsDao().contains(sms.id)) {
-                handleIncomingSms(sms.address, sms.body, sms.id, sms.date)
+            val content = RelayContentCodec.text(sms.body)
+            val identity = ProviderIdentityResolver.resolve(
+                db,
+                ProviderIdentity.SMS,
+                sms.id,
+                sms.address,
+                sms.date,
+                RelayContentCodec.encode(content),
+            )
+            if (!db.processedSmsDao().contains(identity.epoch, sms.id)) {
+                handleIncomingSms(sms.address, sms.body, sms.id, sms.date, identity.epoch)
             }
         }
     }
@@ -1249,5 +1329,23 @@ class SmsBridgeService : Service() {
         relay?.disconnect()
         scope.cancel()
         super.onDestroy()
+    }
+}
+
+internal object MmsRowProcessor {
+    suspend fun process(
+        ids: Iterable<Long>,
+        processRow: suspend (Long) -> Unit,
+        onFailure: (Long, Exception) -> Unit,
+    ) {
+        for (id in ids) {
+            try {
+                processRow(id)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                onFailure(id, error)
+            }
+        }
     }
 }

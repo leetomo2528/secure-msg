@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Api } from "./api";
+import { Api, canonicalDeviceLoginProof, sendMessage } from "./api";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -56,6 +56,44 @@ describe("Api 401 handling", () => {
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
+  it("preserves a 5xx status when an intermediary returns a non-JSON body", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("Bad Gateway", { status: 502 })));
+    const api = new Api();
+    api.setToken("jwt-token");
+
+    const result = await api.keyDirectory();
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 502,
+      error: "서버 응답 형식 오류 (HTTP 502)",
+    });
+  });
+
+  it("ignores a delayed 401 from a previous login session", async () => {
+    let resolveOldRequest!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => {
+      resolveOldRequest = resolve;
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new Api();
+    api.setToken("old-token");
+    const onUnauthorized = vi.fn();
+    api.onUnauthorized = onUnauthorized;
+
+    const oldRequest = api.listConversations();
+    api.setToken("new-token");
+    resolveOldRequest(jsonResponse(401, { ok: false, error: "old token expired" }));
+    const result = await oldRequest;
+
+    expect(result.status).toBe(401);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(api.token).toBe("new-token");
+    expect(fetchMock).toHaveBeenCalledWith("/api/conversations", expect.objectContaining({
+      headers: expect.objectContaining({ Authorization: "Bearer old-token" }),
+    }));
+  });
+
   it("returns a structured error instead of throwing on network failure", async () => {
     const fetchMock = vi.fn(async () => {
       throw new TypeError("fetch failed");
@@ -101,6 +139,23 @@ describe("Api 401 handling", () => {
   });
 });
 
+describe("sendMessage cancellation", () => {
+  it("does not emit a retry after the security context is invalidated", async () => {
+    vi.useFakeTimers();
+    let current = true;
+    const socket = { emit: vi.fn() } as any;
+
+    const pending = sendMessage(socket, "cid", {} as any, () => current);
+    expect(socket.emit).toHaveBeenCalledTimes(1);
+    current = false;
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(pending).resolves.toMatchObject({ ok: false, error: "메시지 전송이 취소되었습니다" });
+    expect(socket.emit).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+});
+
 describe("trusted-device API contract", () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -118,6 +173,22 @@ describe("trusted-device API contract", () => {
         subject_sid: "subject-sid",
         parent_epoch: 12,
         signature: "detached-signature",
+      }),
+    }));
+  });
+
+  it("uses the canonical domain-separated login proof and posts every bound field", async () => {
+    expect(canonicalDeviceLoginProof({
+      uid: 7, sid: "device01", challenge_id: "challenge-id", challenge: "nonce", session_version: 4,
+    })).toBe("securemsg-device-login-v1\nuid=7\nsid=device01\nchallenge_id=challenge-id\nchallenge=nonce\nsession_version=4\n");
+    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true, token: "jwt" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new Api();
+    await client.deviceLoginProof("alice", "hash", "device01", "challenge-id", "nonce", "signature");
+    expect(fetchMock).toHaveBeenCalledWith("/api/device-login", expect.objectContaining({
+      body: JSON.stringify({
+        username: "alice", pw_hash: "hash", sid: "device01",
+        challenge_id: "challenge-id", challenge: "nonce", proof: "signature",
       }),
     }));
   });

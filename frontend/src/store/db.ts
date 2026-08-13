@@ -39,6 +39,7 @@ export interface AccountTrustRow {
   identity_sig_pub: string;
   security_epoch: number;
   directory_hash: string;
+  security_mode: "legacy_v1" | "verified_v2";
   updated_at: number;
 }
 
@@ -59,6 +60,7 @@ export interface TrustedDirectorySnapshot {
   identity_sig_pub: string;
   security_epoch: number;
   directory_hash: string;
+  security_mode: "legacy_v1" | "verified_v2";
   devices: Array<{
     sid: string;
     pub_key: string;
@@ -137,8 +139,8 @@ let _db: Promise<IDBPDatabase<SecureMsgDB>> | null = null;
 
 export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
   if (!_db) {
-    _db = openDB<SecureMsgDB>("secure-msg", 3, {
-      upgrade(d, oldVersion) {
+    _db = openDB<SecureMsgDB>("secure-msg", 4, {
+      upgrade(d, oldVersion, _newVersion, transaction) {
         if (oldVersion < 1) {
           d.createObjectStore("meta");
           const devices = d.createObjectStore("devices", { keyPath: "sid" });
@@ -159,6 +161,20 @@ export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
           d.createObjectStore("accountTrust", { keyPath: "uid" });
           const trust = d.createObjectStore("trustedDevices", { keyPath: "id" });
           trust.createIndex("by-account", "uid");
+        }
+        if (oldVersion >= 3 && oldVersion < 4) {
+          // Rows written by v3 predate mode pinning. Treat them as legacy so
+          // an authenticated verified_v2 proof can upgrade them, while never
+          // guessing that an unverifiable old row was already verified.
+          const accountTrust = transaction.objectStore("accountTrust");
+          void accountTrust.openCursor().then(function migrate(cursor): Promise<void> | void {
+            if (!cursor) return;
+            const row = cursor.value as AccountTrustRow;
+            if (row.security_mode !== "legacy_v1" && row.security_mode !== "verified_v2") {
+              cursor.update({ ...row, security_mode: "legacy_v1" });
+            }
+            return cursor.continue().then(migrate);
+          });
         }
       },
     });
@@ -200,7 +216,31 @@ export async function clearSessionData(): Promise<void> {
   await tx.done;
 }
 
-/** Clear all local data after this device is revoked. */
+/**
+ * Discard a revoked/missing local device so login can register a fresh one.
+ *
+ * Account trust anchors are deliberately excluded: a server-side revocation
+ * must not be able to erase the pinned account identity, security epoch, or
+ * historical device keys that protect the subsequent registration.
+ */
+export async function clearDeviceForReregistration(): Promise<void> {
+  const d = await db();
+  const tx = d.transaction(
+    ["meta", "devices", "messages", "cursors", "blocklist", "blockedSenders"],
+    "readwrite",
+  );
+  await Promise.all([
+    tx.objectStore("meta").clear(),
+    tx.objectStore("devices").clear(),
+    tx.objectStore("messages").clear(),
+    tx.objectStore("cursors").clear(),
+    tx.objectStore("blocklist").clear(),
+    tx.objectStore("blockedSenders").clear(),
+  ]);
+  await tx.done;
+}
+
+/** Explicitly forget this account and every locally pinned trust anchor. */
 export async function clearAllData(): Promise<void> {
   const d = await db();
   const tx = d.transaction(
@@ -251,70 +291,122 @@ function trustedDeviceId(uid: number, sid: string): string {
  * or changed keys for an already-pinned SID.
  */
 export async function pinTrustedDirectory(snapshot: TrustedDirectorySnapshot): Promise<void> {
-  if (!Number.isSafeInteger(snapshot.uid) || snapshot.uid < 0) throw new Error("invalid uid");
-  if (!Number.isSafeInteger(snapshot.security_epoch) || snapshot.security_epoch < 0) throw new Error("invalid security epoch");
-  if (!snapshot.identity_sig_pub || !snapshot.directory_hash) throw new Error("incomplete directory snapshot");
+  await pinTrustedDirectories([snapshot]);
+}
+
+/**
+ * Atomically pins a set of authenticated directory snapshots. Every account
+ * and device invariant is preflighted before any row is written, and all rows
+ * are committed by one IndexedDB transaction.
+ */
+export async function pinTrustedDirectories(
+  snapshots: TrustedDirectorySnapshot[],
+  shouldContinue: () => boolean = () => true,
+): Promise<void> {
+  const snapshotUids = new Set<number>();
+  for (const snapshot of snapshots) {
+    if (!Number.isSafeInteger(snapshot.uid) || snapshot.uid < 0) throw new Error("invalid uid");
+    if (snapshotUids.has(snapshot.uid)) throw new Error("duplicate directory uid");
+    snapshotUids.add(snapshot.uid);
+    if (!Number.isSafeInteger(snapshot.security_epoch) || snapshot.security_epoch < 0) throw new Error("invalid security epoch");
+    if (!snapshot.identity_sig_pub || !snapshot.directory_hash) throw new Error("incomplete directory snapshot");
+    if (snapshot.security_mode !== "legacy_v1" && snapshot.security_mode !== "verified_v2") throw new Error("invalid security mode");
+
+    const seen = new Set<string>();
+    for (const candidate of snapshot.devices) {
+      if (!candidate.sid || seen.has(candidate.sid)) {
+        throw new Error("duplicate or empty device sid");
+      }
+      seen.add(candidate.sid);
+    }
+
+  }
+
   const d = await db();
   const tx = d.transaction(["accountTrust", "trustedDevices"], "readwrite");
   const accountStore = tx.objectStore("accountTrust");
   const deviceStore = tx.objectStore("trustedDevices");
-  const existingAccount = await accountStore.get(snapshot.uid);
-  if (existingAccount) {
-    if (existingAccount.identity_sig_pub !== snapshot.identity_sig_pub) {
-      throw new TrustViolationError("identity_changed", "계정 신원 키가 변경되었습니다.");
+  const pinnedDevices = new Map<string, TrustedDeviceRow | undefined>();
+  const abortIfInvalidated = async (): Promise<boolean> => {
+    if (shouldContinue()) return false;
+    tx.abort();
+    try {
+      await tx.done;
+    } catch (error) {
+      if (!(error instanceof DOMException) || error.name !== "AbortError") throw error;
     }
-    if (snapshot.security_epoch < existingAccount.security_epoch) {
-      throw new TrustViolationError("rollback", "키 디렉터리 롤백이 감지되었습니다.");
+    return true;
+  };
+
+  // Preflight the complete batch. No write is issued before this finishes.
+  for (const snapshot of snapshots) {
+    if (await abortIfInvalidated()) return;
+    const existingAccount = await accountStore.get(snapshot.uid);
+    if (existingAccount) {
+      if (existingAccount.identity_sig_pub !== snapshot.identity_sig_pub) {
+        throw new TrustViolationError("identity_changed", "계정 신원 키가 변경되었습니다.");
+      }
+      if (snapshot.security_epoch < existingAccount.security_epoch) {
+        throw new TrustViolationError("rollback", "키 디렉터리 롤백이 감지되었습니다.");
+      }
+      // Missing values can only exist in a pre-v4 row and are deliberately
+      // interpreted as legacy for backward-compatible verified upgrades.
+      const pinnedMode = existingAccount.security_mode ?? "legacy_v1";
+      if (pinnedMode === "verified_v2" && snapshot.security_mode !== "verified_v2") {
+        throw new TrustViolationError("rollback", "검증된 키 디렉터리의 레거시 모드 역행이 감지되었습니다.");
+      }
+      if (snapshot.security_epoch === existingAccount.security_epoch
+        && snapshot.directory_hash !== existingAccount.directory_hash) {
+        throw new TrustViolationError("equivocation", "같은 보안 버전에서 서로 다른 키 목록이 감지되었습니다.");
+      }
     }
-    if (snapshot.security_epoch === existingAccount.security_epoch
-      && snapshot.directory_hash !== existingAccount.directory_hash) {
-      throw new TrustViolationError("equivocation", "같은 보안 버전에서 서로 다른 키 목록이 감지되었습니다.");
+
+    for (const candidate of snapshot.devices) {
+      if (await abortIfInvalidated()) return;
+      const id = trustedDeviceId(snapshot.uid, candidate.sid);
+      const pinned = await deviceStore.get(id);
+      pinnedDevices.set(id, pinned);
+      if (pinned && (pinned.pub_key !== candidate.pub_key || pinned.sig_pub !== candidate.sig_pub)) {
+        throw new TrustViolationError("device_key_changed", `기기 ${candidate.sid}의 공개키가 변경되었습니다.`);
+      }
+    }
+
+    const calculatedHash = serverDirectoryHash(snapshot.devices.map((device) => ({
+      sid: device.sid,
+      pub_key: device.pub_key,
+      sig_pub: device.sig_pub,
+      kind: device.kind,
+    })));
+    if (calculatedHash !== snapshot.directory_hash) {
+      throw new TrustViolationError("equivocation", "서버 디렉터리 해시와 공개키 목록이 일치하지 않습니다.");
     }
   }
+  if (await abortIfInvalidated()) return;
 
   const now = Date.now();
-  const seen = new Set<string>();
-  for (const candidate of snapshot.devices) {
-    if (!candidate.sid || seen.has(candidate.sid)) {
-      throw new Error("duplicate or empty device sid");
+  for (const snapshot of snapshots) {
+    for (const candidate of snapshot.devices) {
+      if (await abortIfInvalidated()) return;
+      const id = trustedDeviceId(snapshot.uid, candidate.sid);
+      await deviceStore.put({
+        id,
+        uid: snapshot.uid,
+        ...candidate,
+        first_seen_at: pinnedDevices.get(id)?.first_seen_at ?? now,
+        updated_at: now,
+      });
     }
-    seen.add(candidate.sid);
-    const id = trustedDeviceId(snapshot.uid, candidate.sid);
-    const pinned = await deviceStore.get(id);
-    if (pinned && (pinned.pub_key !== candidate.pub_key || pinned.sig_pub !== candidate.sig_pub)) {
-      throw new TrustViolationError("device_key_changed", `기기 ${candidate.sid}의 공개키가 변경되었습니다.`);
-    }
-  }
-
-  const calculatedHash = serverDirectoryHash(snapshot.devices.map((device) => ({
-    sid: device.sid,
-    pub_key: device.pub_key,
-    sig_pub: device.sig_pub,
-    kind: device.kind,
-  })));
-  if (calculatedHash !== snapshot.directory_hash) {
-    throw new TrustViolationError("equivocation", "서버 디렉터리 해시와 공개키 목록이 일치하지 않습니다.");
-  }
-
-  // Validation is complete. No trust row is written before this point.
-  for (const candidate of snapshot.devices) {
-    const id = trustedDeviceId(snapshot.uid, candidate.sid);
-    const pinned = await deviceStore.get(id);
-    await deviceStore.put({
-      id,
+    if (await abortIfInvalidated()) return;
+    await accountStore.put({
       uid: snapshot.uid,
-      ...candidate,
-      first_seen_at: pinned?.first_seen_at ?? now,
+      identity_sig_pub: snapshot.identity_sig_pub,
+      security_epoch: snapshot.security_epoch,
+      directory_hash: snapshot.directory_hash,
+      security_mode: snapshot.security_mode,
       updated_at: now,
     });
   }
-  await accountStore.put({
-    uid: snapshot.uid,
-    identity_sig_pub: snapshot.identity_sig_pub,
-    security_epoch: snapshot.security_epoch,
-    directory_hash: snapshot.directory_hash,
-    updated_at: now,
-  });
+  if (await abortIfInvalidated()) return;
   await tx.done;
 }
 
@@ -340,8 +432,18 @@ export async function putMessage(m: MessageRow): Promise<void> {
   // between our read and write, or it would be silently overwritten.
   const tx = d.transaction("messages", "readwrite");
   const existing = await tx.store.get(key);
-  const keepNewerCarrierState = existing
-    && (existing.carrier_updated_at ?? 0) > (m.carrier_updated_at ?? 0);
+  const existingStatus = existing?.carrier_status ?? "none";
+  const incomingStatus = m.carrier_status ?? "none";
+  // Lifecycle order is authoritative across sources. Client optimistic rows use
+  // the browser clock while relay timestamps have second precision, so wall
+  // clock comparison must only break ties within the same lifecycle state.
+  const keepNewerCarrierState = existing && (
+    !canAdvanceCarrierStatus(existingStatus, incomingStatus)
+    || (
+      existingStatus === incomingStatus
+      && (existing.carrier_updated_at ?? 0) > (m.carrier_updated_at ?? 0)
+    )
+  );
   await tx.store.put({
     ...m,
     ...(keepNewerCarrierState ? {
@@ -389,10 +491,14 @@ export async function setCarrierStatus(
   if (!existing) {
     return;
   }
-  if (!canAdvanceCarrierStatus(existing.carrier_status ?? "none", status)) {
+  const currentStatus = existing.carrier_status ?? "none";
+  if (!canAdvanceCarrierStatus(currentStatus, status)) {
     return;
   }
-  if ((existing.carrier_updated_at ?? 0) > (updatedAt ?? 0)) {
+  // Different producers do not share a precise clock. Only use timestamps to
+  // reject stale repetitions of the same state; forward lifecycle progress is
+  // valid even if its timestamp is slightly older.
+  if (currentStatus === status && (existing.carrier_updated_at ?? 0) > (updatedAt ?? 0)) {
     return;
   }
   await tx.store.put({
@@ -522,6 +628,24 @@ export async function putBlockedSenderRow(row: SenderRow): Promise<void> {
 export async function clearBlockedSenders(): Promise<void> {
   const d = await db();
   await d.clear("blockedSenders");
+}
+
+/** Atomically replace both account block-rule stores after reconciliation. */
+export async function replaceBlockRules(
+  keywords: BlockRow[],
+  senders: SenderRow[],
+): Promise<void> {
+  const d = await db();
+  const tx = d.transaction(["blocklist", "blockedSenders"], "readwrite");
+  const keywordStore = tx.objectStore("blocklist");
+  const senderStore = tx.objectStore("blockedSenders");
+  await Promise.all([
+    keywordStore.clear(),
+    senderStore.clear(),
+    ...keywords.map((row) => keywordStore.put(row)),
+    ...senders.map((row) => senderStore.put(row)),
+  ]);
+  await tx.done;
 }
 
 // ----- message search -----------------------------------------------------

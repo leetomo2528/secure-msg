@@ -21,7 +21,7 @@ carrier → SmsReceiver/MmsReceiver → local filter → Android SMS/MMS Provide
 | Android/PWA 기기 개인키 | Android Keystore AES-GCM 암호문(DataStore) / 웹 IndexedDB | 해당 기기로 전달된 envelope 복호 가능 |
 | 세션 토큰 | Android Keystore AES-GCM 암호문 / 웹 메모리 | 해당 기기 권한으로 만료 전 API 접근 가능 |
 | 사용자 비밀번호 | 메모리에서 Argon2id 처리 후 폐기 | 입력 중 탈취 가능성 |
-| 키워드·차단 발신번호 | 각 클라이언트 로컬 DB | 해당 기기 접근 시 필터 의도 노출 |
+| 키워드·차단 발신번호 | relay 서버 `block_rules`, 각 클라이언트 로컬 DB | 서버 DB 또는 기기 접근 시 필터 의도 노출 |
 | 암호화 메시지 | relay 서버 SQLite | 메타데이터는 노출, 평문은 직접 복호 불가 |
 | 전화번호 대화 라벨 | relay 서버 `conversations.name` | 서버 DB 유출 시 전화번호/대화 관계 노출 |
 | 동기화된 연락처 표시명 | relay 서버 `conversations.synced_contact_name` | 서버 DB 유출 시 연락처 이름/전화번호 관계 노출 |
@@ -80,9 +80,9 @@ Android는 전화번호 이름을 가진 대화라도 멤버가 게이트웨이 
 
 자동 판정은 URL, 금융·도박·홍보 문구, 수신거부 문구를 조합한 로컬 휴리스틱이다. 정상적인 이벤트/금융 알림을 차단할 수 있고, 문구를 변형한 스팸을 놓칠 수 있다. 격리함과 사용자 키워드/발신번호 규칙으로 보정한다.
 
-### 5. 기기별 필터 설정 동기화
+### 5. 필터 설정의 서버 메타데이터 노출
 
-현재 키워드와 발신번호 차단 규칙은 서버로 올리지 않고 각 클라이언트에만 저장한다. 따라서 Android에서 설정한 규칙과 웹 브라우저의 웹 필터 규칙은 자동으로 합쳐지지 않는다. 수신 SMS 차단의 권위 있는 판정 지점은 Android 휴대폰이다.
+키워드와 발신번호 차단 규칙은 계정 단위로 relay 서버의 `block_rules`에 저장된다. 온라인 기기에는 REST 변경 후 `blocklist_updated` 이벤트로 반영하고, 오프라인 기기는 재연결할 때 서버 기준 목록과 조정한다. 네트워크 오류로 아직 업로드하지 못한 로컬 규칙은 보존해 다음 동기화에서 재시도한다. 서버 운영자나 DB 유출 공격자는 서버에 반영된 필터 문자열을 볼 수 있다. 메시지 본문은 이 동기화에 포함되지 않으며, 수신 SMS를 실제로 격리할지 결정하는 권위 있는 판정 지점은 Android 휴대폰이다.
 
 ### 6. 서비스 가용성·전송 큐
 
@@ -118,7 +118,8 @@ Android의 JWT와 X25519/Ed25519 개인키는 Android Keystore의 비내보내�
 
 ## 향후 개선
 
-- [ ] 암호화된 사용자 설정 envelope를 통한 기기 간 차단 규칙 동기화
+- [x] relay 기반 계정 단위 차단 규칙 동기화(필터 문자열은 서버 메타데이터로 노출)
+- [ ] 차단 규칙을 서버에서도 읽을 수 없게 하는 암호화된 사용자 설정 envelope
 - [ ] Signal Protocol/Double Ratchet 및 메시지 서명
 - [x] Android 내구성 outbox + 동일 mid 기반 서버 ACK 재전송 큐
 - [x] MMS·첨부파일 지원(통신사/OEM별 실제 단말 검증은 필요)

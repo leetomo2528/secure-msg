@@ -128,6 +128,97 @@ describe("trusted-device crypto", () => {
     expect(serverDirectoryHash(devices)).toBe("WhyUnwZYhm5sO6L6Dy4sStlx2nM3w6elFu228j-pT5M");
   });
 
+  it("accepts a root-only verified_v2 directory at security epoch 1", () => {
+    const root = generateKeypair();
+    const active = [{ sid: "root", pub_key: root.box.pk, sig_pub: root.sign.pk, kind: "web" as const }];
+    const proof = {
+      user_id: 75,
+      identity_sig_pub: root.sign.pk,
+      security_epoch: 1,
+      security_mode: "verified_v2" as const,
+      directory_hash: serverDirectoryHash(active),
+      device_history: [{
+        ...active[0],
+        fingerprint: deviceFingerprint(root.box.pk, root.sign.pk).hash,
+        trust_state: "approved" as const,
+        challenge: ZERO32,
+        approved_by_sid: "root",
+        verification_state: "verified" as const,
+      }],
+      approval_certificates: [],
+      revocation_certificates: [],
+      security_upgrade_certificates: [],
+    };
+
+    expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+  });
+
+  it("accepts a verified_v2 legacy-upgrade chain that starts after epoch 1", () => {
+    const root = generateKeypair();
+    const fields = { uid: 76, identitySid: "root", identitySigPub: root.sign.pk, parentEpoch: 11 };
+    const active = [{ sid: "root", pub_key: root.box.pk, sig_pub: root.sign.pk, kind: "web" as const }];
+    const proof = {
+      user_id: 76,
+      identity_sig_pub: root.sign.pk,
+      security_epoch: 12,
+      security_mode: "verified_v2" as const,
+      directory_hash: serverDirectoryHash(active),
+      device_history: [{
+        ...active[0],
+        fingerprint: deviceFingerprint(root.box.pk, root.sign.pk).hash,
+        trust_state: "approved" as const,
+        challenge: ZERO32,
+        approved_by_sid: "legacy_tofu",
+        verification_state: "verified" as const,
+      }],
+      approval_certificates: [],
+      revocation_certificates: [],
+      security_upgrade_certificates: [{
+        identity_sid: "root",
+        parent_epoch: 11,
+        resulting_epoch: 12,
+        statement: canonicalLegacyUpgrade(fields),
+        signature: signLegacyUpgrade(fields, root.sign.sk),
+        created_at: 1,
+      }],
+    };
+
+    expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+  });
+
+  it("rejects an inflated verified_v2 security epoch after the certificate chain", () => {
+    const root = generateKeypair();
+    const fields = { uid: 76, identitySid: "root", identitySigPub: root.sign.pk, parentEpoch: 11 };
+    const active = [{ sid: "root", pub_key: root.box.pk, sig_pub: root.sign.pk, kind: "web" as const }];
+    const proof = {
+      user_id: 76,
+      identity_sig_pub: root.sign.pk,
+      security_epoch: 13,
+      security_mode: "verified_v2" as const,
+      directory_hash: serverDirectoryHash(active),
+      device_history: [{
+        ...active[0],
+        fingerprint: deviceFingerprint(root.box.pk, root.sign.pk).hash,
+        trust_state: "approved" as const,
+        challenge: ZERO32,
+        approved_by_sid: "legacy_tofu",
+        verification_state: "verified" as const,
+      }],
+      approval_certificates: [],
+      revocation_certificates: [],
+      security_upgrade_certificates: [{
+        identity_sid: "root",
+        parent_epoch: 11,
+        resulting_epoch: 12,
+        statement: canonicalLegacyUpgrade(fields),
+        signature: signLegacyUpgrade(fields, root.sign.sk),
+        created_at: 1,
+      }],
+    };
+
+    expect(() => verifyDirectoryProof(proof, active)).toThrow(/certificate epoch/);
+  });
+
   it("verifies an anchored approval certificate chain, including revoked approvers", () => {
     const root = generateKeypair();
     const subject = generateKeypair();

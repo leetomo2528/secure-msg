@@ -15,6 +15,21 @@ private const val APPROVAL_DOMAIN = "securemsg-device-approval-v1"
 private const val FINGERPRINT_DOMAIN = "securemsg-device-fingerprint-v1\n"
 private const val SAFETY_DOMAIN = "securemsg-account-safety-v1\n"
 
+data class DeviceLoginStatement(
+    val uid: Long, val sid: String, val challengeId: String,
+    val challenge: String, val sessionVersion: Long,
+) {
+    fun canonical(): String {
+        require(uid >= 0 && sessionVersion >= 0)
+        requireToken("sid", sid)
+        requireToken("challenge_id", challengeId)
+        requireB64u("challenge", challenge, 32)
+        return "securemsg-device-login-v1\nuid=$uid\nsid=$sid\n" +
+            "challenge_id=$challengeId\nchallenge=$challenge\n" +
+            "session_version=$sessionVersion\n"
+    }
+}
+
 data class DeviceApprovalStatement(
     val uid: Long,
     val subjectSid: String,
@@ -585,6 +600,13 @@ internal fun verifyDirectoryProof(
         previousEpoch = event.epoch
     }
     if (proof.securityMode == "verified_v2") {
+        if (previousEpoch == null) {
+            if (proof.securityEpoch != 1L) {
+                return "root-only verified directory must have security epoch 1"
+            }
+        } else if (previousEpoch != proof.securityEpoch) {
+            return "certificate epoch does not match directory epoch"
+        }
         val activeHistory = history.values.filter { it.trustState == "approved" }.map { it.sid }.toSet()
         if (activeHistory != activeAtEpoch) return "certificate final state differs from directory"
     }

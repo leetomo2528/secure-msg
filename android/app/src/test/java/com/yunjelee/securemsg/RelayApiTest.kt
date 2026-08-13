@@ -58,6 +58,30 @@ class RelayApiTest {
     }
 
     @Test
+    fun deviceLoginProofPostsAllChallengeBoundFields() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"token\":\"jwt\"}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+
+        val result = api.deviceLoginProof("alice", "hash", "device01", "challenge-id", "nonce", "signature")
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+
+        assertTrue(result.getBoolean("ok"))
+        assertEquals("challenge-id", body.getString("challenge_id"))
+        assertEquals("nonce", body.getString("challenge"))
+        assertEquals("signature", body.getString("proof"))
+    }
+
+    @Test
+    fun canonicalDeviceLoginStatementBindsSessionAndChallenge() {
+        val canonical = DeviceLoginStatement(7, "device01", "challenge-id", "A".repeat(43), 4).canonical()
+        assertEquals(
+            "securemsg-device-login-v1\nuid=7\nsid=device01\nchallenge_id=challenge-id\n" +
+                "challenge=${"A".repeat(43)}\nsession_version=4\n",
+            canonical,
+        )
+    }
+
+    @Test
     fun contactNameSnapshotPostsNullClearsInOneAuthenticatedRequest() {
         server.enqueue(jsonResponse(200, "{\"ok\":true,\"synced\":2}"))
         val api = RelayApi(server.url("/").toString(), OkHttpClient()).also {

@@ -36,9 +36,9 @@ object SmsNotifier {
         manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "SMS 수신",
+                "메시지 수신",
                 NotificationManager.IMPORTANCE_DEFAULT,
-            ).apply { description = "차단되지 않은 SMS 알림" },
+            ).apply { description = "차단되지 않은 SMS/MMS 알림" },
         )
 
         val normalizedPhone = PhoneNumberNormalizer.normalize(phoneNumber)

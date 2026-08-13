@@ -59,6 +59,24 @@ def conn_ctx():
         conn.close()
 
 
+@contextmanager
+def read_snapshot():
+    """Yield one deferred SQLite read transaction.
+
+    The first query pins a coherent database snapshot.  In WAL mode writers
+    can continue and commit while the caller finishes materializing related
+    rows from that older snapshot.
+    """
+    with conn_ctx() as conn:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
 def init_schema() -> None:
     schema_path = BASE_DIR / "schema.sql"
     sql = schema_path.read_text(encoding="utf-8")
@@ -68,6 +86,20 @@ def init_schema() -> None:
         # Closing the connection on an exception rolls the whole migration
         # back, avoiding a visible half-migrated trust directory.
         c.execute("BEGIN IMMEDIATE")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS device_login_challenges (
+                challenge_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                sid TEXT NOT NULL,
+                challenge TEXT NOT NULL,
+                session_version INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed_at INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device ON device_login_challenges(device_id, created_at)")
         user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)")}
         if "identity_sig_pub" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN identity_sig_pub TEXT NOT NULL DEFAULT ''")
@@ -346,13 +378,17 @@ def get_user_by_name(username: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def _get_user_with_conn(c: sqlite3.Connection, uid: int) -> dict[str, Any] | None:
+    row = c.execute(
+        "SELECT id, username, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE id = ?",
+        (uid,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def get_user(uid: int) -> dict[str, Any] | None:
     with conn_ctx() as c:
-        row = c.execute(
-            "SELECT id, username, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE id = ?",
-            (uid,),
-        ).fetchone()
-        return dict(row) if row else None
+        return _get_user_with_conn(c, uid)
 
 
 # ----- devices -----------------------------------------------------------
@@ -423,14 +459,20 @@ def get_device_by_sid(sid: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def _list_user_devices_with_conn(
+    c: sqlite3.Connection, user_id: int
+) -> list[dict[str, Any]]:
+    rows = c.execute(
+        "SELECT id, sid, name, kind, pub_key, sig_pub, session_version, trust_state, challenge, approved_by_sid, approved_at, approval_signature, fingerprint, revoked_at, verification_state, created_at, last_seen "
+        "FROM devices WHERE user_id = ? ORDER BY created_at, id",
+        (user_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_user_devices(user_id: int) -> list[dict[str, Any]]:
     with conn_ctx() as c:
-        rows = c.execute(
-            "SELECT id, sid, name, kind, pub_key, sig_pub, session_version, trust_state, challenge, approved_by_sid, approved_at, approval_signature, fingerprint, revoked_at, verification_state, created_at, last_seen "
-            "FROM devices WHERE user_id = ? ORDER BY created_at",
-            (user_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return _list_user_devices_with_conn(c, user_id)
 
 
 def touch_device(device_id: int) -> None:
@@ -442,11 +484,16 @@ def rotate_device_session(
     device_id: int,
     user_id: int,
     expected_version: int | None = None,
+    require_not_revoked: bool = False,
 ) -> int | None:
     """Atomically revoke existing JWTs for one device and return its new version.
 
     ``expected_version`` prevents an older request from revoking a newer login
     that won a race after the request was authenticated.
+
+    ``require_not_revoked`` makes the trust-state check part of the same SQL
+    update as the version rotation.  This is used by password-based device
+    login so a concurrent revocation cannot be followed by token issuance.
     """
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -457,6 +504,8 @@ def rotate_device_session(
             if expected_version is not None:
                 where += " AND session_version = ?"
                 params += (expected_version,)
+            if require_not_revoked:
+                where += " AND trust_state != 'revoked'"
             cur = c.execute(
                 "UPDATE devices SET session_version = session_version + 1, "
                 "last_seen = ? WHERE " + where,
@@ -474,6 +523,71 @@ def rotate_device_session(
         except Exception:
             c.execute("ROLLBACK")
             raise
+
+
+def create_device_login_challenge(device_id: int, user_id: int, sid: str, session_version: int) -> dict[str, Any] | None:
+    """Persist a challenge bound to the device's current session generation."""
+    import secrets
+    timestamp = now()
+    record = {
+        "challenge_id": secrets.token_urlsafe(18),
+        "challenge": _b64u(secrets.token_bytes(32)),
+        "expires_at": timestamp + 120,
+    }
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        current = c.execute(
+            "SELECT session_version,trust_state FROM devices WHERE id=? AND user_id=? AND sid=?",
+            (device_id, user_id, sid),
+        ).fetchone()
+        if not current or current["trust_state"] == "revoked" or int(current["session_version"]) != session_version:
+            c.execute("ROLLBACK")
+            return None
+        c.execute(
+            "INSERT INTO device_login_challenges(challenge_id,user_id,device_id,sid,challenge,session_version,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (record["challenge_id"], user_id, device_id, sid, record["challenge"], session_version, record["expires_at"], timestamp),
+        )
+        c.execute("COMMIT")
+    return {**record, "session_version": session_version}
+
+
+def consume_device_login_challenge(
+    challenge_id: str, challenge: str, device_id: int, user_id: int, sid: str,
+    session_version: int,
+) -> tuple[int, str] | None:
+    """Consume one exact unexpired proof and rotate the JWT generation atomically."""
+    timestamp = now()
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT challenge,session_version,expires_at,consumed_at FROM device_login_challenges "
+            "WHERE challenge_id=? AND user_id=? AND device_id=? AND sid=?",
+            (challenge_id, user_id, device_id, sid),
+        ).fetchone()
+        device = c.execute(
+            "SELECT trust_state,session_version FROM devices WHERE id=? AND user_id=? AND sid=?",
+            (device_id, user_id, sid),
+        ).fetchone()
+        if (not row or row["consumed_at"] is not None or int(row["expires_at"]) < timestamp
+                or row["challenge"] != challenge or int(row["session_version"]) != session_version
+                or not device or device["trust_state"] == "revoked"
+                or int(device["session_version"]) != session_version):
+            c.execute("ROLLBACK")
+            return None
+        consumed = c.execute(
+            "UPDATE device_login_challenges SET consumed_at=? WHERE challenge_id=? AND consumed_at IS NULL",
+            (timestamp, challenge_id),
+        )
+        rotated = c.execute(
+            "UPDATE devices SET session_version=session_version+1,last_seen=? "
+            "WHERE id=? AND user_id=? AND sid=? AND session_version=? AND trust_state!='revoked'",
+            (timestamp, device_id, user_id, sid, session_version),
+        )
+        if consumed.rowcount != 1 or rotated.rowcount != 1:
+            c.execute("ROLLBACK")
+            return None
+        c.execute("COMMIT")
+        return session_version + 1, str(device["trust_state"])
 
 
 def revoke_device(
@@ -698,11 +812,13 @@ def upgrade_legacy_security(
             raise
 
 
-def get_key_directory(user_id: int) -> dict[str, Any] | None:
-    user = get_user(user_id)
+def _get_key_directory_with_conn(
+    c: sqlite3.Connection, user_id: int
+) -> dict[str, Any] | None:
+    user = _get_user_with_conn(c, user_id)
     if not user:
         return None
-    proof = get_directory_proof(user_id)
+    proof = _get_directory_proof_with_conn(c, user_id, user=user)
     return {
         "user_id": user_id,
         "identity_sig_pub": user["identity_sig_pub"],
@@ -710,7 +826,11 @@ def get_key_directory(user_id: int) -> dict[str, Any] | None:
         "directory_hash": user["directory_hash"],
         "trust_enforced_at": user["trust_enforced_at"],
         "security_mode": user["security_mode"],
-        "devices": [d for d in list_user_devices(user_id) if d["trust_state"] == "approved"],
+        "devices": [
+            d
+            for d in _list_user_devices_with_conn(c, user_id)
+            if d["trust_state"] == "approved"
+        ],
         "device_history": proof["device_history"],
         "approval_certificates": proof["approval_certificates"],
         "revocation_certificates": proof["revocation_certificates"],
@@ -718,35 +838,45 @@ def get_key_directory(user_id: int) -> dict[str, Any] | None:
     }
 
 
-def get_directory_proof(user_id: int) -> dict[str, Any] | None:
+def get_key_directory(user_id: int) -> dict[str, Any] | None:
+    with read_snapshot() as c:
+        return _get_key_directory_with_conn(c, user_id)
+
+
+def _get_directory_proof_with_conn(
+    c: sqlite3.Connection,
+    user_id: int,
+    *,
+    user: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Public verification material for an account device directory.
 
     Revoked devices that were once approved remain in device_history because
     they may be approvers in a still-valid descendant certificate chain.
     Never-approved pending/cancelled devices are intentionally omitted.
     """
-    user = get_user(user_id)
+    if user is None:
+        user = _get_user_with_conn(c, user_id)
     if not user:
         return None
-    with conn_ctx() as c:
-        history = c.execute(
-            "SELECT sid,kind,pub_key,sig_pub,fingerprint,trust_state,challenge,approved_by_sid,approved_at,approval_signature,revoked_at,verification_state "
-            "FROM devices WHERE user_id = ? AND (trust_state = 'approved' OR approved_at IS NOT NULL) ORDER BY created_at,id",
-            (user_id,),
-        ).fetchall()
-        approvals = c.execute(
-            "SELECT subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at "
-            "FROM device_approvals WHERE user_id = ? ORDER BY resulting_epoch,id",
-            (user_id,),
-        ).fetchall()
-        revocations = c.execute(
-            "SELECT subject_sid,actor_sid,parent_epoch,resulting_epoch,reason,statement,signature,created_at FROM device_revocations WHERE user_id=? ORDER BY resulting_epoch,id",
-            (user_id,),
-        ).fetchall()
-        upgrades = c.execute(
-            "SELECT identity_sid,parent_epoch,resulting_epoch,statement,signature,created_at FROM security_upgrades WHERE user_id=? ORDER BY id",
-            (user_id,),
-        ).fetchall()
+    history = c.execute(
+        "SELECT sid,kind,pub_key,sig_pub,fingerprint,trust_state,challenge,approved_by_sid,approved_at,approval_signature,revoked_at,verification_state "
+        "FROM devices WHERE user_id = ? AND (trust_state = 'approved' OR approved_at IS NOT NULL) ORDER BY created_at,id",
+        (user_id,),
+    ).fetchall()
+    approvals = c.execute(
+        "SELECT subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at "
+        "FROM device_approvals WHERE user_id = ? ORDER BY resulting_epoch,id",
+        (user_id,),
+    ).fetchall()
+    revocations = c.execute(
+        "SELECT subject_sid,actor_sid,parent_epoch,resulting_epoch,reason,statement,signature,created_at FROM device_revocations WHERE user_id=? ORDER BY resulting_epoch,id",
+        (user_id,),
+    ).fetchall()
+    upgrades = c.execute(
+        "SELECT identity_sid,parent_epoch,resulting_epoch,statement,signature,created_at FROM security_upgrades WHERE user_id=? ORDER BY id",
+        (user_id,),
+    ).fetchall()
     return {
         "user_id": user_id,
         "identity_sig_pub": user["identity_sig_pub"],
@@ -759,6 +889,11 @@ def get_directory_proof(user_id: int) -> dict[str, Any] | None:
         "revocation_certificates": [dict(row) for row in revocations],
         "security_upgrade_certificates": [dict(row) for row in upgrades],
     }
+
+
+def get_directory_proof(user_id: int) -> dict[str, Any] | None:
+    with read_snapshot() as c:
+        return _get_directory_proof_with_conn(c, user_id)
 
 
 def list_security_events(user_id: int, limit: int = 200, before_id: int | None = None) -> list[dict[str, Any]]:
@@ -915,6 +1050,62 @@ def list_members(conv_id: int) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def get_conversation_directory_snapshot(cid: str) -> dict[str, Any] | None:
+    """Materialize a conversation's members and trust proofs atomically."""
+    with read_snapshot() as c:
+        conv_row = c.execute(
+            "SELECT id, cid, name, synced_contact_name, created_at "
+            "FROM conversations WHERE cid = ?",
+            (cid,),
+        ).fetchone()
+        if not conv_row:
+            return None
+        conv = dict(conv_row)
+        members = [
+            dict(row)
+            for row in c.execute(
+                "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.sig_pub, d.name, d.kind, "
+                "d.session_version, u.security_epoch, u.directory_hash, u.identity_sig_pub "
+                "FROM conversation_members m "
+                "JOIN devices d ON d.user_id = m.user_id "
+                "JOIN users u ON u.id = d.user_id "
+                "WHERE m.conv_id = ? AND d.trust_state = 'approved' "
+                "ORDER BY d.user_id, d.sid, d.id",
+                (conv["id"],),
+            ).fetchall()
+        ]
+        user_ids = [
+            int(row["user_id"])
+            for row in c.execute(
+                "SELECT user_id FROM conversation_members WHERE conv_id = ? "
+                "ORDER BY user_id",
+                (conv["id"],),
+            ).fetchall()
+        ]
+        checkpoints = []
+        proofs = []
+        for user_id in user_ids:
+            user = _get_user_with_conn(c, user_id)
+            if not user:
+                continue
+            checkpoints.append(
+                {
+                    "user_id": user_id,
+                    "identity_sig_pub": user["identity_sig_pub"],
+                    "security_epoch": user["security_epoch"],
+                    "directory_hash": user["directory_hash"],
+                    "security_mode": user["security_mode"],
+                }
+            )
+            proofs.append(_get_directory_proof_with_conn(c, user_id, user=user))
+        return {
+            "conversation": conv,
+            "members": members,
+            "directory_checkpoints": checkpoints,
+            "directory_proofs": proofs,
+        }
+
+
 # ----- messages ---------------------------------------------------------
 
 
@@ -925,6 +1116,33 @@ def next_seq(conv_id: int) -> int:
             (conv_id,),
         ).fetchone()
         return int(row["s"]) + 1
+
+
+def canonical_message_payload(payload: str | dict[str, Any]) -> str:
+    """Return the stable JSON representation used for retry comparisons."""
+    value = json.loads(payload) if isinstance(payload, str) else payload
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def message_retry_matches(
+    existing: dict[str, Any],
+    *,
+    cid: str,
+    payload: str | dict[str, Any],
+    sender_pub_key: str,
+) -> bool:
+    """Check that a reused client_mid is the same security-bound message."""
+    try:
+        return (
+            str(existing["cid"]) == cid
+            and str(existing["sender_pub_key"]) == sender_pub_key
+            and canonical_message_payload(existing["payload"])
+            == canonical_message_payload(payload)
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def insert_message(
@@ -956,15 +1174,19 @@ def insert_message(
                 raise ValueError("sender device is revoked or unknown")
             if client_mid:
                 existing = c.execute(
-                    "SELECT id, seq, conv_id FROM messages "
-                    "WHERE sender_sid = ? AND client_mid = ?",
+                    "SELECT m.id, m.seq, m.conv_id, cv.cid, m.sender_pub_key, m.payload "
+                    "FROM messages m JOIN conversations cv ON cv.id = m.conv_id "
+                    "WHERE m.sender_sid = ? AND m.client_mid = ?",
                     (sender_sid, client_mid),
                 ).fetchone()
                 if existing:
-                    if int(existing["conv_id"]) != conv_id:
-                        raise ValueError(
-                            "client_mid was already used in another conversation"
-                        )
+                    if int(existing["conv_id"]) != conv_id or not message_retry_matches(
+                        dict(existing),
+                        cid=str(existing["cid"]),
+                        payload=payload,
+                        sender_pub_key=str(sender["pub_key"]),
+                    ):
+                        raise ValueError("message id conflicts with original message")
                     c.execute("COMMIT")
                     return int(existing["id"]), int(existing["seq"]), False
             if expected_recipient_sids is not None:
@@ -1010,7 +1232,9 @@ def get_message_by_sender_mid(
 ) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, seq, conv_id FROM messages WHERE sender_sid = ? AND client_mid = ?",
+            "SELECT m.id, m.seq, m.conv_id, cv.cid, m.sender_pub_key, m.payload "
+            "FROM messages m JOIN conversations cv ON cv.id = m.conv_id "
+            "WHERE m.sender_sid = ? AND m.client_mid = ?",
             (sender_sid, client_mid),
         ).fetchone()
         return dict(row) if row else None
@@ -1232,6 +1456,23 @@ def list_member_user_ids(conv_id: int) -> list[int]:
             (conv_id,),
         ).fetchall()
         return [int(r["user_id"]) for r in rows]
+
+
+def is_self_only_conversation_owner(conv_id: int, user_id: int) -> bool:
+    """Return whether ``user_id`` is the conversation's sole member.
+
+    Carrier authorization uses the account membership itself as the ownership
+    boundary.  Device membership alone is insufficient because every approved
+    device of every participant appears in ``list_members``.
+    """
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS member_count, "
+            "COALESCE(MAX(CASE WHEN user_id = ? THEN 1 ELSE 0 END), 0) AS owned "
+            "FROM conversation_members WHERE conv_id = ?",
+            (user_id, conv_id),
+        ).fetchone()
+        return bool(row and int(row["member_count"]) == 1 and int(row["owned"]) == 1)
 
 
 def list_user_device_sids(user_id: int) -> list[str]:

@@ -82,36 +82,42 @@ class SmsReceiver : BroadcastReceiver() {
                 // As the default SMS app, SecureMsg owns provider persistence. Room must
                 // become authoritative before the notification can open the conversation.
                 val providerId = SmsProvider.insertIncoming(context, sender, body, receivedAt)
-                val persisted = IncomingMessageRepository(
-                    db ?: AppDatabase.get(context),
-                ).persist(
+                val activeDb = db ?: AppDatabase.get(context)
+                val content = RelayContentCodec.text(body)
+                val persisted = IncomingMessageRepository(activeDb).persistCarrier(
+                    kind = ProviderIdentity.SMS,
                     direction = "incoming_sms",
                     phoneNumber = sender,
-                    content = RelayContentCodec.text(body),
+                    content = content,
                     providerId = providerId,
                     receivedAt = receivedAt,
                 )
-                SmsNotifier.notifyIncoming(
-                    context = context,
-                    phoneNumber = persisted.conversation.normalizedPhone,
-                    body = body,
-                    date = receivedAt,
-                    cid = persisted.conversation.cid,
-                    messageIdentity = persisted.outbox.mid,
-                )
+                if (persisted?.newlyCreated == true) {
+                    SmsNotifier.notifyIncoming(
+                        context = context,
+                        phoneNumber = persisted.conversation.normalizedPhone,
+                        body = body,
+                        date = receivedAt,
+                        cid = persisted.conversation.cid,
+                        messageIdentity = persisted.outbox.mid,
+                    )
+                }
                 Log.i(
                     "SmsReceiver",
                     "SMS accepted from ${PhoneNumberNormalizer.redact(sender)} (${body.length} chars)",
                 )
 
-                val serviceIntent = Intent(context, SmsBridgeService::class.java).apply {
-                    action = SmsBridgeService.ACTION_INCOMING_SMS
-                    putExtra(SmsBridgeService.EXTRA_PHONE, sender)
-                    putExtra(SmsBridgeService.EXTRA_BODY, body)
-                    putExtra(SmsBridgeService.EXTRA_PROVIDER_ID, providerId ?: -1L)
-                    putExtra(SmsBridgeService.EXTRA_RECEIVED_AT, receivedAt)
+                if (persisted != null) {
+                    val serviceIntent = Intent(context, SmsBridgeService::class.java).apply {
+                        action = SmsBridgeService.ACTION_INCOMING_SMS
+                        putExtra(SmsBridgeService.EXTRA_PHONE, sender)
+                        putExtra(SmsBridgeService.EXTRA_BODY, body)
+                        putExtra(SmsBridgeService.EXTRA_PROVIDER_ID, providerId ?: -1L)
+                        putExtra(SmsBridgeService.EXTRA_PROVIDER_EPOCH, persisted.outbox.providerEpoch)
+                        putExtra(SmsBridgeService.EXTRA_RECEIVED_AT, receivedAt)
+                    }
+                    ContextCompat.startForegroundService(context, serviceIntent)
                 }
-                ContextCompat.startForegroundService(context, serviceIntent)
                 pending.setResultCode(android.app.Activity.RESULT_OK)
             } catch (e: Exception) {
                 Log.e("SmsReceiver", "failed to process SMS_DELIVER", e)

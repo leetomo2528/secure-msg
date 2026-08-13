@@ -52,6 +52,10 @@ export function generateKeypair(): DeviceKeypair {
   };
 }
 
+export function signDetached(message: string, signingSecretKey: string): string {
+  return b64u(sodium.crypto_sign_detached(message, unb64u(signingSecretKey)));
+}
+
 // ----- password hashing (client-side Argon2id over raw password) -------
 
 export async function hashPassword(password: string, saltB64?: string): Promise<string> {

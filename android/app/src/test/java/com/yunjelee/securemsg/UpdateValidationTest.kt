@@ -20,28 +20,76 @@ class UpdateValidationTest {
     }
 
     @Test
-    fun signerDigestsMatchIndependentOfArrayIdentityAndOrder() {
-        val first = byteArrayOf(1, 2, 3)
-        val second = byteArrayOf(4, 5, 6)
+    fun unchangedSingleSignerPasses() {
         assertTrue(
-            UpdateValidation.signersMatch(
-                listOf(first, second),
-                listOf(second.copyOf(), first.copyOf()),
+            UpdateValidation.signingCertificatesMatch(
+                installedCurrentDigests = setOf("A"),
+                installedHasMultipleSigners = false,
+                archiveCurrentDigests = setOf("A"),
+                archiveHasMultipleSigners = false,
+                archiveHistoryDigests = listOf("A"),
             ),
         )
     }
 
     @Test
-    fun signerDigestsRejectDifferentOrMissingCertificates() {
-        assertFalse(
-            UpdateValidation.signersMatch(
-                listOf(byteArrayOf(1, 2, 3)),
-                listOf(byteArrayOf(1, 2, 4)),
+    fun forwardSingleSignerRotationPasses() {
+        assertTrue(
+            UpdateValidation.signingCertificatesMatch(
+                installedCurrentDigests = setOf("A"),
+                installedHasMultipleSigners = false,
+                archiveCurrentDigests = setOf("B"),
+                archiveHasMultipleSigners = false,
+                archiveHistoryDigests = listOf("A", "B"),
             ),
         )
-        assertFalse(UpdateValidation.signersMatch(emptyList(), listOf(byteArrayOf(1))))
-        assertFalse(UpdateValidation.signersMatch(listOf(byteArrayOf(1)), emptyList()))
     }
+
+    @Test
+    fun unrelatedSingleSignerHistoryIsRejected() {
+        assertFalse(singleSignerMatch(installed = "A", current = "C", history = listOf("B", "C")))
+        assertFalse(singleSignerMatch(installed = "A", current = "B", history = emptyList()))
+    }
+
+    @Test
+    fun malformedOrReversedArchiveHistoryIsRejected() {
+        // History is oldest-to-current. Its final entry must be the APK's current signer.
+        assertFalse(singleSignerMatch(installed = "A", current = "B", history = listOf("B", "A")))
+        assertFalse(singleSignerMatch(installed = "A", current = "B", history = listOf("A", "B", "A")))
+        // An APK signed by the old key with no lineage containing installed B is a downgrade.
+        assertFalse(singleSignerMatch(installed = "B", current = "A", history = listOf("A")))
+    }
+
+    @Test
+    fun multipleSignersRequireExactCurrentSet() {
+        assertTrue(multiSignerMatch(setOf("A", "B"), setOf("B", "A")))
+        assertFalse(multiSignerMatch(setOf("A", "B"), setOf("A", "C")))
+        assertFalse(multiSignerMatch(setOf("A", "B"), setOf("A")))
+    }
+
+    @Test
+    fun signerModeMismatchAndMissingSignersAreRejected() {
+        assertFalse(
+            UpdateValidation.signingCertificatesMatch(
+                setOf("A"), false, setOf("A", "B"), true, emptyList(),
+            ),
+        )
+        assertFalse(
+            UpdateValidation.signingCertificatesMatch(
+                emptySet(), false, setOf("A"), false, listOf("A"),
+            ),
+        )
+    }
+
+    private fun singleSignerMatch(installed: String, current: String, history: List<String>) =
+        UpdateValidation.signingCertificatesMatch(
+            setOf(installed), false, setOf(current), false, history,
+        )
+
+    private fun multiSignerMatch(installed: Set<String>, archive: Set<String>) =
+        UpdateValidation.signingCertificatesMatch(
+            installed, true, archive, true, emptyList(),
+        )
 
     @Test
     fun fallbackCanOnlyLaunchOnceAfterSessionSubmission() {

@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -22,7 +23,7 @@ os.environ["SECUREMSG_JWT_SECRET"] = "test-secret-for-unit-tests-32-bytes-minimu
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app, socketio
-from auth import approval_statement, revoke_statement
+from auth import approval_statement, revoke_statement, device_login_statement
 import store
 
 app.config["TESTING"] = True
@@ -113,6 +114,25 @@ class ServerSmokeTest(unittest.TestCase):
             "parent_epoch": registration.json["security_epoch"],
             "signature": signature,
         }
+
+    def device_login(self, sid=None, signing_key=None, **final_overrides):
+        sid = sid or self.sid
+        signing_key = signing_key or self.device_signing_keys[sid]
+        common = {"username": self.username, "pw_hash": self.pw_hash, "sid": sid}
+        challenge = self.client.post("/api/device-login", json=common)
+        self.assertEqual(challenge.status_code, 200, challenge.json)
+        statement = device_login_statement(
+            challenge.json["uid"], sid, challenge.json["challenge_id"],
+            challenge.json["challenge"], challenge.json["session_version"],
+        )
+        proof = base64.urlsafe_b64encode(
+            signing_key.sign(statement.encode()).signature
+        ).decode().rstrip("=")
+        return self.client.post("/api/device-login", json={
+            **common, "challenge_id": challenge.json["challenge_id"],
+            "challenge": challenge.json["challenge"], "proof": proof,
+            **final_overrides,
+        })
 
     def revoke_payload(self, subject_sid, actor_sid):
         subject = store.get_device_by_sid(subject_sid)
@@ -264,14 +284,7 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertFalse(connected.is_connected())
 
         self.assertIsNotNone(store.get_device_by_sid(self.sid))
-        relogin = self.client.post(
-            "/api/device-login",
-            json={
-                "username": self.username,
-                "pw_hash": self.pw_hash,
-                "sid": self.sid,
-            },
-        )
+        relogin = self.device_login()
         self.assertEqual(relogin.status_code, 200, relogin.json)
         restored = self.client.get(
             "/api/devices",
@@ -301,14 +314,7 @@ class ServerSmokeTest(unittest.TestCase):
         first_socket.get_received()
         second_socket.get_received()
 
-        relogin = self.client.post(
-            "/api/device-login",
-            json={
-                "username": self.username,
-                "pw_hash": self.pw_hash,
-                "sid": self.sid,
-            },
-        )
+        relogin = self.device_login()
         self.assertEqual(relogin.status_code, 200, relogin.json)
         self.assertNotEqual(relogin.json["token"], self.token)
 
@@ -339,6 +345,82 @@ class ServerSmokeTest(unittest.TestCase):
         first_socket.emit("message_send", {}, callback=True)
         self.assertFalse(first_socket.is_connected())
         second_socket.disconnect()
+
+    def test_device_login_cannot_issue_token_after_concurrent_revoke(self):
+        original_consume = store.consume_device_login_challenge
+
+        def revoke_then_consume(challenge_id, challenge, device_id, user_id, sid, session_version):
+            with store.conn_ctx() as conn:
+                conn.execute(
+                    "UPDATE devices SET trust_state='revoked', revoked_at=?, "
+                    "session_version=session_version+1 WHERE id=? AND user_id=?",
+                    (store.now(), device_id, user_id),
+                )
+            return original_consume(challenge_id, challenge, device_id, user_id, sid, session_version)
+
+        with mock.patch.object(
+            store, "consume_device_login_challenge", side_effect=revoke_then_consume
+        ), mock.patch("auth.issue_jwt", wraps=__import__("auth").issue_jwt) as issue:
+            relogin = self.device_login()
+
+        self.assertEqual(relogin.status_code, 403, relogin.json)
+        self.assertEqual(relogin.json["error"], "device revoked")
+        issue.assert_not_called()
+
+    def test_device_login_requires_valid_one_time_device_key_proof(self):
+        common = {"username": self.username, "pw_hash": self.pw_hash, "sid": self.sid}
+        proofless = self.client.post("/api/device-login", json={**common, "challenge_id": "x"})
+        self.assertEqual(proofless.status_code, 400, proofless.json)
+
+        challenge = self.client.post("/api/device-login", json=common).json
+        statement = device_login_statement(
+            self.uid, self.sid, challenge["challenge_id"], challenge["challenge"], challenge["session_version"]
+        )
+        wrong = SigningKey(bytes([99]) * 32)
+        wrong_proof = base64.urlsafe_b64encode(wrong.sign(statement.encode()).signature).decode().rstrip("=")
+        denied = self.client.post("/api/device-login", json={
+            **common, "challenge_id": challenge["challenge_id"], "challenge": challenge["challenge"], "proof": wrong_proof,
+        })
+        self.assertEqual(denied.status_code, 401, denied.json)
+
+        valid_proof = base64.urlsafe_b64encode(self.signing_key.sign(statement.encode()).signature).decode().rstrip("=")
+        body = {**common, "challenge_id": challenge["challenge_id"], "challenge": challenge["challenge"], "proof": valid_proof}
+        accepted = self.client.post("/api/device-login", json=body)
+        self.assertEqual(accepted.status_code, 200, accepted.json)
+        replay = self.client.post("/api/device-login", json=body)
+        self.assertIn(replay.status_code, (401, 409), replay.json)
+
+    def test_device_login_rejects_tampered_challenge_and_stale_session(self):
+        common = {"username": self.username, "pw_hash": self.pw_hash, "sid": self.sid}
+        challenge = self.client.post("/api/device-login", json=common).json
+        statement = device_login_statement(
+            self.uid, self.sid, challenge["challenge_id"], challenge["challenge"], challenge["session_version"]
+        )
+        proof = base64.urlsafe_b64encode(self.signing_key.sign(statement.encode()).signature).decode().rstrip("=")
+        tampered = "A" * 43
+        denied = self.client.post("/api/device-login", json={
+            **common, "challenge_id": challenge["challenge_id"], "challenge": tampered, "proof": proof,
+        })
+        self.assertEqual(denied.status_code, 401, denied.json)
+        store.rotate_device_session(store.get_device_by_sid(self.sid)["id"], self.uid)
+        stale = self.client.post("/api/device-login", json={
+            **common, "challenge_id": challenge["challenge_id"], "challenge": challenge["challenge"], "proof": proof,
+        })
+        self.assertEqual(stale.status_code, 401, stale.json)
+
+    def test_message_delivered_rejects_bool_and_malformed_sequences(self):
+        client_socket = socketio.test_client(app, auth={"token": self.token})
+        self.assertTrue(client_socket.is_connected())
+
+        with mock.patch.object(store, "set_cursor") as set_cursor:
+            for invalid_seq in (True, False, 1.5, "1.0", " 1", {}, None):
+                client_socket.emit(
+                    "message_delivered",
+                    {"cid": "any-conversation", "seq": invalid_seq},
+                )
+
+        set_cursor.assert_not_called()
+        client_socket.disconnect()
 
     def test_logout_rejects_missing_malformed_and_old_format_tokens(self):
         missing = self.client.post("/api/logout")
@@ -436,6 +518,16 @@ class ServerSmokeTest(unittest.TestCase):
                         "SELECT session_version FROM devices WHERE id = 1"
                     ).fetchone()[0]
             self.assertIn("session_version", columns)
+            with store.conn_ctx() as connection:
+                challenge_columns = {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(device_login_challenges)"
+                    ).fetchall()
+                }
+            self.assertEqual(
+                {"challenge_id", "user_id", "device_id", "sid", "challenge", "session_version", "expires_at", "consumed_at", "created_at"},
+                challenge_columns,
+            )
             self.assertEqual(version, 1)
 
     def test_history_payload_is_a_json_object(self):
@@ -610,6 +702,147 @@ class ServerSmokeTest(unittest.TestCase):
         first_socket.disconnect()
         second_socket.disconnect()
 
+    def test_socket_fanout_skips_device_revoked_after_message_commit(self):
+        second = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "revoke-race-recipient",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            },
+        )
+        created = self.create_conversation()
+        sender_socket = socketio.test_client(app, auth={"token": self.token})
+        revoked_socket = socketio.test_client(
+            app, auth={"token": second.json["token"]}
+        )
+        self.assertTrue(sender_socket.is_connected())
+        self.assertTrue(revoked_socket.is_connected())
+        sender_socket.get_received()
+        revoked_socket.get_received()
+
+        payload = {
+            "ct": "A" * 22,
+            "nonce": "A" * 32,
+            "keys": {
+                self.sid: {"ek": "A" * 64, "n": "A" * 32},
+                second.json["sid"]: {"ek": "B" * 64, "n": "B" * 32},
+            },
+        }
+        committed = threading.Event()
+        revoked = threading.Event()
+        original_insert = store.insert_message
+
+        def insert_then_wait_for_revoke(*args, **kwargs):
+            result = original_insert(*args, **kwargs)
+            committed.set()
+            if not revoked.wait(timeout=5):
+                raise AssertionError("revoke barrier timed out")
+            return result
+
+        result = {}
+
+        def send_message():
+            result["ack"] = sender_socket.emit(
+                "message_send",
+                {
+                    "cid": created["cid"],
+                    "mid": "revoke-race-message-0001",
+                    "payload": payload,
+                },
+                callback=True,
+            )
+
+        with mock.patch(
+            "sockets.store.insert_message", side_effect=insert_then_wait_for_revoke
+        ):
+            send_thread = threading.Thread(target=send_message)
+            send_thread.start()
+            self.assertTrue(committed.wait(timeout=5), "message commit barrier timed out")
+            with store.conn_ctx() as connection:
+                connection.execute(
+                    "UPDATE devices SET trust_state='revoked', revoked_at=?, "
+                    "session_version=session_version+1 WHERE sid=?",
+                    (store.now(), second.json["sid"]),
+                )
+            revoked.set()
+            send_thread.join(timeout=5)
+
+        self.assertFalse(send_thread.is_alive(), "message sender thread timed out")
+        self.assertTrue(result["ack"]["ok"], result["ack"])
+        revoked_events = [
+            event
+            for event in revoked_socket.get_received()
+            if event["name"] == "message_new"
+        ]
+        self.assertEqual(revoked_events, [])
+        sender_events = [
+            event
+            for event in sender_socket.get_received()
+            if event["name"] == "message_new"
+        ]
+        self.assertEqual(len(sender_events), 1, sender_events)
+        sender_socket.disconnect()
+        revoked_socket.disconnect()
+
+    def test_message_retry_rejects_changed_payload_or_cid(self):
+        created = self.create_conversation()
+        other = self.create_conversation("+821012345679")
+        socket_client = socketio.test_client(app, auth={"token": self.token})
+        payload = {
+            "ct": "A" * 22,
+            "nonce": "A" * 32,
+            "keys": {self.sid: {"ek": "A" * 64, "n": "A" * 32}},
+        }
+        first = socket_client.emit(
+            "message_send",
+            {
+                "cid": created["cid"],
+                "mid": "retry-binding-test-0001",
+                "payload": payload,
+            },
+            callback=True,
+        )
+        self.assertTrue(first["ok"], first)
+
+        # JSON object ordering is not part of the encrypted envelope identity.
+        reordered = {
+            "keys": {self.sid: {"n": "A" * 32, "ek": "A" * 64}},
+            "nonce": "A" * 32,
+            "ct": "A" * 22,
+        }
+        identical = socket_client.emit(
+            "message_send",
+            {
+                "cid": created["cid"],
+                "mid": "retry-binding-test-0001",
+                "payload": reordered,
+            },
+            callback=True,
+        )
+        self.assertTrue(identical["ok"], identical)
+        self.assertTrue(identical["duplicate"], identical)
+        self.assertEqual(identical["id"], first["id"])
+
+        changed_payload = dict(payload)
+        changed_payload["ct"] = "B" * 22
+        for cid, candidate in (
+            (created["cid"], changed_payload),
+            (other["cid"], payload),
+        ):
+            conflict = socket_client.emit(
+                "message_send",
+                {"cid": cid, "mid": "retry-binding-test-0001", "payload": candidate},
+                callback=True,
+            )
+            self.assertEqual(
+                conflict,
+                {"ok": False, "error": "message id conflicts with original message"},
+            )
+
+        socket_client.disconnect()
+
     def test_insert_rejects_stale_device_snapshot_atomically(self):
         import json
 
@@ -736,6 +969,21 @@ class ServerSmokeTest(unittest.TestCase):
         )
         self.assertTrue(ack["ok"], ack)
 
+        for invalid_seq in (True, False, 1.5, "1.0", " 1", {}, None):
+            malformed = gateway_socket.emit(
+                "carrier_status",
+                {
+                    "cid": created["cid"],
+                    "seq": invalid_seq,
+                    "status": "sent",
+                },
+                callback=True,
+            )
+            self.assertEqual(
+                malformed,
+                {"ok": False, "error": "invalid sequence"},
+            )
+
         rejected = web_socket.emit(
             "carrier_status",
             {"cid": created["cid"], "seq": ack["seq"], "status": "sent"},
@@ -759,6 +1007,119 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(history.json["messages"][0]["carrier_status"], "sent")
         gateway_socket.disconnect()
         web_socket.disconnect()
+
+    def test_participant_gateway_cannot_mutate_carrier_status(self):
+        alice_gateway = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "alice-carrier-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "C" * 43,
+                "sig_pub": "D" * 43,
+            },
+        )
+        bob_username = "bob_" + hashlib.sha256(
+            self._testMethodName.encode()
+        ).hexdigest()[:12]
+        registered = self.client.post(
+            "/api/register",
+            json={"username": bob_username, "pw_hash": self.pw_hash},
+        )
+        self.assertEqual(registered.status_code, 200, registered.json)
+        bob_gateway = self.client.post(
+            "/api/device-register",
+            json={
+                "username": bob_username,
+                "pw_hash": self.pw_hash,
+                "device_name": "bob-carrier-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "E" * 43,
+                "sig_pub": "F" * 43,
+            },
+        )
+        self.assertEqual(bob_gateway.status_code, 200, bob_gateway.json)
+        self.assertEqual(bob_gateway.json["trust_state"], "approved")
+
+        multi = self.client.post(
+            "/api/conversation",
+            headers=self.headers,
+            json={"members": [bob_username], "name": "+821055500000"},
+        )
+        self.assertEqual(multi.status_code, 200, multi.json)
+        alice_socket = socketio.test_client(app, auth={"token": self.token})
+        bob_gateway_socket = socketio.test_client(
+            app, auth={"token": bob_gateway.json["token"]}
+        )
+        payload = {
+            "ct": "A" * 22,
+            "nonce": "A" * 32,
+            "keys": {
+                self.sid: {"ek": "A" * 64, "n": "A" * 32},
+                alice_gateway.json["sid"]: {"ek": "B" * 64, "n": "B" * 32},
+                bob_gateway.json["sid"]: {"ek": "C" * 64, "n": "C" * 32},
+            },
+        }
+        sent = alice_socket.emit(
+            "message_send",
+            {
+                "cid": multi.json["cid"],
+                "mid": "participant-gateway-test-01",
+                "payload": payload,
+            },
+            callback=True,
+        )
+        self.assertTrue(sent["ok"], sent)
+
+        rejected = bob_gateway_socket.emit(
+            "carrier_status",
+            {"cid": multi.json["cid"], "seq": sent["seq"], "status": "sent"},
+            callback=True,
+        )
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertEqual(
+            rejected["error"], "gateway does not own a self-only conversation"
+        )
+        history = self.client.get(
+            f"/api/conversation/{multi.json['cid']}/messages?since=0&limit=20",
+            headers=self.headers,
+        )
+        self.assertEqual(history.status_code, 200, history.json)
+        self.assertEqual(history.json["messages"][0]["carrier_status"], "none")
+
+        owned = self.create_conversation("+821055500001")
+        owned_payload = {
+            "ct": "A" * 22,
+            "nonce": "A" * 32,
+            "keys": {
+                self.sid: {"ek": "A" * 64, "n": "A" * 32},
+                alice_gateway.json["sid"]: {"ek": "B" * 64, "n": "B" * 32},
+            },
+        }
+        owned_sent = alice_socket.emit(
+            "message_send",
+            {
+                "cid": owned["cid"],
+                "mid": "owned-gateway-status-test-01",
+                "payload": owned_payload,
+            },
+            callback=True,
+        )
+        self.assertTrue(owned_sent["ok"], owned_sent)
+        alice_gateway_socket = socketio.test_client(
+            app, auth={"token": alice_gateway.json["token"]}
+        )
+        accepted = alice_gateway_socket.emit(
+            "carrier_status",
+            {"cid": owned["cid"], "seq": owned_sent["seq"], "status": "sent"},
+            callback=True,
+        )
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(accepted["carrier_status"], "sent")
+
+        alice_gateway_socket.disconnect()
+        bob_gateway_socket.disconnect()
+        alice_socket.disconnect()
 
     def test_terminal_carrier_status_cannot_regress(self):
         import json

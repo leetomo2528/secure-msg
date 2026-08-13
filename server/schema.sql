@@ -47,6 +47,22 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 
+-- Short-lived, durable one-time proofs used to recover a JWT for an existing
+-- device. Rows are retained after use so replay attempts fail across restarts.
+CREATE TABLE IF NOT EXISTS device_login_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    sid TEXT NOT NULL,
+    challenge TEXT NOT NULL,
+    session_version INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device
+    ON device_login_challenges(device_id, created_at);
+
 CREATE TABLE IF NOT EXISTS device_approvals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

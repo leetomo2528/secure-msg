@@ -7,6 +7,7 @@ import android.provider.BaseColumns
 import android.provider.Telephony
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 
 data class ProviderMmsPart(
     val name: String,
@@ -28,6 +29,14 @@ object MmsProvider {
     private const val TAG = "MmsProvider"
     private const val MAX_PART_BYTES = RelayContentCodec.MAX_ATTACHMENT_BYTES
     private const val MMS_FROM_TYPE = 137
+
+    internal fun normalizePartContentType(value: String?): String {
+        val mediaType = value.orEmpty().substringBefore(';').trim().lowercase(Locale.ROOT)
+        return mediaType.takeIf {
+            it.length <= 120 &&
+                it.matches(Regex("[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+"))
+        } ?: "application/octet-stream"
+    }
 
     fun createDownloadTarget(context: Context): Pair<Long, android.net.Uri>? {
         return try {
@@ -106,8 +115,9 @@ object MmsProvider {
                 while (cursor.moveToNext() && inspectedParts < 64) {
                     inspectedParts += 1
                     val partId = cursor.getLong(idCol)
-                    val contentType = if (typeCol >= 0) cursor.getString(typeCol).orEmpty()
-                    else "application/octet-stream"
+                    val contentType = normalizePartContentType(
+                        if (typeCol >= 0) cursor.getString(typeCol) else null,
+                    )
                     val text = if (textCol >= 0) cursor.getString(textCol).orEmpty() else ""
                     if (contentType.startsWith("text/")) {
                         val decodedText = if (text.isNotEmpty()) {

@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.BuildConfig
 import com.yunjelee.securemsg.Credentials
 import com.yunjelee.securemsg.CryptoUtil
+import com.yunjelee.securemsg.DeviceLoginStatement
 import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.SavedCredentials
 import com.yunjelee.securemsg.ServerConfig
@@ -247,12 +248,28 @@ internal suspend fun doLogin(
         )
     }
     if (stored != null && stored.username == username) {
-        val r = api.deviceLogin(username, pwHash, stored.sid)
+        val challenge = api.deviceLoginChallenge(username, pwHash, stored.sid)
+        val r = if (challenge.optBoolean("ok")) {
+            val statement = DeviceLoginStatement(
+                challenge.getLong("uid"), stored.sid, challenge.getString("challenge_id"),
+                challenge.getString("challenge"), challenge.getLong("session_version"),
+            ).canonical()
+            val proof = CryptoUtil.signDetached(
+                statement.toByteArray(Charsets.UTF_8), stored.keypair.signSk,
+            )
+            api.deviceLoginProof(
+                username, pwHash, stored.sid, challenge.getString("challenge_id"),
+                challenge.getString("challenge"), proof,
+            )
+        } else challenge
         if (r.optBoolean("ok")) {
             api.token = r.getString("token")
             val saved = stored.copy(token = r.getString("token"))
             Credentials.save(context, saved)
             return saved
+        }
+        if (r.optString("error") !in setOf("device not found", "device revoked")) {
+            throw Exception(r.optString("error", "device login failed"))
         }
     }
 

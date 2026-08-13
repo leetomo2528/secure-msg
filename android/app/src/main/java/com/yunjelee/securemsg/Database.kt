@@ -77,9 +77,27 @@ data class BlockedSender(
     val createdAt: Long = System.currentTimeMillis(),
 )
 
-@Entity(tableName = "processed_sms")
+@Entity(tableName = "processed_sms", primaryKeys = ["providerEpoch", "providerId"])
 data class ProcessedSms(
-    @PrimaryKey val providerId: Long,
+    val providerEpoch: Long = 0,
+    val providerId: Long,
+    val sourceFingerprint: String? = null,
+    val processedAt: Long = System.currentTimeMillis(),
+)
+
+/** Monotonic namespace for carrier-provider row ids, independent for SMS and MMS. */
+@Entity(tableName = "carrier_provider_state")
+data class CarrierProviderState(
+    @PrimaryKey val kind: String,
+    val epoch: Long = 0,
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/** ACK-completed carrier event, including broadcasts that had no provider row id. */
+@Entity(tableName = "processed_carrier_events", primaryKeys = ["kind", "eventKey"])
+data class ProcessedCarrierEvent(
+    val kind: String,
+    val eventKey: String,
     val processedAt: Long = System.currentTimeMillis(),
 )
 
@@ -133,7 +151,11 @@ data class RelayReceipt(
  * for local presentation after a relay ACK and never leaves the device in clear. */
 @Entity(
     tableName = "relay_outbox",
-    indices = [Index(value = ["mid"], unique = true), Index(value = ["relayState", "createdAt"])]
+    indices = [
+        Index(value = ["mid"], unique = true),
+        Index(value = ["relayState", "createdAt"]),
+        Index(value = ["direction", "providerEpoch", "providerId"]),
+    ]
 )
 data class RelayOutbox(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -145,7 +167,10 @@ data class RelayOutbox(
     val subject: String? = null,
     val attachmentsJson: String? = null,
     val phoneNumber: String,
+    val providerEpoch: Long = 0,
     val providerId: Long? = null,
+    val sourceFingerprint: String? = null,
+    val sourceEventKey: String? = null,
     val localMessageId: Long? = null,
     val direction: String = "incoming_sms",
     val carrierState: String = "not_applicable",
@@ -158,9 +183,11 @@ data class RelayOutbox(
     val createdAt: Long = System.currentTimeMillis(),
 )
 
-@Entity(tableName = "processed_mms")
+@Entity(tableName = "processed_mms", primaryKeys = ["providerEpoch", "providerId"])
 data class ProcessedMms(
-    @PrimaryKey val providerId: Long,
+    val providerEpoch: Long = 0,
+    val providerId: Long,
+    val sourceFingerprint: String? = null,
     val processedAt: Long = System.currentTimeMillis(),
 )
 
@@ -224,6 +251,9 @@ interface MessageDao {
 
     @Query("SELECT * FROM messages WHERE id = :id")
     suspend fun getById(id: Long): MessageRow?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE serverKey = :serverKey)")
+    suspend fun hasServerKey(serverKey: String): Boolean
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(msg: MessageRow): Long
@@ -322,8 +352,17 @@ interface BlockedSenderDao {
 
 @Dao
 interface ProcessedSmsDao {
-    @Query("SELECT EXISTS(SELECT 1 FROM processed_sms WHERE providerId = :providerId)")
-    suspend fun contains(providerId: Long): Boolean
+    @Query("SELECT EXISTS(SELECT 1 FROM processed_sms WHERE providerEpoch = :providerEpoch AND providerId = :providerId)")
+    suspend fun contains(providerEpoch: Long, providerId: Long): Boolean
+
+    @Query("SELECT * FROM processed_sms WHERE providerEpoch = :providerEpoch AND providerId = :providerId")
+    suspend fun get(providerEpoch: Long, providerId: Long): ProcessedSms?
+
+    @Query("SELECT * FROM processed_sms WHERE providerId = :providerId ORDER BY providerEpoch DESC")
+    suspend fun history(providerId: Long): List<ProcessedSms>
+
+    @Query("SELECT * FROM processed_sms WHERE sourceFingerprint = :fingerprint ORDER BY processedAt DESC LIMIT 1")
+    suspend fun findByFingerprint(fingerprint: String): ProcessedSms?
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(row: ProcessedSms)
@@ -406,7 +445,7 @@ interface RelayReceiptDao {
     @Query("UPDATE relay_receipts SET status = :status, lastError = :error, statusSynced = 0, sentAt = CASE WHEN :status IN ('sent','delivered') THEN COALESCE(sentAt, :now) ELSE sentAt END, deliveredAt = CASE WHEN :status = 'delivered' THEN :now ELSE deliveredAt END WHERE cid = :cid AND seq = :seq")
     suspend fun markStatus(cid: String, seq: Int, status: String, error: String?, now: Long = System.currentTimeMillis())
 
-    @Query("SELECT * FROM relay_receipts WHERE status != 'claimed' AND statusSynced = 0 ORDER BY claimedAt ASC LIMIT :limit")
+    @Query("SELECT * FROM relay_receipts WHERE status NOT IN ('claimed','attempting') AND statusSynced = 0 ORDER BY claimedAt ASC LIMIT :limit")
     suspend fun pendingStatuses(limit: Int = 100): List<RelayReceipt>
 
     @Query("UPDATE relay_receipts SET statusSynced = 1 WHERE cid = :cid AND seq = :seq AND status = :status")
@@ -421,8 +460,25 @@ interface RelayOutboxDao {
     @Query("SELECT * FROM relay_outbox WHERE mid = :mid LIMIT 1")
     suspend fun getByMid(mid: String): RelayOutbox?
 
-    @Query("SELECT * FROM relay_outbox WHERE providerId = :providerId AND direction = :direction LIMIT 1")
-    suspend fun getByProviderId(providerId: Long, direction: String): RelayOutbox?
+    @Query("SELECT EXISTS(SELECT 1 FROM relay_outbox WHERE cid = :cid AND serverSeq = :seq AND relayState = 'sent')")
+    suspend fun hasAcknowledgedSequence(cid: String, seq: Int): Boolean
+
+    @Query("SELECT * FROM relay_outbox WHERE providerEpoch = :providerEpoch AND providerId = :providerId AND direction = :direction LIMIT 1")
+    suspend fun getByProviderId(providerEpoch: Long, providerId: Long, direction: String): RelayOutbox?
+
+    @Query("SELECT * FROM relay_outbox WHERE providerId = :providerId AND direction = :direction ORDER BY providerEpoch DESC, id DESC")
+    suspend fun providerHistory(providerId: Long, direction: String): List<RelayOutbox>
+
+    @Query("SELECT * FROM relay_outbox WHERE sourceEventKey = :eventKey AND direction = :direction ORDER BY id DESC LIMIT 1")
+    suspend fun findBySourceEventKey(eventKey: String, direction: String): RelayOutbox?
+
+    @Query("UPDATE relay_outbox SET providerEpoch = :providerEpoch, providerId = :providerId, sourceFingerprint = :sourceFingerprint WHERE id = :id AND providerId IS NULL")
+    suspend fun aliasProviderIdentity(
+        id: Long,
+        providerEpoch: Long,
+        providerId: Long,
+        sourceFingerprint: String,
+    ): Int
 
     @Insert
     suspend fun insert(row: RelayOutbox): Long
@@ -457,11 +513,58 @@ interface RelayOutboxDao {
 
 @Dao
 interface ProcessedMmsDao {
-    @Query("SELECT EXISTS(SELECT 1 FROM processed_mms WHERE providerId = :providerId)")
-    suspend fun contains(providerId: Long): Boolean
+    @Query("SELECT EXISTS(SELECT 1 FROM processed_mms WHERE providerEpoch = :providerEpoch AND providerId = :providerId)")
+    suspend fun contains(providerEpoch: Long, providerId: Long): Boolean
+
+    @Query("SELECT * FROM processed_mms WHERE providerEpoch = :providerEpoch AND providerId = :providerId")
+    suspend fun get(providerEpoch: Long, providerId: Long): ProcessedMms?
+
+    @Query("SELECT * FROM processed_mms WHERE providerId = :providerId ORDER BY providerEpoch DESC")
+    suspend fun history(providerId: Long): List<ProcessedMms>
+
+    @Query("SELECT * FROM processed_mms WHERE sourceFingerprint = :fingerprint ORDER BY processedAt DESC LIMIT 1")
+    suspend fun findByFingerprint(fingerprint: String): ProcessedMms?
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(row: ProcessedMms)
+}
+
+@Dao
+interface CarrierProviderStateDao {
+    @Query("SELECT * FROM carrier_provider_state WHERE kind = :kind")
+    suspend fun get(kind: String): CarrierProviderState?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(state: CarrierProviderState): Long
+
+    @Query("UPDATE carrier_provider_state SET epoch = epoch + 1, updatedAt = :updatedAt WHERE kind = :kind")
+    suspend fun increment(kind: String, updatedAt: Long = System.currentTimeMillis()): Int
+
+    @Transaction
+    suspend fun currentEpoch(kind: String): Long {
+        insertIfAbsent(CarrierProviderState(kind = kind))
+        return requireNotNull(get(kind)).epoch
+    }
+
+    /** Explicit reset-evidence API. Callers must not infer resets from weak provider observations. */
+    @Transaction
+    suspend fun rotateEpoch(kind: String): Long {
+        insertIfAbsent(CarrierProviderState(kind = kind))
+        check(increment(kind) == 1)
+        return requireNotNull(get(kind)).epoch
+    }
+}
+
+@Dao
+interface ProcessedCarrierEventDao {
+    @Query("SELECT EXISTS(SELECT 1 FROM processed_carrier_events WHERE kind = :kind AND eventKey = :eventKey)")
+    suspend fun contains(kind: String, eventKey: String): Boolean
+
+    @Query("SELECT * FROM processed_carrier_events WHERE kind = :kind AND eventKey = :eventKey")
+    suspend fun get(kind: String, eventKey: String): ProcessedCarrierEvent?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(row: ProcessedCarrierEvent): Long
 }
 
 @Dao
@@ -494,8 +597,10 @@ interface CarrierPartResultDao {
         CarrierPartResult::class,
         TrustedDevicePin::class,
         TrustDirectoryState::class,
+        CarrierProviderState::class,
+        ProcessedCarrierEvent::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -511,6 +616,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun processedMmsDao(): ProcessedMmsDao
     abstract fun carrierPartResultDao(): CarrierPartResultDao
     abstract fun deviceTrustDao(): DeviceTrustDao
+    abstract fun carrierProviderStateDao(): CarrierProviderStateDao
+    abstract fun processedCarrierEventDao(): ProcessedCarrierEventDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -528,6 +635,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_7_8,
                     MIGRATION_8_9,
                     MIGRATION_9_10,
+                    MIGRATION_10_11,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -724,6 +832,67 @@ abstract class AppDatabase : RoomDatabase() {
                         "safetyNumber TEXT NOT NULL," +
                         "updatedAt INTEGER NOT NULL)",
                 )
+            }
+        }
+
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS carrier_provider_state (" +
+                        "kind TEXT NOT NULL PRIMARY KEY," +
+                        "epoch INTEGER NOT NULL," +
+                        "updatedAt INTEGER NOT NULL)",
+                )
+                db.execSQL(
+                    "INSERT OR IGNORE INTO carrier_provider_state(kind, epoch, updatedAt) " +
+                        "VALUES ('sms', 0, 0), ('mms', 0, 0)",
+                )
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS processed_carrier_events (" +
+                        "kind TEXT NOT NULL," +
+                        "eventKey TEXT NOT NULL," +
+                        "processedAt INTEGER NOT NULL," +
+                        "PRIMARY KEY(kind, eventKey))",
+                )
+
+                db.execSQL(
+                    "CREATE TABLE processed_sms_v11 (" +
+                        "providerEpoch INTEGER NOT NULL," +
+                        "providerId INTEGER NOT NULL," +
+                        "sourceFingerprint TEXT," +
+                        "processedAt INTEGER NOT NULL," +
+                        "PRIMARY KEY(providerEpoch, providerId))",
+                )
+                db.execSQL(
+                    "INSERT INTO processed_sms_v11(providerEpoch, providerId, sourceFingerprint, processedAt) " +
+                        "SELECT 0, providerId, NULL, processedAt FROM processed_sms",
+                )
+                db.execSQL("DROP TABLE processed_sms")
+                db.execSQL("ALTER TABLE processed_sms_v11 RENAME TO processed_sms")
+
+                db.execSQL(
+                    "CREATE TABLE processed_mms_v11 (" +
+                        "providerEpoch INTEGER NOT NULL," +
+                        "providerId INTEGER NOT NULL," +
+                        "sourceFingerprint TEXT," +
+                        "processedAt INTEGER NOT NULL," +
+                        "PRIMARY KEY(providerEpoch, providerId))",
+                )
+                db.execSQL(
+                    "INSERT INTO processed_mms_v11(providerEpoch, providerId, sourceFingerprint, processedAt) " +
+                        "SELECT 0, providerId, NULL, processedAt FROM processed_mms",
+                )
+                db.execSQL("DROP TABLE processed_mms")
+                db.execSQL("ALTER TABLE processed_mms_v11 RENAME TO processed_mms")
+
+                // ALTER preserves every outbox cell, especially the legacy MID and payload.
+                db.execSQL("ALTER TABLE relay_outbox ADD COLUMN providerEpoch INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE relay_outbox ADD COLUMN sourceFingerprint TEXT")
+            db.execSQL("ALTER TABLE relay_outbox ADD COLUMN sourceEventKey TEXT")
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_relay_outbox_direction_providerEpoch_providerId " +
+                    "ON relay_outbox(direction, providerEpoch, providerId)",
+            )
             }
         }
     }

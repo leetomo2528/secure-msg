@@ -83,7 +83,7 @@ class DeviceTrustTest {
     }
 
     @Test fun claimedDirectoryHashMustMatchCanonicalDirectory() {
-        val original = snapshot(4, listOf(descriptor("device_a", one, two)))
+        val original = snapshot(1, listOf(descriptor("device_a", one, two)))
         val valid = original.copy(claimedDirectoryHash = DeviceTrustCrypto.directoryHash(original))
         assertTrue(TrustDirectoryValidator.validate(valid, null, emptyList()) is TrustDecision.Accept)
         assertRejects("hash mismatch", original.copy(claimedDirectoryHash = zero), null, emptyList())
@@ -98,16 +98,16 @@ class DeviceTrustTest {
     }
 
     @Test fun firstUseIsAcceptedButUnsignedNewDeviceIsRejected() {
-        val initial = snapshot(4, listOf(descriptor("device_a", one, two)))
+        val initial = snapshot(1, listOf(descriptor("device_a", one, two)))
         val first = TrustDirectoryValidator.validate(initial, null, emptyList())
         assertTrue(first is TrustDecision.Accept && first.firstUse)
         val state = stateFor(initial)
         val pin = pinFor(initial.devices.single())
-        val next = snapshot(5, initial.devices + descriptor("device_b", two, one))
+        val next = snapshot(2, initial.devices + descriptor("device_b", two, one))
         assertTrue(TrustDirectoryValidator.validate(next, state, listOf(pin)) is TrustDecision.Reject)
     }
 
-    @Test fun approvalCertificateChainAndTamperAreVerified() {
+    @Test fun lateStartApprovalCertificateChainAndTamperAreVerified() {
         val bootstrap = descriptor("device_a", one, two)
         val subject = descriptor("device_b", two, one)
         val base = TrustedDirectorySnapshot(42, two, 5, listOf(bootstrap, subject))
@@ -134,6 +134,59 @@ class DeviceTrustTest {
             proof.copy(approvalCertificates = proof.approvalCertificates.map { it.copy(statement = it.statement + "x") }),
             snapshot, false,
         ) { _, _, _ -> true }!!.contains("invalid"))
+    }
+
+    @Test fun inflatedVerifiedEpochAfterCertificateChainIsRejected() {
+        val bootstrap = descriptor("device_a", one, two)
+        val subject = descriptor("device_b", two, one)
+        val base = TrustedDirectorySnapshot(42, two, 6, listOf(bootstrap, subject))
+        val hash = DeviceTrustCrypto.directoryHash(base)
+        val approval = DeviceApprovalStatement(
+            42, subject.sid, subject.pubKey, subject.sigPub, subject.kind, zero, 4,
+        )
+        val signature = CryptoUtil.b64u(ByteArray(64))
+        val proof = DirectoryProof(
+            42, two, 6, hash, 1,
+            listOf(
+                DeviceHistoryEntry(
+                    bootstrap.sid, bootstrap.kind, bootstrap.pubKey, bootstrap.sigPub,
+                    "approved", zero, bootstrap.sid, null,
+                ),
+                DeviceHistoryEntry(
+                    subject.sid, subject.kind, subject.pubKey, subject.sigPub,
+                    "approved", zero, bootstrap.sid, signature,
+                ),
+            ),
+            listOf(
+                ApprovalCertificate(
+                    subject.sid, bootstrap.sid, 4, 5, approval.canonical(), signature,
+                ),
+            ),
+        )
+        val snapshot = base.copy(claimedDirectoryHash = hash, proof = proof)
+
+        assertEquals(
+            "certificate epoch does not match directory epoch",
+            verifyDirectoryProof(proof, snapshot, false) { _, _, _ -> true },
+        )
+    }
+
+    @Test fun rootOnlyVerifiedDirectoryRequiresEpochOne() {
+        val accepted = snapshot(1, listOf(descriptor("device_a", one, two)))
+        assertEquals(null, verifyDirectoryProof(accepted.proof!!, accepted, true))
+
+        val inflated = snapshot(2, accepted.devices)
+        assertEquals(
+            "root-only verified directory must have security epoch 1",
+            verifyDirectoryProof(inflated.proof!!, inflated, true),
+        )
+    }
+
+    @Test fun legacyRootOnlyDirectoryKeepsArbitraryEpochCompatibility() {
+        val legacy = snapshot(
+            7, listOf(descriptor("device_a", one, two)), securityMode = "legacy_v1",
+        )
+        assertEquals(null, verifyDirectoryProof(legacy.proof!!, legacy, true))
     }
 
     @Test fun rollbackAndSameEpochEquivocationAreRejected() {
@@ -170,7 +223,11 @@ class DeviceTrustTest {
     private fun descriptor(sid: String, box: String, sign: String) =
         TrustedDeviceDescriptor(sid, box, sign, "android_gateway", sid)
 
-    private fun snapshot(epoch: Long, devices: List<TrustedDeviceDescriptor>): TrustedDirectorySnapshot {
+    private fun snapshot(
+        epoch: Long,
+        devices: List<TrustedDeviceDescriptor>,
+        securityMode: String = "verified_v2",
+    ): TrustedDirectorySnapshot {
         val base = TrustedDirectorySnapshot(42, two, epoch, devices)
         val hash = DeviceTrustCrypto.directoryHash(base)
         val history = devices.mapIndexed { index, d ->
@@ -179,7 +236,9 @@ class DeviceTrustTest {
                 if (index == 0) d.sid else "legacy_tofu", null,
             )
         }
-        val proof = DirectoryProof(42, two, epoch, hash, 1, history, emptyList())
+        val proof = DirectoryProof(
+            42, two, epoch, hash, 1, history, emptyList(), securityMode = securityMode,
+        )
         return base.copy(claimedDirectoryHash = hash, proof = proof)
     }
 

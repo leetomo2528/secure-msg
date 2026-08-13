@@ -44,7 +44,8 @@ export default function DeviceManager() {
       if (uid != null && keyDirectory.ok && keyDirectory.identity_sig_pub && keyDirectory.directory_hash
         && Number.isSafeInteger(keyDirectory.security_epoch) && keyDirectory.devices
         && keyDirectory.device_history && keyDirectory.approval_certificates
-        && keyDirectory.revocation_certificates && keyDirectory.security_upgrade_certificates) {
+        && keyDirectory.revocation_certificates && keyDirectory.security_upgrade_certificates
+        && (keyDirectory.security_mode === "legacy_v1" || keyDirectory.security_mode === "verified_v2")) {
         const approved = keyDirectory.devices.filter((device) => device.pub_key && device.sig_pub);
         verifyDirectoryProof({
           user_id: uid,
@@ -63,6 +64,7 @@ export default function DeviceManager() {
           identity_sig_pub: keyDirectory.identity_sig_pub,
           security_epoch: keyDirectory.security_epoch!,
           directory_hash: keyDirectory.directory_hash,
+          security_mode: keyDirectory.security_mode!,
           devices: approved.map((device) => ({
             sid: device.sid,
             pub_key: device.pub_key,

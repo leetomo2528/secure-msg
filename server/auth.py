@@ -33,6 +33,7 @@ bp = Blueprint("auth", __name__, url_prefix="/api")
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 SID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}", re.ASCII)
+LOGIN_PROOF_DOMAIN = "securemsg-device-login-v1"
 
 # Precomputed bcrypt hash (same cost as real stored hashes) so credential checks
 # spend identical work whether the username exists or not. Without this, a
@@ -109,6 +110,14 @@ def _text(body: dict, field: str) -> str:
 def _json_body() -> dict | None:
     body = request.get_json(silent=True)
     return body if isinstance(body, dict) else None
+
+
+def device_login_statement(uid: int, sid: str, challenge_id: str, challenge: str, session_version: int) -> str:
+    return (
+        f"{LOGIN_PROOF_DOMAIN}\nuid={uid}\nsid={sid}\n"
+        f"challenge_id={challenge_id}\nchallenge={challenge}\n"
+        f"session_version={session_version}\n"
+    )
 
 
 def _request_claims(*, missing_error: str) -> tuple[dict | None, tuple | None]:
@@ -343,10 +352,9 @@ def device_register():
 
 @bp.post("/device-login")
 def device_login():
-    """Body: { username, pw_hash, sid } -> { token }.
-    Re-issues a JWT for an EXISTING device. Used when the browser kept the
-    device's private key in IndexedDB but lost the JWT. The user proves
-    knowledge of the password (via pw_hash) to get a fresh token for that sid.
+    """Two-step existing-device login: password challenge, then Ed25519 proof.
+
+    Used when a client retained its private key but lost its JWT.
     """
     body = _json_body()
     if body is None:
@@ -372,11 +380,41 @@ def device_login():
         return _err("device not found", 404)
     if dev["trust_state"] == "revoked":
         return _err("device revoked", 403)
-    session_version = store.rotate_device_session(dev["id"], user["id"])
-    if session_version is None:
+    challenge_id = _text(body, "challenge_id")
+    challenge = _text(body, "challenge")
+    proof = _text(body, "proof")
+    if not challenge_id and not challenge and not proof:
+        issued = store.create_device_login_challenge(
+            dev["id"], user["id"], sid, int(dev["session_version"])
+        )
+        if issued is None:
+            return _err("device state changed; retry", 409)
+        return _ok(uid=user["id"], sid=sid, trust_state=dev["trust_state"], **issued)
+    if not (B64U_RE.fullmatch(challenge_id) and _valid_b64u(challenge, 32) and _valid_b64u(proof, 64)):
+        return _err("device login proof required", 400)
+    statement = device_login_statement(
+        user["id"], sid, challenge_id, challenge, int(dev["session_version"])
+    )
+    try:
+        VerifyKey(base64.urlsafe_b64decode(dev["sig_pub"] + "=" * (-len(dev["sig_pub"]) % 4))).verify(
+            statement.encode("utf-8"),
+            base64.urlsafe_b64decode(proof + "=" * (-len(proof) % 4)),
+        )
+    except (BadSignatureError, ValueError, binascii.Error):
+        return _err("invalid device login proof", 401)
+    consumed = store.consume_device_login_challenge(
+        challenge_id, challenge, dev["id"], user["id"], sid, int(dev["session_version"])
+    )
+    if consumed is None:
+        current = store.get_device_by_sid(sid)
+        if current and current["user_id"] == user["id"] and current["trust_state"] == "revoked":
+            return _err("device revoked", 403)
+        if current and current["user_id"] == user["id"]:
+            return _err("device state changed; retry", 409)
         return _err("device not found", 404)
+    session_version, trust_state = consumed
     token = issue_jwt(user["id"], sid, session_version)
-    return _ok(sid=sid, token=token, uid=user["id"], trust_state=dev["trust_state"])
+    return _ok(sid=sid, token=token, uid=user["id"], trust_state=trust_state)
 
 
 @bp.post("/logout")

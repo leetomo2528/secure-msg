@@ -34,6 +34,17 @@ export interface DeviceRegisterResult {
   security_epoch?: number;
   directory_hash?: string;
   identity_sig_pub?: string;
+  challenge_id?: string;
+  expires_at?: number;
+  session_version?: number;
+}
+
+export function canonicalDeviceLoginProof(fields: {
+  uid: number; sid: string; challenge_id: string; challenge: string; session_version: number;
+}): string {
+  return "securemsg-device-login-v1\n" +
+    `uid=${fields.uid}\nsid=${fields.sid}\nchallenge_id=${fields.challenge_id}\n` +
+    `challenge=${fields.challenge}\nsession_version=${fields.session_version}\n`;
 }
 
 export interface ConvMember {
@@ -215,17 +226,21 @@ export class Api {
   ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    // Bind the request and any 401 side effect to the same session. A delayed
+    // response from an old JWT must not log out a newer session.
+    const requestToken = this.token;
     try {
       const response = await fetch(`${API}${path}`, {
         ...init,
         signal: controller.signal,
         headers: {
           ...(init.body ? { "Content-Type": "application/json" } : {}),
-          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          ...(requestToken ? { Authorization: `Bearer ${requestToken}` } : {}),
           ...init.headers,
         },
       });
-      if (notifyUnauthorized && response.status === 401 && this.token && this.onUnauthorized) {
+      if (notifyUnauthorized && response.status === 401
+        && requestToken && this.token === requestToken && this.onUnauthorized) {
         this.onUnauthorized();
       }
       const text = await response.text();
@@ -233,7 +248,11 @@ export class Api {
       try {
         data = text ? JSON.parse(text) : { ok: response.ok };
       } catch {
-        return { ok: false, error: `서버 응답 형식 오류 (HTTP ${response.status})` } as T;
+        return {
+          ok: false,
+          status: response.status,
+          error: `서버 응답 형식 오류 (HTTP ${response.status})`,
+        } as T;
       }
       if (!response.ok || !data.ok) {
         return {
@@ -273,6 +292,14 @@ export class Api {
   }
   deviceLogin(username: string, pwHash: string, sid: string): Promise<DeviceRegisterResult> {
     return this.post("/device-login", { username, pw_hash: pwHash, sid });
+  }
+  deviceLoginChallenge(username: string, pwHash: string, sid: string): Promise<DeviceRegisterResult> {
+    return this.deviceLogin(username, pwHash, sid);
+  }
+  deviceLoginProof(username: string, pwHash: string, sid: string, challengeId: string, challenge: string, proof: string): Promise<DeviceRegisterResult> {
+    return this.post("/device-login", {
+      username, pw_hash: pwHash, sid, challenge_id: challengeId, challenge, proof,
+    });
   }
   /** Invalidate the current bearer token without recursively firing onUnauthorized. */
   logout(): Promise<ApiResult> {
@@ -391,6 +418,7 @@ export async function sendMessage(
   socket: Socket,
   cid: string,
   envelope: Envelope,
+  shouldContinue: () => boolean = () => true,
 ): Promise<{ ok: boolean; seq?: number; id?: number; error?: string }> {
   const messageId = crypto.randomUUID();
   let result: { ok: boolean; seq?: number; id?: number; error?: string } = {
@@ -400,6 +428,7 @@ export async function sendMessage(
   // Retry one lost acknowledgement with the same id. The server returns the
   // original sequence without fanning out a second carrier-bound message.
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!shouldContinue()) return { ok: false, error: "메시지 전송이 취소되었습니다" };
     result = await emitMessageOnce(socket, cid, messageId, envelope);
     if (result.ok || result.error !== "메시지 전송 확인 시간 초과") break;
   }

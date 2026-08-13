@@ -17,6 +17,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -362,6 +363,145 @@ class TrustedDeviceTest(unittest.TestCase):
         self.assertNotEqual(
             before.json["recipient_keyset_hash"],
             after.json["recipient_keyset_hash"],
+        )
+
+    def test_key_directory_is_one_read_snapshot_while_approval_commits(self):
+        pending, _box, _key, _sig = self._new_pending()
+        snapshot_pinned = threading.Event()
+        resume_reader = threading.Event()
+        reader_finished = threading.Event()
+        original_get_proof = store._get_directory_proof_with_conn
+        result: dict[str, object] = {}
+
+        def pause_after_snapshot_query(connection, user_id, *, user=None):
+            snapshot_pinned.set()
+            if not resume_reader.wait(timeout=5):
+                raise TimeoutError("reader snapshot was not resumed")
+            return original_get_proof(connection, user_id, user=user)
+
+        def read_directory():
+            try:
+                with app.test_client() as reader:
+                    result["response"] = reader.get(
+                        "/api/key-directory", headers=self.first_headers
+                    )
+            except BaseException as exc:  # surface thread failures in this test
+                result["error"] = exc
+            finally:
+                reader_finished.set()
+
+        with mock.patch.object(
+            store,
+            "_get_directory_proof_with_conn",
+            side_effect=pause_after_snapshot_query,
+        ):
+            reader_thread = threading.Thread(target=read_directory, daemon=True)
+            reader_thread.start()
+            self.assertTrue(snapshot_pinned.wait(timeout=5))
+
+            try:
+                approved = self._approve(pending)
+                self.assertEqual(approved["security_epoch"], 2)
+                self.assertFalse(reader_finished.is_set())
+            finally:
+                resume_reader.set()
+            reader_thread.join(timeout=5)
+
+        self.assertFalse(reader_thread.is_alive())
+        if "error" in result:
+            raise result["error"]  # type: ignore[misc]
+        before = result["response"]
+        self.assertEqual(before.status_code, 200, before.json)
+        self.assertEqual(before.json["security_epoch"], 1)
+        self.assertEqual(
+            {row["sid"] for row in before.json["devices"]}, {self.first["sid"]}
+        )
+        self.assertEqual(before.json["approval_certificates"], [])
+
+        after = self.client.get("/api/key-directory", headers=self.first_headers)
+        self.assertEqual(after.status_code, 200, after.json)
+        self.assertEqual(after.json["security_epoch"], 2)
+        self.assertEqual(
+            {row["sid"] for row in after.json["devices"]},
+            {self.first["sid"], pending["sid"]},
+        )
+        self.assertEqual(len(after.json["approval_certificates"]), 1)
+
+    def test_conversation_members_is_one_snapshot_while_approval_commits(self):
+        created = self.client.post(
+            "/api/conversation",
+            headers=self.first_headers,
+            json={"members": [self.username], "name": "+821033355555"},
+        )
+        self.assertEqual(created.status_code, 200, created.json)
+        cid = created.json["cid"]
+        pending, _box, _key, _sig = self._new_pending(seed=31)
+        snapshot_pinned = threading.Event()
+        resume_reader = threading.Event()
+        reader_finished = threading.Event()
+        original_get_proof = store._get_directory_proof_with_conn
+        result: dict[str, object] = {}
+
+        def pause_after_snapshot_query(connection, user_id, *, user=None):
+            if not snapshot_pinned.is_set():
+                snapshot_pinned.set()
+                if not resume_reader.wait(timeout=5):
+                    raise TimeoutError("conversation snapshot was not resumed")
+            return original_get_proof(connection, user_id, user=user)
+
+        def read_members():
+            try:
+                with app.test_client() as reader:
+                    result["response"] = reader.get(
+                        f"/api/conversation/{cid}/members",
+                        headers=self.first_headers,
+                    )
+            except BaseException as exc:  # surface thread failures in this test
+                result["error"] = exc
+            finally:
+                reader_finished.set()
+
+        with mock.patch.object(
+            store,
+            "_get_directory_proof_with_conn",
+            side_effect=pause_after_snapshot_query,
+        ):
+            reader_thread = threading.Thread(target=read_members, daemon=True)
+            reader_thread.start()
+            self.assertTrue(snapshot_pinned.wait(timeout=5))
+
+            try:
+                approved = self._approve(pending)
+                self.assertEqual(approved["security_epoch"], 2)
+                self.assertFalse(reader_finished.is_set())
+            finally:
+                resume_reader.set()
+            reader_thread.join(timeout=5)
+
+        self.assertFalse(reader_thread.is_alive())
+        if "error" in result:
+            raise result["error"]  # type: ignore[misc]
+        before = result["response"]
+        self.assertEqual(before.status_code, 200, before.json)
+        self.assertEqual(
+            {row["sid"] for row in before.json["members"]}, {self.first["sid"]}
+        )
+        self.assertEqual(before.json["directory_checkpoints"][0]["security_epoch"], 1)
+        self.assertEqual(before.json["directory_proofs"][0]["security_epoch"], 1)
+        self.assertEqual(before.json["directory_proofs"][0]["approval_certificates"], [])
+
+        after = self.client.get(
+            f"/api/conversation/{cid}/members", headers=self.first_headers
+        )
+        self.assertEqual(after.status_code, 200, after.json)
+        self.assertEqual(
+            {row["sid"] for row in after.json["members"]},
+            {self.first["sid"], pending["sid"]},
+        )
+        self.assertEqual(after.json["directory_checkpoints"][0]["security_epoch"], 2)
+        self.assertEqual(after.json["directory_proofs"][0]["security_epoch"], 2)
+        self.assertEqual(
+            len(after.json["directory_proofs"][0]["approval_certificates"]), 1
         )
 
     def test_device_public_keys_are_database_immutable(self):

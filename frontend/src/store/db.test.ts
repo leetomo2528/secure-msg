@@ -1,6 +1,7 @@
 import "fake-indexeddb/auto";
 import { beforeAll, describe, expect, it } from "vitest";
 import { initCrypto } from "../crypto/keys";
+import { serverDirectoryHash } from "../crypto/deviceTrust";
 import {
   addBlockKeyword,
   addBlockedSender,
@@ -14,11 +15,17 @@ import {
   setCarrierStatus,
   setCursor,
   setMeta,
+  clearDeviceForReregistration,
+  clearAllData,
   type MessageRow,
   getAccountTrust,
   listTrustedDevices,
   pinTrustedDirectory,
+  pinTrustedDirectories,
+  type TrustedDirectorySnapshot,
   TrustViolationError,
+  db,
+  type AccountTrustRow,
 } from "./db";
 
 function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): MessageRow {
@@ -55,6 +62,32 @@ describe("message persistence", () => {
     const rows = await listMessages("c_carrier");
     expect(rows[0].carrier_status).toBe("sent");
     expect(rows[0].carrier_updated_at).toBe(2000);
+  });
+
+  it("does not erase an optimistic queued state with a status-less sync row", async () => {
+    await putMessage(msg("c_optimistic", 1, {
+      carrier_status: "queued",
+      carrier_updated_at: null,
+    }));
+    await putMessage(msg("c_optimistic", 1, {
+      carrier_status: "none",
+      carrier_updated_at: null,
+    }));
+
+    const rows = await listMessages("c_optimistic");
+    expect(rows[0].carrier_status).toBe("queued");
+  });
+
+  it("accepts lifecycle progress even when the server timestamp is slightly older", async () => {
+    await putMessage(msg("c_clock_skew", 1, {
+      carrier_status: "queued",
+      carrier_updated_at: 2000,
+    }));
+    await setCarrierStatus("c_clock_skew", 1, "sent", null, 1000);
+
+    const rows = await listMessages("c_clock_skew");
+    expect(rows[0].carrier_status).toBe("sent");
+    expect(rows[0].carrier_updated_at).toBe(1000);
   });
 
   it("applies carrier status updates atomically with the ordering rules", async () => {
@@ -148,6 +181,64 @@ describe("meta persistence", () => {
   });
 });
 
+describe("local account cleanup", () => {
+  const uid = 70_001;
+  const trustedDevices = [{
+    sid: "cleanup-old-device",
+    pub_key: "cleanup-box",
+    sig_pub: "cleanup-sign",
+    kind: "web",
+    fingerprint: "cleanup-fingerprint",
+  }];
+  const trust = {
+    uid,
+    identity_sig_pub: "cleanup-identity",
+    security_epoch: 12,
+    directory_hash: serverDirectoryHash(trustedDevices.map(({ fingerprint: _fingerprint, ...device }) => device)),
+    security_mode: "verified_v2" as const,
+    devices: trustedDevices,
+  };
+
+  it("automatic revoked-device recovery removes local secrets but preserves trust anchors", async () => {
+    await setMeta({
+      username: "cleanup-user", uid, sid: "cleanup-old-device", deviceName: "old-device",
+      keypair: { box: { pk: "cleanup-box", sk: "box-secret" }, sign: { pk: "cleanup-sign", sk: "sign-secret" } },
+    });
+    await putMessage(msg("cleanup-content", 1));
+    await setCursor("cleanup-content", 1);
+    await addBlockKeyword("cleanup-keyword");
+    await addBlockedSender("010-7000-0001");
+    await pinTrustedDirectory(trust);
+
+    await clearDeviceForReregistration();
+
+    expect(await getMeta()).toBeNull();
+    expect(await listMessages("cleanup-content")).toEqual([]);
+    expect(await getCursor("cleanup-content")).toBe(0);
+    expect(await listBlockKeywords()).toEqual([]);
+    expect(await listBlockedSenders()).toEqual([]);
+    expect(await getAccountTrust(uid)).toMatchObject({
+      identity_sig_pub: trust.identity_sig_pub,
+      security_epoch: trust.security_epoch,
+      directory_hash: trust.directory_hash,
+    });
+    expect(await listTrustedDevices(uid)).toMatchObject([{
+      sid: "cleanup-old-device",
+      pub_key: "cleanup-box",
+      sig_pub: "cleanup-sign",
+    }]);
+  });
+
+  it("explicit full forget erases account trust anchors", async () => {
+    await pinTrustedDirectory(trust);
+
+    await clearAllData();
+
+    expect(await getAccountTrust(uid)).toBeNull();
+    expect(await listTrustedDevices(uid)).toEqual([]);
+  });
+});
+
 describe("trusted key directory", () => {
   beforeAll(async () => { await initCrypto(); });
   const initial = {
@@ -155,9 +246,27 @@ describe("trusted key directory", () => {
     identity_sig_pub: "identity-A",
     security_epoch: 4,
     directory_hash: "n7p8XOhJkZYBzeWxliNKrn0xqRGrDrsMG6wmYK_p9E0",
+    security_mode: "verified_v2" as const,
     devices: [{
       sid: "sid-a", pub_key: "box-a", sig_pub: "sign-a", kind: "web", fingerprint: "fp-a",
     }],
+  };
+  const snapshot = (
+    uid: number,
+    sid: string,
+    securityEpoch = 1,
+  ): TrustedDirectorySnapshot => {
+    const devices = [{
+      sid, pub_key: `box-${sid}`, sig_pub: `sign-${sid}`, kind: "web", fingerprint: `fp-${sid}`,
+    }];
+    return {
+      uid,
+      identity_sig_pub: `identity-${uid}`,
+      security_epoch: securityEpoch,
+      directory_hash: serverDirectoryHash(devices),
+      security_mode: "verified_v2",
+      devices,
+    };
   };
 
   it("pins a complete snapshot", async () => {
@@ -204,5 +313,96 @@ describe("trusted key directory", () => {
     });
     expect(await listTrustedDevices(801)).toHaveLength(2);
     expect((await getAccountTrust(801))?.security_epoch).toBe(5);
+  });
+
+  it("rejects an unsigned legacy directory after verified_v2 was pinned", async () => {
+    const verified = snapshot(805, "verified-root", 3);
+    await pinTrustedDirectory(verified);
+    const injected = snapshot(805, "attacker-unsigned", 4);
+    injected.security_mode = "legacy_v1";
+
+    await expect(pinTrustedDirectory(injected))
+      .rejects.toMatchObject({ code: "rollback" } satisfies Partial<TrustViolationError>);
+    expect(await getAccountTrust(805)).toMatchObject({
+      security_epoch: 3,
+      security_mode: "verified_v2",
+      directory_hash: verified.directory_hash,
+    });
+    expect((await listTrustedDevices(805)).map((device) => device.sid)).toEqual(["verified-root"]);
+  });
+
+  it("allows a legacy_v1 trust pin to upgrade to verified_v2", async () => {
+    const legacy = snapshot(806, "legacy-root", 1);
+    legacy.security_mode = "legacy_v1";
+    await pinTrustedDirectory(legacy);
+    const upgraded = { ...legacy, security_epoch: 2, security_mode: "verified_v2" as const };
+
+    await expect(pinTrustedDirectory(upgraded)).resolves.toBeUndefined();
+    expect(await getAccountTrust(806)).toMatchObject({ security_epoch: 2, security_mode: "verified_v2" });
+  });
+
+  it("treats a pre-v4 trust row with no mode as legacy and allows a verified upgrade", async () => {
+    const old = snapshot(807, "old-schema-root", 1);
+    await (await db()).put("accountTrust", {
+      uid: old.uid,
+      identity_sig_pub: old.identity_sig_pub,
+      security_epoch: old.security_epoch,
+      directory_hash: old.directory_hash,
+      updated_at: Date.now(),
+    } as AccountTrustRow);
+
+    await expect(pinTrustedDirectory({ ...old, security_epoch: 2 }))
+      .resolves.toBeUndefined();
+    expect(await getAccountTrust(807)).toMatchObject({ security_epoch: 2, security_mode: "verified_v2" });
+  });
+
+  it("commits every participant in one successful batch", async () => {
+    const first = snapshot(811, "batch-first");
+    const second = snapshot(812, "batch-second");
+
+    await pinTrustedDirectories([first, second]);
+
+    expect(await getAccountTrust(811)).toMatchObject({ directory_hash: first.directory_hash });
+    expect(await getAccountTrust(812)).toMatchObject({ directory_hash: second.directory_hash });
+    expect(await listTrustedDevices(811)).toHaveLength(1);
+    expect(await listTrustedDevices(812)).toHaveLength(1);
+  });
+
+  it("writes no participant when a later snapshot conflicts", async () => {
+    const existing = snapshot(822, "stable-device");
+    await pinTrustedDirectory(existing);
+    const first = snapshot(821, "must-not-persist");
+    const conflicting = snapshot(822, "stable-device", 2);
+    conflicting.devices[0] = { ...conflicting.devices[0], sig_pub: "attacker-signing-key" };
+    conflicting.directory_hash = serverDirectoryHash(conflicting.devices);
+
+    await expect(pinTrustedDirectories([first, conflicting]))
+      .rejects.toMatchObject({ code: "device_key_changed" } satisfies Partial<TrustViolationError>);
+
+    expect(await getAccountTrust(821)).toBeNull();
+    expect(await listTrustedDevices(821)).toEqual([]);
+    expect(await getAccountTrust(822)).toMatchObject({
+      security_epoch: existing.security_epoch,
+      directory_hash: existing.directory_hash,
+    });
+    expect((await listTrustedDevices(822))[0].sig_pub).toBe(existing.devices[0].sig_pub);
+  });
+
+  it("aborts all queued writes when the security guard expires", async () => {
+    const first = snapshot(831, "guard-first");
+    const second = snapshot(832, "guard-second");
+    let guardChecks = 0;
+
+    await pinTrustedDirectories([first, second], () => {
+      guardChecks += 1;
+      // Allow preflight and the first participant's queued device/account
+      // writes, then invalidate before the second participant is written.
+      return guardChecks < 9;
+    });
+
+    expect(await getAccountTrust(831)).toBeNull();
+    expect(await listTrustedDevices(831)).toEqual([]);
+    expect(await getAccountTrust(832)).toBeNull();
+    expect(await listTrustedDevices(832)).toEqual([]);
   });
 });

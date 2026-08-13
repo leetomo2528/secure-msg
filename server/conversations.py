@@ -215,12 +215,17 @@ def conv_members(cid: str):
     """Return all devices of all members — client needs these pubkeys to fan out
     envelope encryption keys for every device.
     """
-    conv = store.get_conversation_by_cid(cid)
-    if not conv:
+    snapshot = store.get_conversation_directory_snapshot(cid)
+    if not snapshot:
         return _err("conversation not found", 404)
-    members = store.list_members(conv["id"])
-    # Verify the requesting user is a member.
-    if not any(d["user_id"] == g.auth["uid"] for d in members):
+    conv = snapshot["conversation"]
+    members = snapshot["members"]
+    # Conversation membership is an account property, independent of how many
+    # approved devices that account currently exposes in the key directory.
+    if not any(
+        checkpoint["user_id"] == g.auth["uid"]
+        for checkpoint in snapshot["directory_checkpoints"]
+    ):
         return _err("forbidden", 403)
     key_records = sorted(
         (int(d["user_id"]), d["sid"], d["pub_key"], d["sig_pub"])
@@ -230,24 +235,12 @@ def conv_members(cid: str):
     recipient_keyset_hash = base64.urlsafe_b64encode(
         hashlib.sha256(canonical.encode()).digest()
     ).decode().rstrip("=")
-    directories = {}
-    directory_proofs = {}
-    for user_id in store.list_member_user_ids(conv["id"]):
-        user = store.get_user(user_id)
-        directories[str(user_id)] = {
-            "user_id": user_id,
-            "identity_sig_pub": user["identity_sig_pub"],
-            "security_epoch": user["security_epoch"],
-            "directory_hash": user["directory_hash"],
-            "security_mode": user["security_mode"],
-        }
-        directory_proofs[str(user_id)] = store.get_directory_proof(user_id)
     return _ok(
         conv_id=conv["id"],
         cid=cid,
         recipient_keyset_hash=recipient_keyset_hash,
-        directory_checkpoints=list(directories.values()),
-        directory_proofs=list(directory_proofs.values()),
+        directory_checkpoints=snapshot["directory_checkpoints"],
+        directory_proofs=snapshot["directory_proofs"],
         members=[
             {
                 "user_id": d["user_id"],

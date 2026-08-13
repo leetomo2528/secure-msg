@@ -3,7 +3,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { generateKeypair, initCrypto } from "../crypto/keys";
 import { deviceFingerprint, recipientKeysetHash, serverDirectoryHash } from "../crypto/deviceTrust";
 import type { ConvMember, DirectoryCheckpoint, DirectoryProof } from "../net/api";
-import { verifyConversationKeyDirectory } from "./useStore";
+import { getAccountTrust, listTrustedDevices } from "./db";
+import { verifiedSenderPublicKey, verifyConversationKeyDirectory } from "./useStore";
 
 describe("conversation member key-directory enforcement", () => {
   beforeAll(async () => { await initCrypto(); });
@@ -20,6 +21,7 @@ describe("conversation member key-directory enforcement", () => {
     user_id: userId,
     identity_sig_pub: identity,
     security_epoch: epoch,
+    security_mode: "verified_v2",
     directory_hash: serverDirectoryHash(members.map((member) => ({
       sid: member.sid, pub_key: member.pub_key, sig_pub: member.sig_pub, kind: member.kind,
     }))),
@@ -60,6 +62,31 @@ describe("conversation member key-directory enforcement", () => {
         proof(9102, bob.sig_pub, 1, [bob]),
       ],
     })).resolves.toBeUndefined();
+    expect(await getAccountTrust(9101)).toMatchObject({ security_epoch: 1 });
+    expect(await getAccountTrust(9102)).toMatchObject({ security_epoch: 1 });
+    expect(await listTrustedDevices(9101)).toHaveLength(1);
+    expect(await listTrustedDevices(9102)).toHaveLength(1);
+  });
+
+  it("does not pin an earlier participant when a later proof is invalid", async () => {
+    const first = makeMember(9111, "staged-first");
+    const second = makeMember(9112, "invalid-second");
+    const invalidSecondProof = proof(9112, second.sig_pub, 1, [second]);
+    invalidSecondProof.directory_hash = "invalid-second-proof-hash";
+
+    await expect(verifyConversationKeyDirectory({
+      ok: true,
+      members: [first, second],
+      recipient_keyset_hash: recipientKeysetHash([first, second]),
+      directory_checkpoints: [
+        checkpoint(9111, first.sig_pub, 1, [first]),
+        checkpoint(9112, second.sig_pub, 1, [second]),
+      ],
+      directory_proofs: [proof(9111, first.sig_pub, 1, [first]), invalidSecondProof],
+    })).rejects.toThrow(/checkpoint|proof/);
+
+    expect(await getAccountTrust(9111)).toBeNull();
+    expect(await listTrustedDevices(9111)).toEqual([]);
   });
 
   it("rejects member-list tampering against recipient_keyset_hash", async () => {
@@ -88,6 +115,19 @@ describe("conversation member key-directory enforcement", () => {
     })).rejects.toThrow(/checkpoint|해시/);
   });
 
+  it("rejects a checkpoint whose security mode differs from its proof", async () => {
+    const member = makeMember(9351, "mode-mismatch");
+    const mismatched = checkpoint(9351, member.sig_pub, 1, [member]);
+    mismatched.security_mode = "legacy_v1";
+    await expect(verifyConversationKeyDirectory({
+      ok: true,
+      members: [member],
+      recipient_keyset_hash: recipientKeysetHash([member]),
+      directory_checkpoints: [mismatched],
+      directory_proofs: [proof(9351, member.sig_pub, 1, [member])],
+    })).rejects.toThrow(/checkpoint.*proof/);
+  });
+
   it("rejects a changed key for an already-pinned peer SID", async () => {
     const first = makeMember(9401, "peer-stable");
     await verifyConversationKeyDirectory({
@@ -105,5 +145,48 @@ describe("conversation member key-directory enforcement", () => {
       directory_checkpoints: [checkpoint(9401, first.sig_pub, 2, [attacker])],
       directory_proofs: [proof(9401, first.sig_pub, 2, [attacker])],
     })).rejects.toThrow();
+  });
+
+  it("rejects a relay-supplied message key that differs from verified device history", async () => {
+    const sender = makeMember(9501, "historical-sender");
+    const directoryProof = proof(9501, sender.sig_pub, 1, [sender]);
+    const attacker = makeMember(9501, "attacker");
+    const result = {
+      ok: true,
+      members: [sender],
+      recipient_keyset_hash: recipientKeysetHash([sender]),
+      directory_checkpoints: [checkpoint(9501, sender.sig_pub, 1, [sender])],
+      directory_proofs: [directoryProof],
+    };
+    await verifyConversationKeyDirectory(result);
+
+    expect(() => verifiedSenderPublicKey(
+      result,
+      sender.user_id,
+      sender.sid,
+      attacker.pub_key,
+    )).toThrow(/송신 키|기기 키/);
+  });
+
+  it("uses a verified revoked device history key for old messages", async () => {
+    const active = makeMember(9601, "active-device");
+    const revoked = makeMember(9601, "revoked-device");
+    const directoryProof = proof(9601, active.sig_pub, 2, [active]);
+    directoryProof.device_history.push({
+      ...directoryProof.device_history[0],
+      sid: revoked.sid,
+      pub_key: revoked.pub_key,
+      sig_pub: revoked.sig_pub,
+      fingerprint: deviceFingerprint(revoked.pub_key, revoked.sig_pub).hash,
+      trust_state: "revoked",
+    });
+    const result = { ok: true, directory_proofs: [directoryProof] };
+
+    expect(verifiedSenderPublicKey(
+      result,
+      revoked.user_id,
+      revoked.sid,
+      revoked.pub_key,
+    )).toBe(revoked.pub_key);
   });
 });

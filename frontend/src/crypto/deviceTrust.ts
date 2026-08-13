@@ -306,7 +306,17 @@ export function verifyDirectoryProof(
     }
     previousResultingEpoch = certificate.resulting_epoch;
   }
-  if (previousResultingEpoch != null && previousResultingEpoch > proof.security_epoch) {
+  if (proof.security_mode === "verified_v2") {
+    if (previousResultingEpoch == null) {
+      if (proof.security_epoch !== 1) {
+        throw new Error("root-only verified directory must have security epoch 1");
+      }
+    } else if (previousResultingEpoch !== proof.security_epoch) {
+      throw new Error("certificate epoch does not match directory epoch");
+    }
+  } else if (previousResultingEpoch != null && previousResultingEpoch > proof.security_epoch) {
+    // Preserve the legacy_v1 compatibility rule: old relays may not expose a
+    // complete certificate history, but an event still cannot be from the future.
     throw new Error("certificate epoch exceeds directory epoch");
   }
 

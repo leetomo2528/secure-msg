@@ -1,8 +1,20 @@
 import "fake-indexeddb/auto";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { b64u, initCrypto } from "../crypto/keys";
+import { serverDirectoryHash } from "../crypto/deviceTrust";
 import { api } from "../net/api";
-import { putMessage, type MessageRow } from "./db";
+import {
+  addBlockKeyword,
+  addBlockedSender,
+  listMessages,
+  listBlockKeywords,
+  listBlockedSenders,
+  pinTrustedDirectory,
+  putBlockKeywordRow,
+  putBlockedSenderRow,
+  putMessage,
+  type MessageRow,
+} from "./db";
 import { decodeRelayContent, useStore } from "./useStore";
 
 function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): MessageRow {
@@ -78,6 +90,90 @@ describe("logout session cleanup", () => {
     expect(useStore.getState().conversations).toEqual([]);
     expect(useStore.getState().activeMessages).toEqual([]);
     expect(useStore.getState().error).toContain("로컬 캐시");
+  });
+});
+
+describe("block-rule synchronization", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    api.setToken(null);
+  });
+
+  it("retains failed local uploads while replacing successful and stale server rows", async () => {
+    const failedKeyword = await addBlockKeyword("sync-failed-keyword");
+    const uploadedSender = await addBlockedSender("010-9876-5432");
+    await putBlockKeywordRow({ id: "srv:9001", keyword: "sync-stale-keyword", created_at: 1 });
+    await putBlockedSenderRow({ id: "srv:9002", sender: "+821099990002", created_at: 1 });
+
+    api.setToken("active-token");
+    vi.spyOn(api, "listBlockRules").mockResolvedValue({
+      ok: true,
+      rules: [{ id: 10, type: "keyword", value: "sync-server-keyword", created_at: 10 }],
+    });
+    vi.spyOn(api, "addBlockRule").mockImplementation(async (type, value) => {
+      if (type === "keyword" && value === failedKeyword.keyword) {
+        return { ok: false, error: "temporary failure" };
+      }
+      if (type === "sender" && value === uploadedSender.sender) {
+        return { ok: true, rule: { id: 11, type, value, created_at: 11 } };
+      }
+      return { ok: false, error: "unexpected local rule" };
+    });
+
+    await useStore.getState().syncBlockRules();
+
+    const keywords = await listBlockKeywords();
+    expect(keywords).toContainEqual(failedKeyword);
+    expect(keywords).toContainEqual({
+      id: "srv:10", keyword: "sync-server-keyword", created_at: 10_000,
+    });
+    expect(keywords.some((row) => row.id === "srv:9001")).toBe(false);
+
+    const senders = await listBlockedSenders();
+    expect(senders).toContainEqual({
+      id: "srv:11", sender: uploadedSender.sender, created_at: 11_000,
+    });
+    expect(senders.some((row) => row.id === uploadedSender.id)).toBe(false);
+    expect(senders.some((row) => row.id === "srv:9002")).toBe(false);
+  });
+});
+
+describe("sender block-rule reapplication", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useStore.setState({ username: null, conversations: [], activeCid: null, activeMessages: [] });
+  });
+
+  it("blocks only the cached Android gateway sender in an SMS conversation", async () => {
+    const uid = 81_001;
+    const cid = "sender-reapply-mixed-direction";
+    const phone = "+821055501234";
+    const devices = [
+      { sid: "reapply-web", pub_key: "web-box", sig_pub: "web-sign", kind: "web", fingerprint: "web-fp" },
+      { sid: "reapply-gateway", pub_key: "gateway-box", sig_pub: "gateway-sign", kind: "android_gateway", fingerprint: "gateway-fp" },
+    ];
+    await pinTrustedDirectory({
+      uid,
+      identity_sig_pub: "reapply-identity",
+      security_epoch: 1,
+      directory_hash: serverDirectoryHash(devices),
+      security_mode: "verified_v2",
+      devices,
+    });
+    await putMessage(msg(cid, 1, { sender_id: uid, sender_sid: "reapply-web", plaintext: "outgoing" }));
+    await putMessage(msg(cid, 2, { sender_id: uid, sender_sid: "reapply-gateway", plaintext: "incoming" }));
+    useStore.setState({
+      username: "alice",
+      conversations: [{ cid, conv_id: 81_001, name: phone, members: ["alice"], created_at: 1 }],
+      activeCid: cid,
+    });
+    vi.spyOn(api, "addBlockRule").mockResolvedValue({ ok: false, error: "offline" });
+
+    await useStore.getState().addBlockedSenderRule(phone);
+
+    const [outgoing, incoming] = await listMessages(cid);
+    expect(Boolean(outgoing.blocked)).toBe(false);
+    expect(incoming.blocked).toBe(true);
   });
 });
 

@@ -658,29 +658,36 @@ class MainActivity : ComponentActivity() {
                 }
                 val receivedAt = System.currentTimeMillis()
                 val providerId = SmsProvider.insertIncoming(ctx, sender, body, receivedAt)
-                val persisted = IncomingMessageRepository(db).persist(
+                val content = RelayContentCodec.text(body)
+                val persisted = IncomingMessageRepository(db).persistCarrier(
+                    kind = ProviderIdentity.SMS,
                     direction = "incoming_sms",
                     phoneNumber = sender,
-                    content = RelayContentCodec.text(body),
+                    content = content,
                     providerId = providerId,
                     receivedAt = receivedAt,
                 )
-                SmsNotifier.notifyIncoming(
-                    ctx,
-                    persisted.conversation.normalizedPhone,
-                    body,
-                    receivedAt,
-                    persisted.conversation.cid,
-                    persisted.outbox.mid,
-                )
-                val intent = Intent(ctx, SmsBridgeService::class.java).apply {
-                    action = SmsBridgeService.ACTION_INCOMING_SMS
-                    putExtra(SmsBridgeService.EXTRA_PHONE, sender)
-                    putExtra(SmsBridgeService.EXTRA_BODY, body)
-                    putExtra(SmsBridgeService.EXTRA_PROVIDER_ID, providerId ?: -1L)
-                    putExtra(SmsBridgeService.EXTRA_RECEIVED_AT, receivedAt)
+                if (persisted?.newlyCreated == true) {
+                    SmsNotifier.notifyIncoming(
+                        ctx,
+                        persisted.conversation.normalizedPhone,
+                        body,
+                        receivedAt,
+                        persisted.conversation.cid,
+                        persisted.outbox.mid,
+                    )
                 }
-                ContextCompat.startForegroundService(ctx, intent)
+                if (persisted != null) {
+                    val intent = Intent(ctx, SmsBridgeService::class.java).apply {
+                        action = SmsBridgeService.ACTION_INCOMING_SMS
+                        putExtra(SmsBridgeService.EXTRA_PHONE, sender)
+                        putExtra(SmsBridgeService.EXTRA_BODY, body)
+                        putExtra(SmsBridgeService.EXTRA_PROVIDER_ID, providerId ?: -1L)
+                        putExtra(SmsBridgeService.EXTRA_PROVIDER_EPOCH, persisted.outbox.providerEpoch)
+                        putExtra(SmsBridgeService.EXTRA_RECEIVED_AT, receivedAt)
+                    }
+                    ContextCompat.startForegroundService(ctx, intent)
+                }
                 withContext(Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         ctx, "시뮬레이션 SMS 주입 완료 — 웹에서 확인하세요",

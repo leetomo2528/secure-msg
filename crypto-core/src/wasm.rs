@@ -1,8 +1,8 @@
 //! Browser-facing `wasm-bindgen` adapter for the transactional MLS core.
 //!
-//! OpenMLS types never cross the JavaScript boundary. Wire messages, device
+//! `OpenMLS` types never cross the JavaScript boundary. Wire messages, device
 //! certificates and device state are opaque bytes. `exportSecretState()` still
-//! contains secrets: the host MUST encrypt it with a non-exportable WebCrypto
+//! contains secrets: the host MUST encrypt it with a non-exportable `WebCrypto`
 //! key and atomically persist it together with `checkpoint`.
 
 use anyhow::{Result, anyhow, bail};
@@ -13,11 +13,11 @@ use crate::{
     PendingEnrollment, RemoveDeviceOutput, StatePersistence, StoredState,
 };
 
-fn js_error(error: anyhow::Error) -> JsValue {
+fn js_error(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
 
-fn aad(cid: String, mid: String, outgoing: bool) -> MessageAad {
+const fn aad(cid: String, mid: String, outgoing: bool) -> MessageAad {
     MessageAad {
         cid,
         mid,
@@ -42,7 +42,7 @@ struct WasmStatePersistence {
 }
 
 impl WasmStatePersistence {
-    fn empty(account_id: Vec<u8>, device_id: String) -> Self {
+    const fn empty(account_id: Vec<u8>, device_id: String) -> Self {
         Self {
             account_id,
             device_id,
@@ -51,7 +51,7 @@ impl WasmStatePersistence {
         }
     }
 
-    fn restored(
+    const fn restored(
         account_id: Vec<u8>,
         device_id: String,
         checkpoint: u64,
@@ -143,7 +143,7 @@ pub struct WasmPendingEnrollment {
 impl WasmPendingEnrollment {
     /// Generate a new device signing key and unsigned enrollment request.
     #[wasm_bindgen(constructor)]
-    pub fn new(account_id: &[u8], device_id: String) -> Result<WasmPendingEnrollment, JsValue> {
+    pub fn new(account_id: &[u8], device_id: String) -> Result<Self, JsValue> {
         let inner =
             AccountDevice::begin_enrollment(account_id, device_id.clone()).map_err(js_error)?;
         Ok(Self {
@@ -160,7 +160,7 @@ impl WasmPendingEnrollment {
             .inner
             .as_ref()
             .ok_or_else(|| JsValue::from_str("enrollment was already finalized"))?;
-        serde_json::to_vec(enrollment.request()).map_err(|error| js_error(error.into()))
+        serde_json::to_vec(enrollment.request()).map_err(js_error)
     }
 
     /// Verify the root-signed certificate and create the transactional device.
@@ -170,7 +170,7 @@ impl WasmPendingEnrollment {
         certificate_bytes: &[u8],
     ) -> Result<WasmAccountDevice, JsValue> {
         let certificate: DeviceCertificate =
-            serde_json::from_slice(certificate_bytes).map_err(|error| js_error(error.into()))?;
+            serde_json::from_slice(certificate_bytes).map_err(js_error)?;
         let enrollment = self
             .inner
             .take()
@@ -199,7 +199,7 @@ impl WasmAccountDevice {
     pub fn import_secret_state(
         secret_state: &[u8],
         trusted_checkpoint: u64,
-    ) -> Result<WasmAccountDevice, JsValue> {
+    ) -> Result<Self, JsValue> {
         let inspected = AccountDevice::import_secret_state(secret_state).map_err(js_error)?;
         if inspected.checkpoint() != trusted_checkpoint {
             return Err(JsValue::from_str(
@@ -229,6 +229,7 @@ impl WasmAccountDevice {
 
     #[wasm_bindgen(getter)]
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // `wasm-bindgen` does not support exported `const fn`s.
     pub fn checkpoint(&self) -> u64 {
         self.inner.checkpoint()
     }
@@ -441,6 +442,7 @@ impl WasmDecryptedApplication {
 
     #[wasm_bindgen(getter, js_name = senderLeafIndex)]
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // `wasm-bindgen` does not support exported `const fn`s.
     pub fn sender_leaf_index(&self) -> u32 {
         self.sender_leaf_index
     }
@@ -459,6 +461,7 @@ impl WasmDecryptedApplication {
 
     #[wasm_bindgen(getter)]
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // `wasm-bindgen` does not support exported `const fn`s.
     pub fn outgoing(&self) -> bool {
         self.outgoing
     }

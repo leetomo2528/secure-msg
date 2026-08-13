@@ -46,7 +46,22 @@ export default defineConfig({
       "/socket.io": { target: "http://127.0.0.1:5050", ws: true },
     },
   },
-  build: { target: "es2022", sourcemap: false },
+  build: {
+    target: "es2022",
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        // Keep stable, heavy dependencies separate from the app code so a UI
+        // release does not invalidate the libsodium/React/Socket.IO caches.
+        manualChunks: {
+          crypto: ["libsodium-wrappers-sumo"],
+          react: ["react", "react-dom"],
+          socket: ["socket.io-client"],
+          state: ["idb", "zustand"],
+        },
+      },
+    },
+  },
   resolve: {
     alias: {
       "libsodium-wrappers-sumo": SODIUM_CJS,

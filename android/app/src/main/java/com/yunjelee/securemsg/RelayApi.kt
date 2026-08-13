@@ -74,11 +74,18 @@ class RelayApi(
         .put("sig_pub", sigPub)
         .let { post("/api/device-register", it) }
 
-    fun deviceLogin(username: String, pwHash: String, sid: String): JSONObject =
+    fun deviceLoginChallenge(username: String, pwHash: String, sid: String): JSONObject =
         post("/api/device-login", JSONObject()
             .put("username", username)
             .put("pw_hash", pwHash)
             .put("sid", sid))
+
+    fun deviceLoginProof(
+        username: String, pwHash: String, sid: String,
+        challengeId: String, challenge: String, proof: String,
+    ): JSONObject = post("/api/device-login", JSONObject()
+        .put("username", username).put("pw_hash", pwHash).put("sid", sid)
+        .put("challenge_id", challengeId).put("challenge", challenge).put("proof", proof))
 
     fun logout(): JSONObject = post("/api/logout", JSONObject())
 

@@ -18,25 +18,36 @@ class IncomingMessageRepository(
     data class Persisted(
         val outbox: RelayOutbox,
         val conversation: ConversationTarget,
+        /** True only for the transaction that inserted the visible message/outbox pair. */
+        val newlyCreated: Boolean,
     )
 
     suspend fun persist(
         direction: String,
         phoneNumber: String,
         content: RelayContent,
-        providerId: Long?,
+        providerIdentity: ProviderIdentity,
         receivedAt: Long,
-    ): Persisted {
+    ): Persisted? {
         val phone = PhoneNumberNormalizer.normalize(phoneNumber)
         require(phone.isNotBlank()) { "phone number is blank" }
         val encoded = RelayContentCodec.encode(content)
-        val mid = IncomingMessageIdentity.mid(direction, providerId, phone, receivedAt, encoded)
+        val mid = IncomingMessageIdentity.mid(direction, providerIdentity, phone, receivedAt, encoded)
 
         return db.withTransaction {
+            providerIdentity.id?.let { providerId ->
+                val alreadyProcessed = when (direction) {
+                    "incoming_sms" -> db.processedSmsDao().contains(providerIdentity.epoch, providerId)
+                    "incoming_mms" -> db.processedMmsDao().contains(providerIdentity.epoch, providerId)
+                    else -> false
+                }
+                if (alreadyProcessed) return@withTransaction null
+            }
             db.relayOutboxDao().getByMid(mid)?.let { existing ->
                 return@withTransaction Persisted(
                     outbox = existing,
-                    conversation = ConversationTarget(existing.cid, phone),
+                    conversation = ConversationTarget(existing.cid, existing.phoneNumber),
+                    newlyCreated = false,
                 )
             }
 
@@ -71,7 +82,10 @@ class IncomingMessageRepository(
                     subject = content.subject,
                     attachmentsJson = attachmentsJson,
                     phoneNumber = phone,
-                    providerId = providerId,
+                    providerEpoch = providerIdentity.epoch,
+                    providerId = providerIdentity.id,
+                    sourceFingerprint = providerIdentity.fingerprint,
+                    sourceEventKey = providerIdentity.eventKey,
                     localMessageId = localMessageId,
                     direction = direction,
                     createdAt = receivedAt,
@@ -79,8 +93,83 @@ class IncomingMessageRepository(
             )
             val outbox = db.relayOutboxDao().getByMid(mid)
                 ?: error("missing incoming outbox row id=$outboxId")
-            Persisted(outbox, ConversationTarget(thread.cid, phone))
+            Persisted(outbox, ConversationTarget(thread.cid, phone), newlyCreated = true)
         }
+    }
+
+    /** Resolves the provider namespace and claims the visible/outbox pair atomically. */
+    suspend fun persistCarrier(
+        kind: String,
+        direction: String,
+        phoneNumber: String,
+        content: RelayContent,
+        providerId: Long?,
+        receivedAt: Long,
+    ): Persisted? = db.withTransaction {
+        val encoded = RelayContentCodec.encode(content)
+        // eventKey does not depend on the provider epoch/id. Check the durable
+        // tombstone before namespace resolution so a completed broadcast that
+        // later gains a provider id cannot rotate or otherwise mutate ledgers.
+        val eventKey = ProviderIdentity.snapshot(
+            kind, 0, null, phoneNumber, receivedAt, encoded,
+        ).eventKey
+        if (db.processedCarrierEventDao().contains(kind, eventKey)) {
+            return@withTransaction null
+        }
+        val identity = ProviderIdentityResolver.resolve(
+            db, kind, providerId, phoneNumber, receivedAt, encoded,
+        )
+
+        val directionForKind = when (kind) {
+            ProviderIdentity.SMS -> "incoming_sms"
+            ProviderIdentity.MMS -> "incoming_mms"
+            else -> error("unsupported provider kind")
+        }
+        require(direction == directionForKind) { "carrier kind/direction mismatch" }
+        db.relayOutboxDao().findBySourceEventKey(identity.eventKey, direction)?.let { existing ->
+            if (existing.providerId == null && identity.id != null) {
+                db.relayOutboxDao().aliasProviderIdentity(
+                    existing.id,
+                    identity.epoch,
+                    identity.id,
+                    identity.fingerprint,
+                )
+            }
+            val aliased = db.relayOutboxDao().getByMid(existing.mid) ?: existing
+            return@withTransaction Persisted(
+                outbox = aliased,
+                conversation = ConversationTarget(aliased.cid, aliased.phoneNumber),
+                newlyCreated = false,
+            )
+        }
+        persist(direction, phoneNumber, content, identity, receivedAt)
+    }
+
+    /** Commits all incoming-event dedupe records before removing retry state. */
+    suspend fun acknowledgeIncoming(row: RelayOutbox) = db.withTransaction {
+        require(row.direction.startsWith("incoming_")) { "not an incoming outbox row" }
+        val kind = when (row.direction) {
+            "incoming_sms" -> ProviderIdentity.SMS
+            "incoming_mms" -> ProviderIdentity.MMS
+            else -> error("unsupported incoming direction")
+        }
+        row.sourceEventKey?.let { eventKey ->
+            db.processedCarrierEventDao().insert(
+                ProcessedCarrierEvent(kind = kind, eventKey = eventKey),
+            )
+        }
+        row.providerId?.let { providerId ->
+            if (kind == ProviderIdentity.MMS) {
+                db.processedMmsDao().insert(
+                    ProcessedMms(row.providerEpoch, providerId, row.sourceFingerprint),
+                )
+            } else {
+                db.processedSmsDao().insert(
+                    ProcessedSms(row.providerEpoch, providerId, row.sourceFingerprint),
+                )
+            }
+        }
+        db.relayOutboxDao().delete(row.id)
     }
 
     private fun attachmentsJson(content: RelayContent): String? {

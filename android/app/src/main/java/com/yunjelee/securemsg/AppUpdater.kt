@@ -3,7 +3,6 @@ package com.yunjelee.securemsg
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
-import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.app.PendingIntent
 import android.net.Uri
@@ -192,13 +191,31 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
         } catch (e: PackageManager.NameNotFoundException) {
             throw IOException("설치된 앱의 서명 정보를 읽지 못했습니다", e)
         }
-        if (!UpdateValidation.signersMatch(signerBytes(installed), signerBytes(archive))) {
+        val installedSigning = installed.signingInfo
+            ?: throw IOException("설치된 앱의 서명 정보를 읽지 못했습니다")
+        val archiveSigning = archive.signingInfo
+            ?: throw IOException("APK 서명 정보를 읽지 못했습니다")
+        if (!UpdateValidation.signingCertificatesMatch(
+                installedCurrentDigests = signerDigests(installedSigning.apkContentsSigners.map { it.toByteArray() }),
+                installedHasMultipleSigners = installedSigning.hasMultipleSigners(),
+                archiveCurrentDigests = signerDigests(archiveSigning.apkContentsSigners.map { it.toByteArray() }),
+                archiveHasMultipleSigners = archiveSigning.hasMultipleSigners(),
+                archiveHistoryDigests = archiveSigning.signingCertificateHistory
+                    ?.map { certificateDigest(it.toByteArray()) }
+                    .orEmpty(),
+            )
+        ) {
             throw IOException("APK 서명이 현재 설치된 SecureMsg와 일치하지 않습니다")
         }
     }
 
-    private fun signerBytes(info: PackageInfo): List<ByteArray> =
-        info.signingInfo?.apkContentsSigners?.map { it.toByteArray() }.orEmpty()
+    private fun signerDigests(certificates: Collection<ByteArray>): Set<String> =
+        certificates.mapTo(mutableSetOf(), ::certificateDigest)
+
+    private fun certificateDigest(certificate: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(certificate)
+            .joinToString("") { "%02x".format(it) }
 
     @Synchronized
     fun persistPendingUpdate(
@@ -397,9 +414,41 @@ object UpdateValidation {
     fun hasExpectedSize(expectedBytes: Long, actualBytes: Long): Boolean =
         expectedBytes <= 0 || expectedBytes == actualBytes
 
-    fun signersMatch(installedCertificates: Collection<ByteArray>, apkCertificates: Collection<ByteArray>): Boolean {
-        if (installedCertificates.isEmpty() || apkCertificates.isEmpty()) return false
-        return installedCertificates.map(::sha256).toSet() == apkCertificates.map(::sha256).toSet()
+    /**
+     * Decide whether an archive can be handed to PackageInstaller as an update.
+     * Digest extraction is deliberately kept outside this pure helper.
+     *
+     * A single-signer APK may rotate its certificate. Android verifies the
+     * proof-of-rotation while parsing the archive and returns its oldest-to-current
+     * lineage in signingCertificateHistory. Multiple signers form one identity and
+     * cannot rotate, so both current signer sets must match exactly.
+     */
+    fun signingCertificatesMatch(
+        installedCurrentDigests: Set<String>,
+        installedHasMultipleSigners: Boolean,
+        archiveCurrentDigests: Set<String>,
+        archiveHasMultipleSigners: Boolean,
+        archiveHistoryDigests: List<String>,
+    ): Boolean {
+        if (installedCurrentDigests.isEmpty() || archiveCurrentDigests.isEmpty()) return false
+
+        if (installedHasMultipleSigners || archiveHasMultipleSigners) {
+            return installedHasMultipleSigners &&
+                archiveHasMultipleSigners &&
+                installedCurrentDigests.size > 1 &&
+                archiveCurrentDigests.size > 1 &&
+                installedCurrentDigests == archiveCurrentDigests
+        }
+
+        if (installedCurrentDigests.size != 1 || archiveCurrentDigests.size != 1) return false
+        if (archiveHistoryDigests.isEmpty() || archiveHistoryDigests.toSet().size != archiveHistoryDigests.size) {
+            return false
+        }
+
+        val installedCurrent = installedCurrentDigests.single()
+        val archiveCurrent = archiveCurrentDigests.single()
+        return archiveHistoryDigests.last() == archiveCurrent &&
+            installedCurrent in archiveHistoryDigests
     }
 
     fun shouldLaunchFallback(state: PendingInstallState): Boolean =
@@ -428,10 +477,6 @@ object UpdateValidation {
         return packageUpdatedAt >= apkDownloadedAt
     }
 
-    private fun sha256(certificate: ByteArray): String =
-        MessageDigest.getInstance("SHA-256")
-            .digest(certificate)
-            .joinToString("") { "%02x".format(it) }
 }
 
 /**

@@ -6,9 +6,89 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.room.withTransaction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+
+internal data class CommittedCarrierStatus(
+    val status: String,
+    val error: String?,
+    val statusApplied: Boolean,
+)
+
+internal object CarrierCallbackPersistence {
+    /**
+     * Claims a complete callback set and applies every Room-backed status as one unit.
+     * A failed transaction leaves the complete part set intact for a later callback/retry.
+     */
+    suspend fun commitCompleted(
+        db: AppDatabase,
+        mid: String,
+        action: String,
+        partCount: Int,
+        cid: String,
+        seq: Int,
+    ): CommittedCarrierStatus? = db.withTransaction {
+        val results = db.carrierPartResultDao().getAll(mid, action)
+        if (results.map { it.part }.distinct().size < partCount) return@withTransaction null
+
+        // The delete is both the completion claim and part of the same atomic unit as
+        // all durable status updates. Rollback therefore restores the complete set.
+        if (db.carrierPartResultDao().deleteAll(mid, action) == 0) {
+            return@withTransaction null
+        }
+        val aggregate = CarrierCallbackAggregate.resolve(action, partCount, results)
+        var effectiveStatus = aggregate.status
+        var statusApplied = false
+        var statusTracked = false
+
+        if (cid.isNotBlank() && seq > 0) {
+            var receipt = db.relayReceiptDao().get(cid, seq)
+            if (receipt == null) {
+                db.relayReceiptDao().claim(RelayReceipt(cid, seq))
+                receipt = db.relayReceiptDao().get(cid, seq)
+            }
+            statusTracked = receipt != null
+            if (receipt == null || CarrierState.canAdvance(receipt.status, aggregate.status)) {
+                db.relayReceiptDao().markStatus(cid, seq, aggregate.status, aggregate.error)
+                statusApplied = true
+            } else {
+                effectiveStatus = receipt.status
+            }
+        }
+        db.relayOutboxDao().getByMid(mid)?.let { row ->
+            statusTracked = true
+            if (CarrierState.canAdvance(row.carrierState, aggregate.status)) {
+                db.relayOutboxDao().markCarrierState(row.id, aggregate.status, aggregate.error)
+                row.localMessageId?.let { localId ->
+                    val message = db.messageDao().getById(localId)
+                    if (message == null || CarrierState.canAdvance(
+                            message.carrierStatus,
+                            aggregate.status,
+                        )
+                    ) {
+                        db.messageDao().setCarrierStatusById(
+                            localId,
+                            aggregate.status,
+                            aggregate.error,
+                        )
+                    }
+                }
+                effectiveStatus = aggregate.status
+                statusApplied = true
+            } else {
+                effectiveStatus = row.carrierState
+            }
+        }
+        if (!statusTracked) statusApplied = true
+        CommittedCarrierStatus(
+            status = effectiveStatus,
+            error = if (effectiveStatus == aggregate.status) aggregate.error else null,
+            statusApplied = statusApplied,
+        )
+    }
+}
 
 /** Receives asynchronous carrier SENT/DELIVERED callbacks and persists them. */
 class CarrierStatusReceiver : BroadcastReceiver() {
@@ -55,60 +135,19 @@ class CarrierStatusReceiver : BroadcastReceiver() {
                         resultCode = callbackResult,
                     ),
                 )
-                val results = db.carrierPartResultDao().getAll(mid, action)
-                if (results.map { it.part }.distinct().size < partCount) return@launch
-                // Only one callback may consume a completed part set. The
-                // atomic delete acts as the claim: concurrent part callbacks
-                // cannot aggregate and dispatch the same result twice.
-                if (db.carrierPartResultDao().deleteAll(mid, action) == 0) return@launch
-                val failedPart = results.firstOrNull { !it.successful }
-                val ok = failedPart == null
-                val status = when {
-                    action == ACTION_DELIVERED && ok -> "delivered"
-                    action == ACTION_DELIVERED -> "delivery_failed"
-                    ok -> "sent"
-                    else -> "failed"
-                }
-                val error = failedPart?.let {
-                    "carrier result=${it.resultCode} part=${it.part + 1}/$partCount"
-                }
+                val committed = CarrierCallbackPersistence.commitCompleted(
+                    db = db,
+                    mid = mid,
+                    action = action,
+                    partCount = partCount,
+                    cid = cid,
+                    seq = seq,
+                ) ?: return@launch
+
+                // These touch state outside Room and must only run after the transaction commits.
                 MmsSender.deletePdu(context, intent.getStringExtra("pdu_id"))
-                var effectiveStatus = status
-                var statusApplied = false
-                var statusTracked = false
-                if (cid.isNotBlank() && seq > 0) {
-                    var receipt = db.relayReceiptDao().get(cid, seq)
-                    if (receipt == null) {
-                        db.relayReceiptDao().claim(RelayReceipt(cid, seq))
-                        receipt = db.relayReceiptDao().get(cid, seq)
-                    }
-                    statusTracked = receipt != null
-                    if (receipt == null || CarrierState.canAdvance(receipt.status, status)) {
-                        db.relayReceiptDao().markStatus(cid, seq, status, error)
-                        statusApplied = true
-                    } else {
-                        effectiveStatus = receipt.status
-                    }
-                }
-                db.relayOutboxDao().getByMid(mid)?.let { row ->
-                    statusTracked = true
-                    if (CarrierState.canAdvance(row.carrierState, status)) {
-                        db.relayOutboxDao().markCarrierState(row.id, status, error)
-                        row.localMessageId?.let { localId ->
-                            val message = db.messageDao().getById(localId)
-                            if (message == null || CarrierState.canAdvance(message.carrierStatus, status)) {
-                                db.messageDao().setCarrierStatusById(localId, status, error)
-                            }
-                        }
-                        effectiveStatus = status
-                        statusApplied = true
-                    } else {
-                        effectiveStatus = row.carrierState
-                    }
-                }
-                if (!statusTracked) statusApplied = true
-                if (providerId > 0 && statusApplied) {
-                    val providerStatus = when (effectiveStatus) {
+                if (providerId > 0 && committed.statusApplied) {
+                    val providerStatus = when (committed.status) {
                         "delivered" -> android.provider.Telephony.Sms.STATUS_COMPLETE
                         "sent", "dispatched" -> android.provider.Telephony.Sms.STATUS_PENDING
                         else -> android.provider.Telephony.Sms.STATUS_FAILED
@@ -117,7 +156,7 @@ class CarrierStatusReceiver : BroadcastReceiver() {
                         context,
                         providerId,
                         providerStatus,
-                        failed = effectiveStatus == "failed",
+                        failed = CarrierState.isFailure(committed.status),
                     )
                 }
                 val service = Intent(context, SmsBridgeService::class.java)
@@ -125,8 +164,8 @@ class CarrierStatusReceiver : BroadcastReceiver() {
                     .putExtra(EXTRA_MID, mid)
                     .putExtra(EXTRA_CID, cid)
                     .putExtra(EXTRA_SEQ, seq)
-                    .putExtra(EXTRA_STATUS, effectiveStatus)
-                    .putExtra(EXTRA_ERROR, if (effectiveStatus == status) error else null)
+                    .putExtra(EXTRA_STATUS, committed.status)
+                    .putExtra(EXTRA_ERROR, committed.error)
                 ContextCompat.startForegroundService(context, service)
             } catch (e: Exception) {
                 Log.e("CarrierStatusReceiver", "failed to persist carrier status", e)

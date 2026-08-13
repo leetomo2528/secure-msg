@@ -1,8 +1,10 @@
 /**
  * Blocklist (keyword filter) — applied AFTER decryption, BEFORE display.
  *
- * Privacy property: the keyword list lives ONLY in IndexedDB. It is never sent
- * to the server. The server has no way to learn what's filtered.
+ * Privacy boundary: account block rules are synchronized through the relay and
+ * cached in IndexedDB, so the server can see rule strings. Message plaintext is
+ * never included in that synchronization; matching still happens locally after
+ * decryption.
  *
  * Blocking semantics: a decrypted message is hidden from the UI (and marked
  * `blocked=true` in IndexedDB) when ANY keyword in the list is a substring of

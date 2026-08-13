@@ -32,8 +32,20 @@ from rate_limit import check as rate_limit
 
 log = logging.getLogger("securemsg.sockets")
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
+PHONE_RE = re.compile(r"\+?[0-9*#]{3,24}", re.ASCII)
 
 _socketio_ref: SocketIO | None = None
+
+
+def _parse_positive_seq(value: object) -> int | None:
+    """Parse a JSON sequence without Python's bool/int coercion surprises."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value, re.ASCII):
+        return int(value)
+    return None
 
 
 def _device_room(sid: str, session_version: int) -> str:
@@ -218,10 +230,21 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if client_mid:
             existing = store.get_message_by_sender_mid(sid, client_mid)
             if existing:
-                if int(existing["conv_id"]) != int(conv["id"]):
+                sender_device = store.get_device_by_sid(sid)
+                if not sender_device or sender_device["user_id"] != uid:
                     return {
                         "ok": False,
-                        "error": "message id already used in another conversation",
+                        "error": "sender device is revoked or unknown",
+                    }
+                if not store.message_retry_matches(
+                    existing,
+                    cid=cid,
+                    payload=encoded_payload,
+                    sender_pub_key=sender_device["pub_key"],
+                ):
+                    return {
+                        "ok": False,
+                        "error": "message id conflicts with original message",
                     }
                 return {
                     "ok": True,
@@ -277,6 +300,22 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         # Fan out exactly once per registered device. Sending repeatedly to a
         # shared user room would duplicate carrier SMS when a user has 2+ devices.
         for device in members:
+            # The committed recipient set is only a snapshot. A device can be
+            # revoked (or rotate its session) after insert_message commits but
+            # before this loop emits. Re-read immediately before each push and
+            # only target the exact still-approved device/session from that
+            # snapshot; otherwise its old versioned room may still contain a
+            # connected socket during the revocation race.
+            current_device = store.get_device_by_sid(device["sid"])
+            if (
+                not current_device
+                or current_device["trust_state"] != "approved"
+                or current_device["id"] != device["device_id"]
+                or current_device["user_id"] != device["user_id"]
+                or current_device["sid"] != device["sid"]
+                or current_device["session_version"] != device["session_version"]
+            ):
+                continue
             socketio.emit(
                 "message_new",
                 envelope,
@@ -294,11 +333,8 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             return
         uid, sid, device_id = client
         cid = data.get("cid")
-        try:
-            seq = int(data.get("seq") or 0)
-        except (TypeError, ValueError):
-            return
-        if seq <= 0:
+        seq = _parse_positive_seq(data.get("seq"))
+        if seq is None:
             return
         conv = store.get_conversation_by_cid(cid)
         if not conv:
@@ -317,8 +353,10 @@ def attach_socketio(app, socketio: SocketIO) -> None:
     def _carrier_status(data: dict):
         """Android gateway reports carrier dispatch/delivery for one relay row.
 
-        This event contains only metadata. The gateway role and conversation
-        membership are checked before the status is accepted and fanned out.
+        This event contains only metadata. Only the approved Android gateway
+        owned by the sole account in an SMS conversation may update it. Merely
+        being one participant's gateway in a multi-account conversation is not
+        carrier authority for that conversation.
         """
         client = current_client()
         if not client or not isinstance(data, dict):
@@ -330,9 +368,8 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if device.get("kind") != "android_gateway":
             return {"ok": False, "error": "Android gateway required"}
         cid = data.get("cid")
-        try:
-            seq = int(data.get("seq") or 0)
-        except (TypeError, ValueError):
+        seq = _parse_positive_seq(data.get("seq"))
+        if seq is None:
             return {"ok": False, "error": "invalid sequence"}
         status = data.get("status")
         raw_error = data.get("error")
@@ -341,14 +378,19 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         error = raw_error[:300] if isinstance(raw_error, str) else None
         if not isinstance(cid, str) or not (1 <= len(cid) <= 64):
             return {"ok": False, "error": "invalid conversation"}
-        if seq <= 0 or not isinstance(status, str):
+        if not isinstance(status, str):
             return {"ok": False, "error": "invalid status"}
         conv = store.get_conversation_by_cid(cid)
         if not conv:
             return {"ok": False, "error": "conversation not found"}
+        if not PHONE_RE.fullmatch(str(conv.get("name") or "")):
+            return {"ok": False, "error": "carrier status requires an SMS conversation"}
+        if not store.is_self_only_conversation_owner(conv["id"], uid):
+            return {
+                "ok": False,
+                "error": "gateway does not own a self-only conversation",
+            }
         members = store.list_members(conv["id"])
-        if not any(member["user_id"] == uid for member in members):
-            return {"ok": False, "error": "forbidden"}
         if not any(member["sid"] == sid for member in members):
             return {"ok": False, "error": "gateway is not a conversation member"}
         try:
