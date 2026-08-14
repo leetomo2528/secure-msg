@@ -27,7 +27,7 @@ export default function App() {
   if (securityLocked) return <SecurityLocked />;
 
   return (
-    <div className="app-shell relative grid h-full grid-cols-1 md:grid-cols-[320px_1fr] bg-night">
+    <div className="app-shell family-shell relative grid h-full grid-cols-1 md:grid-cols-[320px_1fr] bg-night">
       {error && (
         <div className="absolute top-3 left-1/2 z-50 flex max-w-[92%] -translate-x-1/2 items-center gap-2 rounded-xl bg-red-500/10 px-4 py-2.5 text-xs text-danger-tx shadow-bubble ring-1 ring-red-400/30 backdrop-blur animate-rise">
           <span>{error}</span>
@@ -47,8 +47,8 @@ export default function App() {
           <div className="flex items-center gap-2.5">
             <BrandMark />
             <div>
-              <h1 className="text-[15px] font-bold leading-none tracking-tight text-tx-1">Secure Msg</h1>
-              <p className="mt-1 text-[10px] font-medium uppercase leading-none tracking-[0.16em] text-tx-4">Private by default</p>
+              <h1 className="family-heading text-[15px] font-bold leading-none tracking-tight text-tx-1">채팅</h1>
+              <p className="mt-1 text-[10px] font-medium uppercase leading-none tracking-[0.16em] text-tx-4">SecureMsg · private by default</p>
             </div>
           </div>
           <div className="flex items-center">

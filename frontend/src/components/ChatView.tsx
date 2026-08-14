@@ -136,8 +136,8 @@ export default function ChatView({ cid }: { cid: string }) {
   };
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 border-b border-fg/5 bg-night-soft/70 px-3 py-2.5 backdrop-blur">
+    <div className="family-chat flex h-full flex-col">
+      <div className="family-chat-header flex items-center gap-3 border-b border-fg/5 bg-night-soft/70 px-3 py-2.5 backdrop-blur">
         <button
           type="button"
           onClick={() => useStore.setState({ activeCid: null, activeMessages: [] })}
@@ -213,7 +213,7 @@ export default function ChatView({ cid }: { cid: string }) {
         </div>
       </div>
 
-      <div ref={scrollRef} className="flex-1 space-y-2.5 overflow-y-auto px-4 py-5">
+      <div ref={scrollRef} className="family-message-surface flex-1 space-y-2.5 overflow-y-auto px-4 py-5">
         {activeMessages.length === 0 && (
           <div className="pt-14 text-center text-xs leading-relaxed text-tx-4">
             메시지가 없습니다.
@@ -233,7 +233,7 @@ export default function ChatView({ cid }: { cid: string }) {
           return (
             <div key={`${m.cid}:${m.seq}`} className={`flex animate-rise ${mine ? "justify-end" : "justify-start"}`}>
               <div
-                className={`max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-bubble ${
+                className={`family-message-bubble max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed shadow-bubble ${
                   mine
                     ? "rounded-br-md bg-gradient-to-br from-teal-500 to-sky-600 text-white"
                     : "rounded-bl-md bg-fg/[0.06] text-tx-1 ring-1 ring-fg/[0.06]"
@@ -254,7 +254,7 @@ export default function ChatView({ cid }: { cid: string }) {
         })}
       </div>
 
-      <form onSubmit={submit} className="space-y-2 border-t border-fg/5 bg-night-soft/70 p-3 backdrop-blur">
+      <form onSubmit={submit} className="family-composer space-y-2 border-t border-fg/5 bg-night-soft/70 p-3 backdrop-blur">
         {(attachments.length > 0 || subject) && (
           <div className="flex items-center gap-2">
             <input
