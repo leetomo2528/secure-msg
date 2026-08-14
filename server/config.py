@@ -34,6 +34,21 @@ CORS_ORIGINS = [
     if o.strip()
 ]
 
+# Email verification/password recovery. Keep credentials outside the repo.
+# Resend is preferred for hosted deployments; SMTP remains available as a
+# fallback for self-hosted installations.
+EMAIL_PROVIDER = os.environ.get("SECUREMSG_EMAIL_PROVIDER", "resend").strip().lower()
+RESEND_API_KEY = os.environ.get("SECUREMSG_RESEND_API_KEY", "")
+RESEND_FROM = os.environ.get("SECUREMSG_RESEND_FROM", "")
+RESEND_API_URL = os.environ.get("SECUREMSG_RESEND_API_URL", "https://api.resend.com/emails")
+SMTP_HOST = os.environ.get("SECUREMSG_SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SECUREMSG_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SECUREMSG_SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SECUREMSG_SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SECUREMSG_SMTP_FROM", SMTP_USER)
+SMTP_STARTTLS = os.environ.get("SECUREMSG_SMTP_STARTTLS", "1") != "0"
+EMAIL_CODE_TTL_SECONDS = int(os.environ.get("SECUREMSG_EMAIL_CODE_TTL", "600"))
+
 LISTEN_HOST = os.environ.get("SECUREMSG_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("SECUREMSG_PORT", "5050"))
 

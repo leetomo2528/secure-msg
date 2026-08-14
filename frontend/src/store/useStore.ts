@@ -143,6 +143,8 @@ interface State {
 
   init: () => Promise<void>;
   register: (username: string, password: string) => Promise<boolean>;
+  requestEmailRegistration: (username: string, email: string, password: string) => Promise<string | null>;
+  verifyEmailRegistration: (username: string, email: string, password: string, challengeId: string, code: string) => Promise<boolean>;
   login: (username: string, password: string) => Promise<boolean>;
   addDevice: (username: string, password: string, deviceName: string) => Promise<boolean>;
   loginExistingDevice: (username: string, password: string) => Promise<boolean>;
@@ -249,6 +251,53 @@ export const useStore = create<State>((set, get) => ({
       if (!r.ok) { set({ error: r.error || "register failed" }); return false; }
       // After register, immediately register first device.
       return await get().addDevice(username, password, "first-device");
+    } catch (error) {
+      set({ error: errorText(error) });
+      return false;
+    }
+  },
+
+  requestEmailRegistration: async (username, email, password) => {
+    const entryGeneration = get().securityGeneration;
+    try {
+      if (!/^[a-z0-9_]{3,20}$/.test(username)) {
+        set({ error: "아이디는 영소문자·숫자·_ 3~20자로 입력하세요" });
+        return null;
+      }
+      if (!/^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,63}$/.test(email)) {
+        set({ error: "올바른 이메일 주소를 입력하세요" });
+        return null;
+      }
+      if (password.length < 8 || password.length > 1024) {
+        set({ error: "비밀번호는 8~1,024자로 입력하세요" });
+        return null;
+      }
+      const pwHash = await hashPassword(password, saltForUser(username));
+      if (get().securityGeneration !== entryGeneration) return null;
+      const result = await api.registerEmailRequest(username, email, pwHash);
+      if (get().securityGeneration !== entryGeneration) return null;
+      if (!result.ok || !result.challenge_id) {
+        set({ error: result.error ?? "인증 메일을 보내지 못했습니다." });
+        return null;
+      }
+      set({ error: null });
+      return result.challenge_id;
+    } catch (error) {
+      set({ error: errorText(error) });
+      return null;
+    }
+  },
+
+  verifyEmailRegistration: async (username, email, password, challengeId, code) => {
+    const entryGeneration = get().securityGeneration;
+    try {
+      const result = await api.registerEmailVerify(challengeId, code);
+      if (get().securityGeneration !== entryGeneration) return false;
+      if (!result.ok || result.username !== username || result.email !== email) {
+        set({ error: result.error ?? "인증 코드가 올바르지 않습니다." });
+        return false;
+      }
+      return await get().addDevice(username, password, "web-browser");
     } catch (error) {
       set({ error: errorText(error) });
       return false;

@@ -301,6 +301,20 @@ export class Api {
       username, pw_hash: pwHash, sid, challenge_id: challengeId, challenge, proof,
     });
   }
+  registerEmailRequest(username: string, email: string, pwHash: string): Promise<ApiResult & { challenge_id?: string; expires_at?: number }> {
+    return this.post("/register/email/request", { username, email, pw_hash: pwHash });
+  }
+  registerEmailVerify(challengeId: string, code: string): Promise<ApiResult & { uid?: number; username?: string; email?: string }> {
+    return this.post("/register/email/verify", { challenge_id: challengeId, code });
+  }
+  passwordResetRequest(username: string, email: string): Promise<ApiResult & { challenge_id?: string; expires_at?: number }> {
+    return this.post("/password-reset/request", { username, email });
+  }
+  passwordResetConfirm(username: string, email: string, challengeId: string, code: string, pwHash: string): Promise<ApiResult> {
+    return this.post("/password-reset/confirm", {
+      username, email, challenge_id: challengeId, code, pw_hash: pwHash,
+    });
+  }
   /** Invalidate the current bearer token without recursively firing onUnauthorized. */
   logout(): Promise<ApiResult> {
     return this.request("/logout", { method: "POST", body: JSON.stringify({}) }, false);

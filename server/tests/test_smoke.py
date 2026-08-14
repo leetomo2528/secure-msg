@@ -101,6 +101,70 @@ class ServerSmokeTest(unittest.TestCase):
             self.assertEqual(approved.status_code, 200, approved.json)
         return response
 
+    def test_email_registration_and_password_reset_codes(self):
+        username = "mail_" + self._testMethodName[-8:]
+        email = f"{username}@example.test"
+        with mock.patch("emailer.send_code") as send_code:
+            requested = self.client.post(
+                "/api/register/email/request",
+                json={"username": username, "email": email, "pw_hash": self.pw_hash},
+            )
+            self.assertEqual(requested.status_code, 200, requested.json)
+            self.assertEqual(send_code.call_args.args[0], email)
+            code = send_code.call_args.args[2]
+            verified = self.client.post(
+                "/api/register/email/verify",
+                json={"challenge_id": requested.json["challenge_id"], "code": code},
+            )
+            self.assertEqual(verified.status_code, 200, verified.json)
+            self.assertEqual(verified.json["username"], username)
+            self.assertEqual(store.get_user_by_email(email)["email_verified_at"] > 0, True)
+
+            reset_requested = self.client.post(
+                "/api/password-reset/request",
+                json={"username": username, "email": email},
+            )
+            self.assertEqual(reset_requested.status_code, 200, reset_requested.json)
+            reset_code = send_code.call_args.args[2]
+            reset = self.client.post(
+                "/api/password-reset/confirm",
+                json={
+                    "username": username,
+                    "email": email,
+                    "challenge_id": reset_requested.json["challenge_id"],
+                    "code": reset_code,
+                    "pw_hash": "B" * 43,
+                },
+            )
+            self.assertEqual(reset.status_code, 200, reset.json)
+
+    def test_resend_email_provider_posts_server_side_api_request(self):
+        import emailer
+        from urllib.request import Request
+
+        original = {
+            "provider": emailer.config.EMAIL_PROVIDER,
+            "key": emailer.config.RESEND_API_KEY,
+            "from": emailer.config.RESEND_FROM,
+        }
+        try:
+            emailer.config.EMAIL_PROVIDER = "resend"
+            emailer.config.RESEND_API_KEY = "re_test"
+            emailer.config.RESEND_FROM = "SecureMsg <no-reply@example.test>"
+            with mock.patch("emailer.urlopen") as opener:
+                response = mock.MagicMock(status=200)
+                response.__enter__.return_value = response
+                opener.return_value = response
+                emailer.send_code("user@example.test", "subject", "123456", "가입 인증")
+                request = opener.call_args.args[0]
+                self.assertIsInstance(request, Request)
+                self.assertEqual(request.get_header("Authorization"), "Bearer re_test")
+                self.assertIn(b"123456", request.data)
+        finally:
+            emailer.config.EMAIL_PROVIDER = original["provider"]
+            emailer.config.RESEND_API_KEY = original["key"]
+            emailer.config.RESEND_FROM = original["from"]
+
     def approval_payload(self, registration):
         subject = store.get_device_by_sid(registration.json["sid"])
         statement = approval_statement(

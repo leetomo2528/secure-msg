@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
     security_epoch INTEGER NOT NULL DEFAULT 0,
     directory_hash TEXT NOT NULL DEFAULT '',
     trust_enforced_at INTEGER
-    ,security_mode TEXT NOT NULL DEFAULT 'verified_v2'
+    ,security_mode TEXT NOT NULL DEFAULT 'verified_v2',
+    email         TEXT UNIQUE,
+    email_verified_at INTEGER
 );
 
 -- Devices: one user can have many devices. Each device owns its keypair (private key stays client-side).
@@ -62,6 +64,35 @@ CREATE TABLE IF NOT EXISTS device_login_challenges (
 );
 CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device
     ON device_login_challenges(device_id, created_at);
+
+-- Short-lived email codes. Raw codes are never stored; code_digest is an
+-- HMAC keyed by the server JWT secret and the challenge id.
+CREATE TABLE IF NOT EXISTS email_verification_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    username TEXT NOT NULL,
+    pw_hash TEXT NOT NULL,
+    code_digest TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_email_verification_email
+    ON email_verification_challenges(email, created_at);
+
+CREATE TABLE IF NOT EXISTS password_reset_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    code_digest TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_user
+    ON password_reset_challenges(user_id, created_at);
 
 CREATE TABLE IF NOT EXISTS device_approvals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

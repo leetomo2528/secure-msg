@@ -24,6 +24,7 @@ import bcrypt
 import config
 import jwt
 import store
+import emailer
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 from flask import Blueprint, g, jsonify, request
@@ -33,6 +34,7 @@ bp = Blueprint("auth", __name__, url_prefix="/api")
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 SID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}", re.ASCII)
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,63}$", re.ASCII)
 LOGIN_PROOF_DOMAIN = "securemsg-device-login-v1"
 
 # Precomputed bcrypt hash (same cost as real stored hashes) so credential checks
@@ -110,6 +112,25 @@ def _text(body: dict, field: str) -> str:
 def _json_body() -> dict | None:
     body = request.get_json(silent=True)
     return body if isinstance(body, dict) else None
+
+
+def _email(value: object) -> str:
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _code_digest(challenge_id: str, code: str) -> str:
+    material = f"securemsg-email-code-v1\n{challenge_id}\n{code}".encode("utf-8")
+    return base64.urlsafe_b64encode(
+        __import__("hmac").new(config.JWT_SECRET.encode("utf-8"), material, __import__("hashlib").sha256).digest()
+    ).decode("ascii").rstrip("=")
+
+
+def _new_email_code() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _email_ok(value: str) -> bool:
+    return len(value) <= 320 and bool(EMAIL_RE.fullmatch(value))
 
 
 def device_login_statement(uid: int, sid: str, challenge_id: str, challenge: str, session_version: int) -> str:
@@ -230,6 +251,114 @@ def register():
     except sqlite3.IntegrityError:
         return _err("username already taken", 409)
     return _ok(uid=uid, username=username)
+
+
+@bp.post("/register/email/request")
+def register_email_request():
+    """Start a web registration with a verified recovery email."""
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    username = _text(body, "username").strip().lower()
+    email = _email(body.get("email"))
+    pw_hash = _text(body, "pw_hash")
+    if not USERNAME_RE.fullmatch(username) or not _email_ok(email) or not _valid_client_hash(pw_hash):
+        return _err("username, email and password are required", 400)
+    if store.get_user_by_name(username) or store.get_user_by_email(email):
+        return _err("username or email already taken", 409)
+    challenge_id = secrets.token_urlsafe(18)
+    code = _new_email_code()
+    expires_at = int(time.time()) + config.EMAIL_CODE_TTL_SECONDS
+    store.create_email_verification_challenge(
+        challenge_id, email, username, pw_hash, _code_digest(challenge_id, code), expires_at,
+    )
+    try:
+        emailer.send_code(email, "SecureMsg 이메일 인증 코드", code, "가입 인증")
+    except Exception:
+        return _err("이메일을 보낼 수 없습니다. 서버 메일 설정을 확인하세요.", 503)
+    return _ok(challenge_id=challenge_id, expires_at=expires_at)
+
+
+@bp.post("/register/email/verify")
+def register_email_verify():
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    challenge_id = _text(body, "challenge_id")
+    code = _text(body, "code").strip()
+    if not B64U_RE.fullmatch(challenge_id) or not re.fullmatch(r"[0-9]{6}", code):
+        return _err("verification code is invalid", 400)
+    pending = store.consume_email_verification(
+        challenge_id, _code_digest(challenge_id, code), int(time.time()),
+    )
+    if pending is None:
+        return _err("verification code is invalid or expired", 400)
+    server_hash = bcrypt.hashpw(pending["pw_hash"].encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    try:
+        uid = store.create_user(pending["username"], server_hash, pending["email"], int(time.time()))
+    except sqlite3.IntegrityError:
+        return _err("username or email already taken", 409)
+    return _ok(uid=uid, username=pending["username"], email=pending["email"])
+
+
+@bp.post("/password-reset/request")
+def password_reset_request():
+    """Send a reset code; always return a generic response to avoid enumeration."""
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    username = _text(body, "username").strip().lower()
+    email = _email(body.get("email"))
+    challenge_id = secrets.token_urlsafe(18)
+    response = _ok(
+        message="계정이 존재하면 이메일로 인증 코드를 보냈습니다.",
+        challenge_id=challenge_id,
+        expires_at=int(time.time()) + config.EMAIL_CODE_TTL_SECONDS,
+    )
+    if not USERNAME_RE.fullmatch(username) or not _email_ok(email):
+        return response
+    user = store.get_user_by_name(username)
+    # A manually linked-but-not-yet-verified address can still receive the
+    # first reset code; completing that code marks the address verified.
+    if not user or user.get("email") != email:
+        return response
+    code = _new_email_code()
+    expires_at = int(time.time()) + config.EMAIL_CODE_TTL_SECONDS
+    store.create_password_reset_challenge(
+        challenge_id, int(user["id"]), email, _code_digest(challenge_id, code), expires_at,
+    )
+    try:
+        emailer.send_code(email, "SecureMsg 비밀번호 재설정 코드", code, "비밀번호 재설정")
+    except Exception:
+        # Do not reveal whether this email belongs to an account.
+        pass
+    return response
+
+
+@bp.post("/password-reset/confirm")
+def password_reset_confirm():
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    username = _text(body, "username").strip().lower()
+    email = _email(body.get("email"))
+    challenge_id = _text(body, "challenge_id")
+    code = _text(body, "code").strip()
+    pw_hash = _text(body, "pw_hash")
+    if (not USERNAME_RE.fullmatch(username) or not _email_ok(email)
+            or not B64U_RE.fullmatch(challenge_id) or not re.fullmatch(r"[0-9]{6}", code)
+            or not _valid_client_hash(pw_hash)):
+        return _err("invalid password reset request", 400)
+    user = store.get_user_by_name(username)
+    if not user or user.get("email") != email:
+        return _err("invalid password reset request", 400)
+    server_hash = bcrypt.hashpw(pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    reset_username = store.consume_password_reset(
+        challenge_id, email, _code_digest(challenge_id, code), server_hash, int(time.time()),
+    )
+    if reset_username is None or reset_username != username:
+        return _err("verification code is invalid or expired", 400)
+    return _ok(username=username, message="비밀번호가 변경되었습니다.")
 
 
 @bp.post("/login")

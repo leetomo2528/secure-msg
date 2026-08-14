@@ -111,6 +111,38 @@ def init_schema() -> None:
             c.execute("ALTER TABLE users ADD COLUMN trust_enforced_at INTEGER")
         if "security_mode" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN security_mode TEXT NOT NULL DEFAULT 'legacy_v1'")
+        if "email" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if "email_verified_at" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN email_verified_at INTEGER")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS email_verification_challenges (
+                challenge_id TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                username TEXT NOT NULL,
+                pw_hash TEXT NOT NULL,
+                code_digest TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consumed_at INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_email ON email_verification_challenges(email, created_at)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS password_reset_challenges (
+                challenge_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                email TEXT NOT NULL,
+                code_digest TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consumed_at INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_challenges(user_id, created_at)")
         # Migration: add name column if missing (existing DBs created before this column).
         cols = [
             row[1] for row in c.execute("PRAGMA table_info(conversations)").fetchall()
@@ -360,11 +392,11 @@ def _append_security_event_locked(
 # ----- users -------------------------------------------------------------
 
 
-def create_user(username: str, pw_hash: str) -> int:
+def create_user(username: str, pw_hash: str, email: str | None = None, email_verified_at: int | None = None) -> int:
     with conn_ctx() as c:
         cur = c.execute(
-            "INSERT INTO users(username, pw_hash, created_at) VALUES (?, ?, ?)",
-            (username, pw_hash, now()),
+            "INSERT INTO users(username, pw_hash, created_at, email, email_verified_at) VALUES (?, ?, ?, ?, ?)",
+            (username, pw_hash, now(), email, email_verified_at),
         )
         return cur.lastrowid
 
@@ -372,10 +404,104 @@ def create_user(username: str, pw_hash: str) -> int:
 def get_user_by_name(username: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, username, pw_hash, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE username = ?",
+            "SELECT id, username, pw_hash, email, email_verified_at, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE username = ?",
             (username,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_user_by_email(email: str) -> dict[str, Any] | None:
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT id, username, pw_hash, email, email_verified_at, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_email_verification_challenge(
+    challenge_id: str, email: str, username: str, pw_hash: str,
+    code_digest: str, expires_at: int,
+) -> None:
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "UPDATE email_verification_challenges SET consumed_at=COALESCE(consumed_at, created_at) WHERE email=? AND consumed_at IS NULL",
+            (email,),
+        )
+        c.execute(
+            "INSERT INTO email_verification_challenges(challenge_id,email,username,pw_hash,code_digest,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
+            (challenge_id, email, username, pw_hash, code_digest, expires_at, now()),
+        )
+        c.execute("COMMIT")
+
+
+def consume_email_verification(
+    challenge_id: str, code_digest: str, timestamp: int,
+) -> dict[str, Any] | None:
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT email,username,pw_hash,code_digest,expires_at,attempts,consumed_at FROM email_verification_challenges WHERE challenge_id=?",
+            (challenge_id,),
+        ).fetchone()
+        if (not row or row["consumed_at"] is not None or int(row["expires_at"]) < timestamp
+                or int(row["attempts"]) >= 5 or not hmac.compare_digest(row["code_digest"], code_digest)):
+            if row and row["consumed_at"] is None and int(row["attempts"]) < 5:
+                c.execute("UPDATE email_verification_challenges SET attempts=attempts+1 WHERE challenge_id=?", (challenge_id,))
+                c.execute("COMMIT")
+            else:
+                c.execute("ROLLBACK")
+            return None
+        c.execute("UPDATE email_verification_challenges SET consumed_at=? WHERE challenge_id=?", (timestamp, challenge_id))
+        result = {"email": row["email"], "username": row["username"], "pw_hash": row["pw_hash"]}
+        c.execute("COMMIT")
+        return result
+
+
+def create_password_reset_challenge(
+    challenge_id: str, user_id: int, email: str, code_digest: str, expires_at: int,
+) -> None:
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            "UPDATE password_reset_challenges SET consumed_at=COALESCE(consumed_at, created_at) WHERE user_id=? AND consumed_at IS NULL",
+            (user_id,),
+        )
+        c.execute(
+            "INSERT INTO password_reset_challenges(challenge_id,user_id,email,code_digest,expires_at,created_at) VALUES(?,?,?,?,?,?)",
+            (challenge_id, user_id, email, code_digest, expires_at, now()),
+        )
+        c.execute("COMMIT")
+
+
+def consume_password_reset(
+    challenge_id: str, email: str, code_digest: str, new_pw_hash: str, timestamp: int,
+) -> str | None:
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT user_id,email,code_digest,expires_at,attempts,consumed_at FROM password_reset_challenges WHERE challenge_id=?",
+            (challenge_id,),
+        ).fetchone()
+        if (not row or row["consumed_at"] is not None or int(row["expires_at"]) < timestamp
+                or int(row["attempts"]) >= 5 or row["email"] != email
+                or not hmac.compare_digest(row["code_digest"], code_digest)):
+            if row and row["consumed_at"] is None and int(row["attempts"]) < 5:
+                c.execute("UPDATE password_reset_challenges SET attempts=attempts+1 WHERE challenge_id=?", (challenge_id,))
+                c.execute("COMMIT")
+            else:
+                c.execute("ROLLBACK")
+            return None
+        user = c.execute("SELECT username,email FROM users WHERE id=?", (row["user_id"],)).fetchone()
+        if not user or user["email"] != email:
+            c.execute("ROLLBACK")
+            return None
+        c.execute("UPDATE password_reset_challenges SET consumed_at=? WHERE challenge_id=?", (timestamp, challenge_id))
+        c.execute("UPDATE users SET pw_hash=? WHERE id=?", (new_pw_hash, row["user_id"]))
+        c.execute("UPDATE devices SET session_version=session_version+1 WHERE user_id=?", (row["user_id"],))
+        c.execute("COMMIT")
+        return str(user["username"])
 
 
 def _get_user_with_conn(c: sqlite3.Connection, uid: int) -> dict[str, Any] | None:

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../store/useStore";
+import { api } from "../net/api";
+import { hashPassword, saltForUser } from "../crypto/keys";
 import BrandMark from "./BrandMark";
 import OnboardingPolicyNotice from "./OnboardingPolicyNotice";
 import { Segmented } from "./ui";
@@ -7,10 +9,20 @@ import { Segmented } from "./ui";
 type Mode = "login" | "register";
 
 export default function Onboarding() {
-  const { login, register, forgetLocalDevice, error, username: rememberedUsername } = useStore();
+  const { login, requestEmailRegistration, verifyEmailRegistration, forgetLocalDevice, error, username: rememberedUsername } = useStore();
   const [mode, setMode] = useState<Mode>("login");
   const [username, setUsername] = useState(rememberedUsername ?? "");
   const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("");
+  const [registrationChallenge, setRegistrationChallenge] = useState<string | null>(null);
+  const [registrationCode, setRegistrationCode] = useState("");
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetUsername, setResetUsername] = useState("");
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [resetChallenge, setResetChallenge] = useState<string | null>(null);
+  const [resetPassword, setResetPassword] = useState("");
+  const [resetMessage, setResetMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -22,12 +34,44 @@ export default function Onboarding() {
     if (busy) return;
     setBusy(true);
     try {
+      const normalizedUsername = username.trim().toLowerCase();
       const ok = mode === "login"
-        ? await login(username.trim().toLowerCase(), password)
-        : await register(username.trim().toLowerCase(), password);
+        ? await login(normalizedUsername, password)
+        : registrationChallenge
+          ? await verifyEmailRegistration(normalizedUsername, email.trim().toLowerCase(), password, registrationChallenge, registrationCode.trim())
+          : Boolean(await requestEmailRegistration(normalizedUsername, email.trim().toLowerCase(), password).then((challenge) => {
+              setRegistrationChallenge(challenge);
+              return challenge;
+            }));
       if (!ok) { /* error already in store */ }
     } finally {
       setBusy(false);
+    }
+  };
+
+  const requestReset = async () => {
+    setResetMessage(null);
+    const result = await api.passwordResetRequest(resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase());
+    if (result.ok) {
+      setResetMessage("계정이 존재하면 이메일로 인증 코드를 보냈습니다.");
+      setResetChallenge(result.challenge_id ?? null);
+    } else setResetMessage(result.error ?? "재설정 메일을 보내지 못했습니다.");
+  };
+
+  const confirmReset = async () => {
+    if (!resetChallenge || resetChallenge === "pending") {
+      setResetMessage("먼저 인증 메일을 요청하세요.");
+      return;
+    }
+    const pwHash = await hashPassword(resetPassword, saltForUser(resetUsername.trim().toLowerCase()));
+    const result = await api.passwordResetConfirm(
+      resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase(), resetChallenge, resetCode.trim(), pwHash,
+    );
+    setResetMessage(result.ok ? "비밀번호가 변경되었습니다. 로그인해 주세요." : result.error ?? "인증 코드가 올바르지 않습니다.");
+    if (result.ok) {
+      setResetOpen(false);
+      setResetChallenge(null);
+      setPassword("");
     }
   };
 
@@ -111,6 +155,15 @@ export default function Onboarding() {
             />
           </div>
 
+          {mode === "register" && (
+            <div className="space-y-2">
+              <label className="form-label" htmlFor="ob-email">인증 이메일</label>
+              <input id="ob-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" className="field" placeholder="you@example.com" required />
+              {registrationChallenge && <input value={registrationCode} onChange={(e) => setRegistrationCode(e.target.value)} inputMode="numeric" maxLength={6} className="field" placeholder="이메일로 받은 6자리 코드" required />}
+              {registrationChallenge && <p className="text-[11px] text-brand-teal">인증 코드가 전송되었습니다. 코드를 입력하고 가입을 완료하세요.</p>}
+            </div>
+          )}
+
           <div className="space-y-2">
             <label className="form-label" htmlFor="ob-password">
               비밀번호 (8자 이상)
@@ -138,8 +191,23 @@ export default function Onboarding() {
           )}
 
           <button type="submit" disabled={busy} className="btn-primary w-full !py-3.5">
-            {busy ? "처리 중…" : mode === "login" ? "로그인" : "가입 및 첫 기기 등록"}
+            {busy ? "처리 중…" : mode === "login" ? "로그인" : registrationChallenge ? "이메일 인증 및 가입" : "인증 메일 보내기"}
           </button>
+
+          {mode === "login" && <button type="button" onClick={() => setResetOpen((open) => !open)} className="mx-auto block text-[11px] text-white/60 transition hover:text-white">비밀번호를 잊으셨나요?</button>}
+
+          {resetOpen && (
+            <div className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.04] p-4 animate-rise">
+              <p className="text-sm font-semibold text-white">비밀번호 재설정</p>
+              <p className="text-[11px] leading-relaxed text-white/50">가입 때 인증한 이메일로 6자리 코드를 보냅니다.</p>
+              <input value={resetUsername} onChange={(e) => setResetUsername(e.target.value)} className="field" placeholder="아이디" />
+              <input type="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} className="field" placeholder="인증 이메일" />
+              {resetChallenge && <input value={resetCode} onChange={(e) => setResetCode(e.target.value)} inputMode="numeric" maxLength={6} className="field" placeholder="6자리 인증 코드" />}
+              {resetChallenge && <input type="password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} minLength={8} className="field" placeholder="새 비밀번호 (8자 이상)" />}
+              {resetMessage && <p className="text-[11px] leading-relaxed text-white/65">{resetMessage}</p>}
+              <button type="button" onClick={() => void (resetChallenge ? confirmReset() : requestReset())} className="btn-ghost w-full !py-2.5 text-xs">{resetChallenge ? "비밀번호 변경" : "인증 코드 받기"}</button>
+            </div>
+          )}
 
           <p className="text-center text-[11px] leading-relaxed text-white/40">
             가입하면 암호화 키쌍이 이 브라우저의 IndexedDB에 생성됩니다.
