@@ -16,6 +16,9 @@ class AppUpdaterTest {
         assertTrue(AppUpdater.isNewer("1.0.0", "0.99.99"))
         assertTrue(AppUpdater.isNewer("v0.7.0", "0.6.1"))
         assertTrue(AppUpdater.isNewer("0.6.1.1", "0.6.1"))
+        // Regression for the first web-family release: a v0.10.0 install
+        // must recognize the current v0.10.4 release.
+        assertTrue(AppUpdater.isNewer("0.10.4", "0.10.0"))
     }
 
     @Test
@@ -47,6 +50,16 @@ class AppUpdaterTest {
         assertEquals("https://x/app-debug.apk", info.apkUrl)
         assertEquals(12345678L, info.sizeBytes)
         assertTrue(info.notes.contains("새 기능"))
+    }
+
+    @Test
+    fun parseCurrentReleaseWithDebugApk() {
+        val info = AppUpdater.parseRelease(
+            """{"tag_name":"v0.10.4","assets":[{"name":"app-debug.apk","browser_download_url":"https://x/app-debug.apk","size":27473122}]}""",
+        )
+        assertNotNull(info)
+        assertEquals("0.10.4", info!!.versionName)
+        assertEquals(27473122L, info.sizeBytes)
     }
 
     @Test

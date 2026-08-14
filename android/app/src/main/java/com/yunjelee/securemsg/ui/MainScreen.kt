@@ -173,6 +173,18 @@ fun MainScreen(
             }
         }
 
+        // The updater checks in the background from this screen. Keep the
+        // resulting action visible here; without this banner an Available
+        // result was silently reduced to the settings-card status text.
+        UpdateBanner(
+            state = update.state,
+            onUpdate = update.onUpdate,
+            onInstall = update.onInstall,
+            onRetry = update.onRetry,
+            onCloseInstallBlocked = update.onCloseInstallBlocked,
+            onDismiss = update.onDismiss,
+        )
+
         SmTabs(
             selected = selectedSection,
             labels = listOf("메시지", "차단·설정"),
