@@ -1,5 +1,17 @@
 # 업데이트 내역
 
+## v0.10.3 (2026-08-14) — 보안·수신 안정성 패치
+
+- 기존 기기 로그인에 Ed25519 개인키 소유 증명 challenge-response 추가
+- Room v11 provider epoch/fingerprint 기반 SMS·MMS 중복·Provider ID 재사용 방어
+- provider-less 이벤트 ACK tombstone 및 pending provider ID alias 처리
+- MMS placeholder·비표준 MIME·multipart carrier callback 처리 안정화
+- 모호한 carrier 발송 상태의 자동 재전송을 막아 중복 SMS/MMS 발송 방지
+- relay malformed/decrypt 실패 시 cursor를 건너뛰지 않는 fail-safe 동기화
+- 서버 message MID payload 충돌 검증 및 폐기 기기 fanout 경쟁조건 수정
+- 웹 trust-mode downgrade, stale session mutation, trust-anchor 보존 처리 강화
+- 서버 65개, 웹 137개, Android debug/release 148개, Rust 13개 테스트 통과
+
 ## v0.10.2 (2026-08-11) — Android 화면 단순화
 
 - 메시지 화면에서 버전·업데이트·장문 권한 설명을 제거하고 핵심 상태와 작업만 표시
