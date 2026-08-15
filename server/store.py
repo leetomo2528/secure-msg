@@ -498,7 +498,12 @@ def consume_password_reset(
             c.execute("ROLLBACK")
             return None
         c.execute("UPDATE password_reset_challenges SET consumed_at=? WHERE challenge_id=?", (timestamp, challenge_id))
-        c.execute("UPDATE users SET pw_hash=? WHERE id=?", (new_pw_hash, row["user_id"]))
+        # Possession of the reset mailbox proves ownership of a previously
+        # linked address, so the first successful reset also verifies it.
+        c.execute(
+            "UPDATE users SET pw_hash=?, email_verified_at=COALESCE(email_verified_at, ?) WHERE id=?",
+            (new_pw_hash, timestamp, row["user_id"]),
+        )
         c.execute("UPDATE devices SET session_version=session_version+1 WHERE user_id=?", (row["user_id"],))
         c.execute("COMMIT")
         return str(user["username"])
