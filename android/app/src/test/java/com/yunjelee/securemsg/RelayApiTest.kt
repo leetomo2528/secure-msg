@@ -72,6 +72,44 @@ class RelayApiTest {
     }
 
     @Test
+    fun passwordResetRequestAndConfirmUsePublicEndpoints() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"challenge_id\":\"c1\"}"))
+        server.enqueue(jsonResponse(200, "{\"ok\":true}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+
+        assertTrue(api.requestPasswordReset("alice", "alice@example.com").getBoolean("ok"))
+        val request = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals("alice", request.getString("username"))
+        assertEquals("alice@example.com", request.getString("email"))
+
+        assertTrue(api.confirmPasswordReset("alice", "alice@example.com", "c1", "123456", "hash").getBoolean("ok"))
+        val confirm = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals("c1", confirm.getString("challenge_id"))
+        assertEquals("123456", confirm.getString("code"))
+        assertEquals("hash", confirm.getString("pw_hash"))
+    }
+
+    @Test
+    fun emailRegistrationUsesRequestAndVerifyEndpoints() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"challenge_id\":\"c1\"}"))
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"username\":\"alice\"}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+
+        assertTrue(api.registerEmailRequest("alice", "alice@example.com", "hash").getBoolean("ok"))
+        val requestCall = server.takeRequest()
+        val request = JSONObject(requestCall.body.readUtf8())
+        assertEquals("/api/register/email/request", requestCall.path)
+        assertEquals("alice@example.com", request.getString("email"))
+
+        assertTrue(api.registerEmailVerify("c1", "123456").getBoolean("ok"))
+        val verifyCall = server.takeRequest()
+        val verify = JSONObject(verifyCall.body.readUtf8())
+        assertEquals("/api/register/email/verify", verifyCall.path)
+        assertEquals("c1", verify.getString("challenge_id"))
+        assertEquals("123456", verify.getString("code"))
+    }
+
+    @Test
     fun canonicalDeviceLoginStatementBindsSessionAndChallenge() {
         val canonical = DeviceLoginStatement(7, "device01", "challenge-id", "A".repeat(43), 4).canonical()
         assertEquals(

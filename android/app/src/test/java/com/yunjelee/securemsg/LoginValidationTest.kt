@@ -11,9 +11,8 @@ class LoginValidationTest {
 
     @Test
     fun onboardingWarnsAboutAccountRecoveryAndSessionExpiry() {
-        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("비밀번호 재설정·계정 복구 수단이 없습니다"))
-        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("세션은 만료 전까지 동작할 수"))
-        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("세션 만료 후에는 다시 로그인할 수 없습니다"))
+        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("이메일 인증코드"))
+        assertTrue(ACCOUNT_RECOVERY_WARNING.contains("비밀번호를 재설정할 수 있습니다"))
     }
 
     @Test

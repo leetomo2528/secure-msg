@@ -52,9 +52,11 @@ import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 internal const val ACCOUNT_RECOVERY_WARNING =
-    "비밀번호 재설정·계정 복구 수단이 없습니다. 비밀번호를 잊으면 현재 로그인된 세션은 만료 전까지 동작할 수 있지만, 세션 만료 후에는 다시 로그인할 수 없습니다."
+    "이메일 인증코드로 비밀번호를 재설정할 수 있습니다. 가입 또는 재설정에 사용한 이메일 주소를 안전하게 보관하세요."
 internal const val NEW_DEVICE_HISTORY_WARNING =
     "새 휴대폰·새 설치는 기기 등록 이전 메시지를 복호화할 수 없습니다. 현재는 기존 기기 전송이나 암호화 백업 기능을 제공하지 않습니다."
+
+private class EmailRegistrationRequired(val challengeId: String) : Exception()
 
 /** Login / auto-register screen (self-hosted relay, arbitrary username). */
 @Composable
@@ -67,10 +69,19 @@ fun LoginScreen(
     val scope = rememberCoroutineScope()
     var username by remember(rememberedUsername) { mutableStateOf(rememberedUsername.orEmpty()) }
     var password by remember { mutableStateOf("") }
+    var registrationEmail by remember { mutableStateOf("") }
+    var registrationChallenge by remember { mutableStateOf<String?>(null) }
+    var registrationCode by remember { mutableStateOf("") }
     var serverUrl by remember { mutableStateOf(ServerConfig.url(context)) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var confirmForget by remember { mutableStateOf(false) }
+    var recoveryOpen by remember { mutableStateOf(false) }
+    var recoveryEmail by remember { mutableStateOf("") }
+    var recoveryCode by remember { mutableStateOf("") }
+    var recoveryChallenge by remember { mutableStateOf<String?>(null) }
+    var recoveryNewPassword by remember { mutableStateOf("") }
+    var recoveryMessage by remember { mutableStateOf<String?>(null) }
 
     if (confirmForget) {
         AlertDialog(
@@ -152,6 +163,20 @@ fun LoginScreen(
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
                 )
+                SmTextField(
+                    value = registrationEmail,
+                    onValueChange = { registrationEmail = it.take(320) },
+                    label = "가입 이메일 (새 계정)", singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                registrationChallenge?.let {
+                    SmTextField(
+                        value = registrationCode,
+                        onValueChange = { registrationCode = it.filter(Char::isDigit).take(6) },
+                        label = "가입 인증코드 (6자리)", singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 error?.let {
                     Text(
                         it, color = Sm.danger, fontSize = 12.sp, lineHeight = 16.sp,
@@ -171,7 +196,10 @@ fun LoginScreen(
                         busy = true; error = null
                         scope.launch(Dispatchers.IO) {
                             try {
-                                val saved = doLogin(context, serverUrl.trim(), username.trim(), password)
+                                val saved = doLogin(
+                                    context, serverUrl.trim(), username.trim(), password,
+                                    registrationEmail.trim(), registrationChallenge, registrationCode,
+                                )
                                 withContext(Dispatchers.Main) {
                                     ServerConfig.save(context, serverUrl.trim())
                                     onLogin(saved)
@@ -180,6 +208,12 @@ fun LoginScreen(
                                 Log.e("LoginScreen", "Crypto native library initialization failed", e)
                                 withContext(Dispatchers.Main) {
                                     error = "암호화 모듈을 불러오지 못했습니다. 앱을 최신 버전으로 다시 설치해 주세요."
+                                }
+                            } catch (e: EmailRegistrationRequired) {
+                                withContext(Dispatchers.Main) {
+                                    registrationChallenge = e.challengeId
+                                    registrationCode = ""
+                                    error = "가입 이메일로 인증코드를 보냈습니다. 코드를 입력한 뒤 다시 눌러 주세요."
                                 }
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) { error = e.message ?: "로그인에 실패했습니다." }
@@ -200,6 +234,105 @@ fun LoginScreen(
                             .padding(6.dp),
                     )
                 }
+                Text(
+                    if (recoveryOpen) "비밀번호 찾기 닫기" else "비밀번호를 잊으셨나요?",
+                    color = Sm.cyan, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            recoveryOpen = !recoveryOpen
+                            error = null
+                            recoveryMessage = null
+                        }
+                        .padding(6.dp),
+                )
+                if (recoveryOpen) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "가입한 이메일로 인증코드를 보내 새 비밀번호를 설정합니다.",
+                        color = Sm.text3, fontSize = 11.sp, lineHeight = 16.sp,
+                    )
+                    SmTextField(
+                        value = recoveryEmail,
+                        onValueChange = { recoveryEmail = it.take(320) },
+                        label = "가입 이메일", singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (recoveryChallenge == null) {
+                        SmGradientButton(
+                            text = if (busy) "전송 중…" else "인증코드 받기",
+                            enabled = !busy && username.isNotBlank() && recoveryEmail.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                busy = true; error = null; recoveryMessage = null
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val challenge = requestPasswordReset(
+                                            context, serverUrl.trim(), username.trim(), recoveryEmail.trim(),
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            recoveryChallenge = challenge
+                                            recoveryMessage = "인증코드를 이메일로 보냈습니다. 10분 안에 입력하세요."
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) { error = e.message ?: "인증코드 전송에 실패했습니다." }
+                                    } finally {
+                                        withContext(Dispatchers.Main) { busy = false }
+                                    }
+                                }
+                            },
+                        )
+                    } else {
+                        SmTextField(
+                            value = recoveryCode,
+                            onValueChange = { recoveryCode = it.filter(Char::isDigit).take(6) },
+                            label = "이메일 인증코드 (6자리)", singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        SmTextField(
+                            value = recoveryNewPassword,
+                            onValueChange = { recoveryNewPassword = it.take(1024) },
+                            label = "새 비밀번호 (8자 이상)", singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        SmGradientButton(
+                            text = if (busy) "변경 중…" else "비밀번호 변경",
+                            enabled = !busy && recoveryCode.length == 6 && recoveryNewPassword.length >= 8,
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                busy = true; error = null; recoveryMessage = null
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        confirmPasswordReset(
+                                            context, serverUrl.trim(), username.trim(), recoveryEmail.trim(),
+                                            recoveryChallenge.orEmpty(), recoveryCode, recoveryNewPassword,
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            recoveryOpen = false
+                                            recoveryChallenge = null
+                                            recoveryCode = ""
+                                            recoveryNewPassword = ""
+                                            recoveryMessage = "비밀번호가 변경되었습니다. 새 비밀번호로 로그인하세요."
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) { error = e.message ?: "비밀번호 변경에 실패했습니다." }
+                                    } finally {
+                                        withContext(Dispatchers.Main) { busy = false }
+                                    }
+                                }
+                            },
+                        )
+                        TextButton(onClick = {
+                            recoveryChallenge = null
+                            recoveryCode = ""
+                            error = null
+                        }) { Text("인증코드 다시 받기", color = Sm.text3) }
+                    }
+                    recoveryMessage?.let {
+                        Text(it, color = Sm.cyan, fontSize = 12.sp, lineHeight = 16.sp)
+                    }
+                }
             }
             Text(
                 "v${BuildConfig.VERSION_NAME}",
@@ -211,6 +344,57 @@ fun LoginScreen(
     }
 }
 
+internal suspend fun requestPasswordReset(
+    context: Context,
+    serverUrl: String,
+    username: String,
+    email: String,
+): String {
+    if (!Regex("^[a-z0-9_]{3,20}$").matches(username)) {
+        throw IllegalArgumentException("아이디는 영소문자·숫자·_ 3~20자로 입력하세요.")
+    }
+    if (!Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(email)) {
+        throw IllegalArgumentException("올바른 이메일 주소를 입력하세요.")
+    }
+    val api = RelayApi(validateServerUrl(serverUrl))
+    val response = api.requestPasswordReset(username, email.lowercase(Locale.ROOT))
+    if (!response.optBoolean("ok")) throw Exception(response.optString("error", "인증코드 전송에 실패했습니다."))
+    return response.getString("challenge_id")
+}
+
+internal suspend fun confirmPasswordReset(
+    context: Context,
+    serverUrl: String,
+    username: String,
+    email: String,
+    challengeId: String,
+    code: String,
+    newPassword: String,
+) {
+    if (challengeId.isBlank() || !Regex("^\\d{6}$").matches(code)) {
+        throw IllegalArgumentException("6자리 인증코드를 입력하세요.")
+    }
+    if (newPassword.length < 8) throw IllegalArgumentException("새 비밀번호는 8자 이상이어야 합니다.")
+    val api = RelayApi(validateServerUrl(serverUrl))
+    val pwHash = CryptoUtil.hashPassword(newPassword, CryptoUtil.saltForUser(username))
+    val response = api.confirmPasswordReset(
+        username, email.lowercase(Locale.ROOT), challengeId, code, pwHash,
+    )
+    if (!response.optBoolean("ok")) throw Exception(response.optString("error", "비밀번호 변경에 실패했습니다."))
+}
+
+private fun validateServerUrl(serverUrl: String): String {
+    val parsedUrl = serverUrl.toHttpUrlOrNull()
+        ?: throw IllegalArgumentException("올바른 서버 URL을 입력하세요.")
+    if (parsedUrl.scheme != "https" && !isLocalTestHost(parsedUrl.host)) {
+        throw IllegalArgumentException("원격 서버는 HTTPS 주소를 사용해야 합니다.")
+    }
+    if (parsedUrl.username.isNotEmpty() || parsedUrl.password.isNotEmpty() ||
+        parsedUrl.encodedPath != "/" || parsedUrl.query != null || parsedUrl.fragment != null
+    ) throw IllegalArgumentException("서버 URL은 도메인과 포트까지만 입력하세요.")
+    return parsedUrl.toString().trimEnd('/')
+}
+
 /**
  * Shared-secret login: device-login with a stored sid, otherwise register the
  * account (if new) and register this device's keypair.
@@ -220,6 +404,9 @@ internal suspend fun doLogin(
     serverUrl: String,
     username: String,
     password: String,
+    registrationEmail: String = "",
+    registrationChallenge: String? = null,
+    registrationCode: String = "",
 ): SavedCredentials {
     if (!Regex("^[a-z0-9_]{3,20}$").matches(username)) {
         throw IllegalArgumentException("아이디는 영소문자·숫자·_ 3~20자로 입력하세요.")
@@ -292,18 +479,26 @@ internal suspend fun doLogin(
         return saved
     }
 
-    // User doesn't exist → register.
+    // User doesn't exist → email-verified registration.
     if (password.length < 8) {
         throw IllegalArgumentException("새 계정 비밀번호는 8자 이상이면 됩니다. 영문·숫자·특수문자는 자유롭게 조합할 수 있습니다.")
     }
-    val reg = api.register(username, pwHash)
-    if (!reg.optBoolean("ok")) {
-        val message = if (reg.optString("error") == "username already taken") {
-            "비밀번호가 틀렸거나 이미 가입된 아이디입니다."
-        } else {
-            reg.optString("error", "register failed")
+    if (!Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(registrationEmail)) {
+        throw IllegalArgumentException("새 계정은 가입 이메일을 입력해야 합니다.")
+    }
+    if (registrationChallenge == null) {
+        val requested = api.registerEmailRequest(username, registrationEmail, pwHash)
+        if (!requested.optBoolean("ok")) {
+            throw Exception(requested.optString("error", "인증코드 전송에 실패했습니다."))
         }
-        throw Exception(message)
+        throw EmailRegistrationRequired(requested.getString("challenge_id"))
+    }
+    if (!Regex("^\\d{6}$").matches(registrationCode)) {
+        throw IllegalArgumentException("가입 이메일로 받은 6자리 인증코드를 입력하세요.")
+    }
+    val reg = api.registerEmailVerify(registrationChallenge, registrationCode)
+    if (!reg.optBoolean("ok")) {
+        throw Exception(reg.optString("error", "이메일 인증에 실패했습니다."))
     }
     val dr = api.deviceRegister(username, pwHash, deviceName, kp.boxPk, kp.signPk)
     if (!dr.optBoolean("ok")) throw Exception(dr.optString("error", "device register failed"))

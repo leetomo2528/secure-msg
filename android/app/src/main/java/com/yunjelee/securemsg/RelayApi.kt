@@ -62,6 +62,27 @@ class RelayApi(
     fun login(username: String, pwHash: String): JSONObject =
         post("/api/login", JSONObject().put("username", username).put("pw_hash", pwHash))
 
+    fun registerEmailRequest(username: String, email: String, pwHash: String): JSONObject =
+        post("/api/register/email/request", JSONObject()
+            .put("username", username).put("email", email).put("pw_hash", pwHash))
+
+    fun registerEmailVerify(challengeId: String, code: String): JSONObject =
+        post("/api/register/email/verify", JSONObject()
+            .put("challenge_id", challengeId).put("code", code))
+
+    fun requestPasswordReset(username: String, email: String): JSONObject =
+        post("/api/password-reset/request", JSONObject()
+            .put("username", username).put("email", email))
+
+    fun confirmPasswordReset(
+        username: String, email: String, challengeId: String, code: String, pwHash: String,
+    ): JSONObject = post("/api/password-reset/confirm", JSONObject()
+        .put("username", username)
+        .put("email", email)
+        .put("challenge_id", challengeId)
+        .put("code", code)
+        .put("pw_hash", pwHash))
+
     fun deviceRegister(
         username: String, pwHash: String, deviceName: String,
         pubKey: String, sigPub: String,
