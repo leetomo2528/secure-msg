@@ -18,6 +18,7 @@ interface ApiResult {
 export interface LoginResult {
   ok: boolean;
   error?: string;
+  status?: number;
   uid?: number;
   username?: string;
   has_devices?: boolean;
@@ -26,6 +27,7 @@ export interface LoginResult {
 export interface DeviceRegisterResult {
   ok: boolean;
   error?: string;
+  status?: number;
   sid?: string;
   token?: string;
   uid?: number;
@@ -428,14 +430,23 @@ export function waitForSocketConnected(socket: Socket, timeoutMs = 5_000): Promi
   });
 }
 
+export interface MessageAck {
+  ok: boolean;
+  seq?: number;
+  id?: number;
+  error?: string;
+  /** Client-side marker for a lost acknowledgement (never server-set). */
+  timedOut?: boolean;
+}
+
 export async function sendMessage(
   socket: Socket,
   cid: string,
   envelope: Envelope,
   shouldContinue: () => boolean = () => true,
-): Promise<{ ok: boolean; seq?: number; id?: number; error?: string }> {
+): Promise<MessageAck> {
   const messageId = crypto.randomUUID();
-  let result: { ok: boolean; seq?: number; id?: number; error?: string } = {
+  let result: MessageAck = {
     ok: false,
     error: "메시지 전송 실패",
   };
@@ -444,7 +455,7 @@ export async function sendMessage(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (!shouldContinue()) return { ok: false, error: "메시지 전송이 취소되었습니다" };
     result = await emitMessageOnce(socket, cid, messageId, envelope);
-    if (result.ok || result.error !== "메시지 전송 확인 시간 초과") break;
+    if (result.ok || !result.timedOut) break;
   }
   return result;
 }
@@ -454,21 +465,26 @@ function emitMessageOnce(
   cid: string,
   messageId: string,
   envelope: Envelope,
-): Promise<{ ok: boolean; seq?: number; id?: number; error?: string }> {
+): Promise<MessageAck> {
   return new Promise((resolve) => {
     let finished = false;
     const timer = setTimeout(() => {
       if (finished) return;
       finished = true;
-      resolve({ ok: false, error: "메시지 전송 확인 시간 초과" });
+      resolve({ ok: false, error: "메시지 전송 확인 시간 초과", timedOut: true });
     }, SOCKET_ACK_TIMEOUT_MS);
-    socket.emit("message_send", { cid, mid: messageId, payload: envelope }, (ack: any) => {
+    socket.emit("message_send", { cid, mid: messageId, payload: envelope }, (ack: unknown) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      resolve(ack ?? { ok: false, error: "서버 확인 응답 없음" });
+      resolve(isMessageAck(ack) ? ack : { ok: false, error: "서버 확인 응답 없음" });
     });
   });
+}
+
+function isMessageAck(value: unknown): value is MessageAck {
+  return typeof value === "object" && value !== null
+    && typeof (value as MessageAck).ok === "boolean";
 }
 
 export type { Envelope, RecipientDevice };

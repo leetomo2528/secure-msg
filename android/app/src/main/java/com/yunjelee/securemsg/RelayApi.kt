@@ -152,10 +152,11 @@ class RelayApi(
     fun syncContactNames(entries: JSONArray): JSONObject =
         post("/api/contact-names/sync", JSONObject().put("entries", entries))
 
-    fun convMembers(cid: String): JSONObject = get("/api/conversation/$cid/members")
+    fun convMembers(cid: String): JSONObject =
+        get("/api/conversation/${encodeSegment(cid)}/members")
 
     fun fetchMessages(cid: String, since: Int): JSONObject =
-        get("/api/conversation/$cid/messages?since=$since&limit=500")
+        get("/api/conversation/${encodeSegment(cid)}/messages?since=$since&limit=500")
 
     fun listBlockRules(): JSONObject = get("/api/blocklist")
 
@@ -166,6 +167,10 @@ class RelayApi(
         post("/api/blocklist/remove", JSONObject().put("id", id))
 
     companion object {
+        /** cids come from server responses; keep them from escaping the path/query. */
+        private fun encodeSegment(value: String): String =
+            java.net.URLEncoder.encode(value, "UTF-8")
+
         private val HTTP = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)

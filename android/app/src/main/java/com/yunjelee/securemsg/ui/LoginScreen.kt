@@ -479,7 +479,20 @@ internal suspend fun doLogin(
         return saved
     }
 
-    // User doesn't exist → email-verified registration.
+    // Login failed. The server deliberately returns the same 401 for an
+    // unknown user and a wrong password, so they cannot be told apart here.
+    // Only continue into email-verified registration when the user actually
+    // filled the signup email field; otherwise a typo'd password for an
+    // existing account must surface as a credentials error, not as a
+    // registration prompt (which would also mail verification codes on the
+    // attacker's behalf for a known username+email pair).
+    if (registrationEmail.isBlank()) {
+        throw IllegalArgumentException(
+            "아이디 또는 비밀번호가 올바르지 않습니다. 새 계정이면 가입 이메일을 입력하세요.",
+        )
+    }
+
+    // Unknown user → email-verified registration.
     if (password.length < 8) {
         throw IllegalArgumentException("새 계정 비밀번호는 8자 이상이면 됩니다. 영문·숫자·특수문자는 자유롭게 조합할 수 있습니다.")
     }

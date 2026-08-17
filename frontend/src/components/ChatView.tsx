@@ -7,7 +7,10 @@ import { Avatar } from "./ChatList";
 import { conversationDisplayName } from "../store/helpers";
 
 export default function ChatView({ cid }: { cid: string }) {
-  const { activeMessages, conversations, sendContent, sid } = useStore();
+  const activeMessages = useStore((s) => s.activeMessages);
+  const conversations = useStore((s) => s.conversations);
+  const sendContent = useStore((s) => s.sendContent);
+  const sid = useStore((s) => s.sid);
   const [text, setText] = useState("");
   const [subject, setSubject] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
@@ -40,7 +43,9 @@ export default function ChatView({ cid }: { cid: string }) {
     a.href = url;
     a.download = filename;
     a.click();
-    URL.revokeObjectURL(url);
+    // Some browsers (notably Safari/iOS PWA) abort the download if the URL is
+    // revoked before the download actually starts.
+    setTimeout(() => URL.revokeObjectURL(url), 1_000);
   };
 
   const exportMessages = (format: "csv" | "json") => {
@@ -65,7 +70,10 @@ export default function ChatView({ cid }: { cid: string }) {
       }, null, 2));
       return;
     }
-    const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    // Quote-escape cells, and neutralize spreadsheet formula injection: SMS
+    // text is attacker-controlled, so a leading =+-@ (or tab/CR) would execute
+    // as a formula when the export is opened in Excel/Sheets.
+    const esc = (v: string) => `"${(/^[=+\-@\t\r]/.test(v) ? `'${v}` : v).replace(/"/g, '""')}"`;
     const lines = [
       ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
       ...rows.map((m: MessageRow) => [
@@ -353,7 +361,9 @@ function dataUrl(attachment: MessageAttachment): string {
 
 function AttachmentPreview({ attachment, mine }: { attachment: MessageAttachment; mine: boolean }) {
   const url = dataUrl(attachment);
-  if (/^image\/[A-Za-z0-9!#$&^_.+-]+$/.test(attachment.content_type)) {
+  // Render inline images only for a fixed safe whitelist. A generic MIME
+  // pattern would let remote-controlled content pick exotic image types.
+  if (/^image\/(png|jpe?g|gif|webp|bmp)$/i.test(attachment.content_type)) {
     return (
       <a href={url} download={attachment.name} className="mt-2 block">
         <img src={url} alt={attachment.name} className="max-h-56 max-w-full rounded-xl" loading="lazy" />

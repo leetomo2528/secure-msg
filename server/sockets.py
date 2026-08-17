@@ -133,11 +133,14 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         token = auth.get("token") or (
             header[7:] if header.startswith("Bearer ") else None
         )
+        # Refusal messages carry a machine-readable "auth_rejected:" prefix so
+        # clients invalidate dead sessions from a stable code instead of
+        # matching localized/changeable prose (keep the human text after it).
         if not token:
-            raise ConnectionRefusedError("auth required")
+            raise ConnectionRefusedError("auth_rejected: auth required")
         decoded = verify_jwt(token)
         if not decoded:
-            raise ConnectionRefusedError("invalid token")
+            raise ConnectionRefusedError("auth_rejected: invalid token")
         try:
             uid, sid, expires_at, session_version = (
                 int(decoded["uid"]),
@@ -146,7 +149,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
                 int(decoded["sv"]),
             )
         except (KeyError, TypeError, ValueError):
-            raise ConnectionRefusedError("invalid token")
+            raise ConnectionRefusedError("auth_rejected: invalid token")
         dev = store.get_device_by_sid(sid)
         if (
             not dev
@@ -154,7 +157,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             or dev["session_version"] != session_version
             or dev["trust_state"] != "approved"
         ):
-            raise ConnectionRefusedError("device unknown")
+            raise ConnectionRefusedError("auth_rejected: device unknown")
         store.touch_device(dev["id"])
         clients[request.sid] = (
             uid,

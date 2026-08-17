@@ -10,7 +10,14 @@ import NotifyToggle from "./components/NotifyToggle";
 import PendingDeviceApproval from "./components/PendingDeviceApproval";
 
 export default function App() {
-  const { ready, authed, approvalPending, securityLocked, activeCid, error } = useStore();
+  // Atomic selectors: a message arriving must not re-render this shell (it
+  // re-renders ChatList/ChatView, which subscribe to what they need).
+  const ready = useStore((s) => s.ready);
+  const authed = useStore((s) => s.authed);
+  const approvalPending = useStore((s) => s.approvalPending);
+  const securityLocked = useStore((s) => s.securityLocked);
+  const activeCid = useStore((s) => s.activeCid);
+  const error = useStore((s) => s.error);
 
   if (!ready) {
     return (

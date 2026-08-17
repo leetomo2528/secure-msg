@@ -84,6 +84,11 @@ export { decodeRelayContent };
 
 const NOTIFY_PREF_KEY = "securemsg-notify";
 
+/** Set by loginExistingDevice when the server answered 404/403 — the stored
+ * device is gone (revoked) and re-registration with a fresh keypair is safe.
+ * Read and reset by login(); keeps the boolean return contract stable. */
+let lastExistingDeviceGone = false;
+
 function readNotifyPref(): boolean {
   try {
     return typeof localStorage !== "undefined"
@@ -330,8 +335,12 @@ export const useStore = create<State>((set, get) => ({
         const reused = await get().loginExistingDevice(username, password);
         if (reused) return true;
         // A device revoked from another session must get a fresh keypair. Do not
-        // discard keys on transient network errors.
-        if (!/^(device not found|device revoked)$/.test(get().error ?? "")) return false;
+        // discard keys on transient network errors. Prefer the structured
+        // HTTP status classification; the prose match only covers old servers.
+        const deviceGone = lastExistingDeviceGone
+          || /^(device not found|device revoked)$/.test(get().error ?? "");
+        lastExistingDeviceGone = false;
+        if (!deviceGone) return false;
         const fallbackGeneration = get().securityGeneration;
         await sessionCoordinator.exclusive(async () => {
           if (get().securityGeneration !== fallbackGeneration) return;
@@ -396,6 +405,7 @@ export const useStore = create<State>((set, get) => ({
     if (get().securityGeneration !== attemptGeneration) return false;
     if (!challenge.ok || challenge.uid === undefined || !challenge.challenge_id ||
         !challenge.challenge || challenge.session_version === undefined) {
+      if (challenge.status === 404 || challenge.status === 403) lastExistingDeviceGone = true;
       set({ error: challenge.error || "device login challenge failed" });
       return false;
     }
@@ -407,7 +417,11 @@ export const useStore = create<State>((set, get) => ({
       username, pwHash, meta.sid, challenge.challenge_id, challenge.challenge, proof,
     );
     if (get().securityGeneration !== attemptGeneration) return false;
-    if (!r.ok || !r.token) { set({ error: r.error || "device login failed" }); return false; }
+    if (!r.ok || !r.token) {
+      if (r.status === 404 || r.status === 403) lastExistingDeviceGone = true;
+      set({ error: r.error || "device login failed" });
+      return false;
+    }
     const approvalPending = r.trust_state === "pending";
     const installed = await sessionCoordinator.exclusive(async () => {
       if (get().securityGeneration !== attemptGeneration) return false;
@@ -1167,7 +1181,9 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   socket.on("connect_error", (error: Error) => {
     if (!sameContext(context)) return;
     const detail = error?.message ?? "";
-    if (/auth required|invalid token|device unknown|unauthenticated/i.test(detail)) {
+    // Servers >= v0.10.8 prefix refusals with a stable "auth_rejected:" code;
+    // the prose match is the fallback for older servers.
+    if (/^auth_rejected|auth required|invalid token|device unknown|unauthenticated/i.test(detail)) {
       void useStore.getState().logout().then(() => {
         if (useStore.getState().securityGeneration === context.generation + 1 && !useStore.getState().authed) {
           useStore.setState({ error: "로그인이 만료되었거나 이 기기가 폐기되었습니다. 다시 로그인하세요." });

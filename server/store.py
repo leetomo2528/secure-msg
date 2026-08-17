@@ -9,6 +9,7 @@ import json
 import base64
 import hashlib
 import hmac
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -239,7 +240,7 @@ def init_schema() -> None:
             for duplicate in gateways[1:]:
                 c.execute(
                     "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
-                    (_b64u(__import__("secrets").token_bytes(32)), duplicate["id"]),
+                    (_b64u(secrets.token_bytes(32)), duplicate["id"]),
                 )
                 quarantined_gateways.append(str(duplicate["sid"]))
             earliest = c.execute(
@@ -552,7 +553,7 @@ def add_device(
             # Only a genuinely new account may self-bootstrap. Tombstones are
             # retained, so revoking every device cannot silently reset trust.
             trust_state = "approved" if int(total_count) == 0 else "pending"
-            challenge = _b64u(__import__("secrets").token_bytes(32))
+            challenge = _b64u(secrets.token_bytes(32))
             fingerprint = device_fingerprint(pub_key, sig_pub)
             cur = c.execute(
                 "INSERT INTO devices(user_id, sid, name, kind, pub_key, sig_pub, "
@@ -658,7 +659,6 @@ def rotate_device_session(
 
 def create_device_login_challenge(device_id: int, user_id: int, sid: str, session_version: int) -> dict[str, Any] | None:
     """Persist a challenge bound to the device's current session generation."""
-    import secrets
     timestamp = now()
     record = {
         "challenge_id": secrets.token_urlsafe(18),
@@ -919,7 +919,7 @@ def upgrade_legacy_security(
             ).fetchall():
                 c.execute(
                     "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
-                    (_b64u(__import__("secrets").token_bytes(32)), peer["id"]),
+                    (_b64u(secrets.token_bytes(32)), peer["id"]),
                 )
             epoch = parent_epoch + 1
             c.execute(

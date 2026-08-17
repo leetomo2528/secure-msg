@@ -8,10 +8,19 @@ import {
   generateKeypair,
   encryptMessage,
   decryptMessageWithSender,
+  hashPassword,
+  saltForUser,
   b64u,
   unb64u,
   type Envelope,
 } from "./keys";
+
+/** Flip one bit of the first byte of a base64url payload. */
+function flipFirstBit(value: string): string {
+  const bytes = unb64u(value);
+  bytes[0] ^= 0x01;
+  return b64u(new Uint8Array(bytes));
+}
 
 describe("envelope crypto", () => {
   beforeAll(async () => {
@@ -81,5 +90,56 @@ describe("envelope crypto", () => {
     expect(() => decryptMessageWithSender(malformed, "bob1", bob, "bad-key"))
       .not.toThrow();
     expect(decryptMessageWithSender(malformed, "bob1", bob, "bad-key")).toBeNull();
+  });
+
+  it("returns null on a tampered wrapped key", async () => {
+    const alice = generateKeypair();
+    const bob = generateKeypair();
+    const env = await encryptMessage("orig",
+      [{ sid: "bob1", pub_key: bob.box.pk }], alice);
+    const tampered: Envelope = {
+      ...env,
+      keys: { bob1: { ...env.keys.bob1, ek: flipFirstBit(env.keys.bob1.ek) } },
+    };
+    expect(decryptMessageWithSender(tampered, "bob1", bob, alice.box.pk)).toBeNull();
+  });
+
+  it("returns null when the ciphertext is replayed under a different nonce", async () => {
+    const alice = generateKeypair();
+    const bob = generateKeypair();
+    const env = await encryptMessage("orig",
+      [{ sid: "bob1", pub_key: bob.box.pk }], alice);
+    const other = await encryptMessage("other",
+      [{ sid: "bob1", pub_key: bob.box.pk }], alice);
+    const tampered: Envelope = { ...env, nonce: other.nonce };
+    expect(decryptMessageWithSender(tampered, "bob1", bob, alice.box.pk)).toBeNull();
+  });
+
+  it("returns null when a different sender key is claimed (impersonation)", async () => {
+    const alice = generateKeypair();
+    const bob = generateKeypair();
+    const mallory = generateKeypair();
+    const env = await encryptMessage("orig",
+      [{ sid: "bob1", pub_key: bob.box.pk }], alice);
+    expect(decryptMessageWithSender(env, "bob1", bob, mallory.box.pk)).toBeNull();
+  });
+});
+
+describe("password hashing contract", () => {
+  beforeAll(async () => {
+    await initCrypto();
+  });
+
+  it("is deterministic for the same username salt", async () => {
+    const a = await hashPassword("correct horse", saltForUser("alice_92"));
+    const b = await hashPassword("correct horse", saltForUser("alice_92"));
+    expect(a).toBe(b);
+  });
+
+  it("differs per user and rejects an empty salt", async () => {
+    const a = await hashPassword("correct horse", saltForUser("alice_92"));
+    const b = await hashPassword("correct horse", saltForUser("bob_92"));
+    expect(a).not.toBe(b);
+    await expect(hashPassword("x", "")).rejects.toThrow();
   });
 });

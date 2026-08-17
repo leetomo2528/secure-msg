@@ -283,7 +283,12 @@ class SmsBridgeService : Service() {
             client.onDisconnect = { Log.w(TAG, "Relay disconnected — will auto-reconnect") }
             client.onConnectError = { message ->
                 Log.w(TAG, "Relay connection error: $message")
-                if (message.contains("invalid token", ignoreCase = true) ||
+                // Servers >= v0.10.8 prefix refusals with a stable
+                // "auth_rejected:" code. Fall back to the legacy prose match
+                // for older servers instead of re-connecting forever with a
+                // dead token.
+                if (message.startsWith("auth_rejected", ignoreCase = true) ||
+                    message.contains("invalid token", ignoreCase = true) ||
                     message.contains("device unknown", ignoreCase = true) ||
                     message.contains("auth required", ignoreCase = true) ||
                     message.contains("unauthenticated", ignoreCase = true)
@@ -329,7 +334,9 @@ class SmsBridgeService : Service() {
             }
         }
         relay!!.connect(loaded.token)
-        Log.i(TAG, "Bridge started for ${loaded.username}")
+        // Account usernames are identifiers; keep them out of logcat like the
+        // redacted phone numbers used everywhere else in this app.
+        Log.i(TAG, "Bridge started")
     }
 
     private fun invalidateSession(reason: String) {

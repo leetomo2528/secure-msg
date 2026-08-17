@@ -4,7 +4,10 @@ import { searchMessages, type MessageRow } from "../store/db";
 import { conversationDisplayName } from "../store/helpers";
 
 export default function ChatList() {
-  const { conversations, activeCid, selectConversation, refreshConversations } = useStore();
+  const conversations = useStore((s) => s.conversations);
+  const activeCid = useStore((s) => s.activeCid);
+  const selectConversation = useStore((s) => s.selectConversation);
+  const refreshConversations = useStore((s) => s.refreshConversations);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<MessageRow[]>([]);
 
@@ -15,7 +18,7 @@ export default function ChatList() {
       return;
     }
     const timer = setTimeout(() => {
-      void searchMessages(q).then(setHits);
+      void searchMessages(q).then(setHits).catch(() => setHits([]));
     }, 200);
     return () => clearTimeout(timer);
   }, [query]);

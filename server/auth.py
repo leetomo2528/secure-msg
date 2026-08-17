@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import re
 import secrets
 import sqlite3
@@ -121,7 +123,7 @@ def _email(value: object) -> str:
 def _code_digest(challenge_id: str, code: str) -> str:
     material = f"securemsg-email-code-v1\n{challenge_id}\n{code}".encode("utf-8")
     return base64.urlsafe_b64encode(
-        __import__("hmac").new(config.JWT_SECRET.encode("utf-8"), material, __import__("hashlib").sha256).digest()
+        hmac.new(config.JWT_SECRET.encode("utf-8"), material, hashlib.sha256).digest()
     ).decode("ascii").rstrip("=")
 
 
@@ -264,6 +266,11 @@ def register_email_request():
     pw_hash = _text(body, "pw_hash")
     if not USERNAME_RE.fullmatch(username) or not _email_ok(email) or not _valid_client_hash(pw_hash):
         return _err("username, email and password are required", 400)
+    # This endpoint triggers outbound email; rate limit per IP before any
+    # mailbox lookup so it cannot be used to mail-bomb arbitrary addresses.
+    retry_after = rate_limit("register-email-request", email, 5, 60)
+    if retry_after:
+        return _rate_error(retry_after)
     if store.get_user_by_name(username) or store.get_user_by_email(email):
         return _err("username or email already taken", 409)
     challenge_id = secrets.token_urlsafe(18)
@@ -288,6 +295,9 @@ def register_email_verify():
     code = _text(body, "code").strip()
     if not B64U_RE.fullmatch(challenge_id) or not re.fullmatch(r"[0-9]{6}", code):
         return _err("verification code is invalid", 400)
+    retry_after = rate_limit("register-email-verify", challenge_id, 10, 60)
+    if retry_after:
+        return _rate_error(retry_after)
     pending = store.consume_email_verification(
         challenge_id, _code_digest(challenge_id, code), int(time.time()),
     )
@@ -316,6 +326,10 @@ def password_reset_request():
         expires_at=int(time.time()) + config.EMAIL_CODE_TTL_SECONDS,
     )
     if not USERNAME_RE.fullmatch(username) or not _email_ok(email):
+        return response
+    # Rate limit per IP+email: the response must stay identical whether or not
+    # the account exists, so check before any user lookup and swallow the 429.
+    if rate_limit("password-reset-request", email, 5, 60):
         return response
     user = store.get_user_by_name(username)
     # A manually linked-but-not-yet-verified address can still receive the
@@ -349,6 +363,9 @@ def password_reset_confirm():
             or not B64U_RE.fullmatch(challenge_id) or not re.fullmatch(r"[0-9]{6}", code)
             or not _valid_client_hash(pw_hash)):
         return _err("invalid password reset request", 400)
+    retry_after = rate_limit("password-reset-confirm", challenge_id, 10, 60)
+    if retry_after:
+        return _rate_error(retry_after)
     user = store.get_user_by_name(username)
     if not user or user.get("email") != email:
         return _err("invalid password reset request", 400)

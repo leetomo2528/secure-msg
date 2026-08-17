@@ -58,12 +58,19 @@ export function signDetached(message: string, signingSecretKey: string): string 
 
 // ----- password hashing (client-side Argon2id over raw password) -------
 
-export async function hashPassword(password: string, saltB64?: string): Promise<string> {
-  // Argon2id with a per-user salt. Salt is derived from the username so the
-  // same (username, password) always yields the same hash — the server
-  // compares bcrypt(this_hash, stored). Salt is NOT secret; it just forces
-  // attackers to recompute per-user.
-  const salt = saltB64 ? unb64u(saltB64) : sodium.randombytes_buf(16);
+/**
+ * Argon2id with a per-user salt. Salt is derived from the username so the
+ * same (username, password) always yields the same hash — the server
+ * compares bcrypt(this_hash, stored). Salt is NOT secret; it just forces
+ * attackers to recompute per-user.
+ *
+ * The salt is REQUIRED: a missing salt would silently produce a different
+ * hash on every call and the server's bcrypt comparison would fail with no
+ * diagnostic. Callers pass saltForUser(username).
+ */
+export async function hashPassword(password: string, saltB64: string): Promise<string> {
+  const salt = unb64u(saltB64);
+  if (salt.length === 0) throw new Error("password salt must not be empty");
   const hash = sodium.crypto_pwhash(
     32,
     password,

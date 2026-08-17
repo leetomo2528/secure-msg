@@ -572,6 +572,15 @@ class MainActivity : ComponentActivity() {
                             var localCleanupFailed = false
                             try {
                                 Credentials.clearSession(this@MainActivity)
+                                // Device keys survive logout for same-device re-login, but the
+                                // decrypted history they can re-read must not stay on disk:
+                                // clear plaintext tables (idempotency ledgers and pending
+                                // outbox sends are kept; history re-pulls from the relay).
+                                val db = AppDatabase.get(this@MainActivity)
+                                db.messageDao().clearAll()
+                                db.threadDao().clearAll()
+                                db.blockedSmsDao().clearAll()
+                                db.relayOutboxDao().clearSentPlaintext()
                             } catch (e: Exception) {
                                 localCleanupFailed = true
                                 Log.e("MainActivity", "Local credential cleanup failed", e)
@@ -632,6 +641,10 @@ class MainActivity : ComponentActivity() {
      * pipeline (block check -> provider write -> notification -> bridge
      * relay), so SIM-less devices can verify phone->web interlock. */
     private fun simulateIncomingSms() {
+        // Gate the function itself, not just its UI: this writes a fake row
+        // into the system SMS Provider, so it must not survive into release
+        // binaries even if a future change exposes another call path.
+        if (!BuildConfig.DEBUG) return
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val ctx = this@MainActivity

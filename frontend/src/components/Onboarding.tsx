@@ -9,7 +9,12 @@ import { Segmented } from "./ui";
 type Mode = "login" | "register";
 
 export default function Onboarding() {
-  const { login, requestEmailRegistration, verifyEmailRegistration, forgetLocalDevice, error, username: rememberedUsername } = useStore();
+  const login = useStore((s) => s.login);
+  const requestEmailRegistration = useStore((s) => s.requestEmailRegistration);
+  const verifyEmailRegistration = useStore((s) => s.verifyEmailRegistration);
+  const forgetLocalDevice = useStore((s) => s.forgetLocalDevice);
+  const error = useStore((s) => s.error);
+  const rememberedUsername = useStore((s) => s.username);
   const [mode, setMode] = useState<Mode>("login");
   const [username, setUsername] = useState(rememberedUsername ?? "");
   const [password, setPassword] = useState("");
@@ -24,6 +29,7 @@ export default function Onboarding() {
   const [resetPassword, setResetPassword] = useState("");
   const [resetMessage, setResetMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
 
   useEffect(() => {
     if (rememberedUsername) setUsername(rememberedUsername);
@@ -43,35 +49,47 @@ export default function Onboarding() {
               setRegistrationChallenge(challenge);
               return challenge;
             }));
-      if (!ok) { /* error already in store */ }
+      void ok; // a false result already put the error text in the store
     } finally {
       setBusy(false);
     }
   };
 
   const requestReset = async () => {
-    setResetMessage(null);
-    const result = await api.passwordResetRequest(resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase());
-    if (result.ok) {
-      setResetMessage("계정이 존재하면 이메일로 인증 코드를 보냈습니다.");
-      setResetChallenge(result.challenge_id ?? null);
-    } else setResetMessage(result.error ?? "재설정 메일을 보내지 못했습니다.");
+    if (resetBusy) return;
+    setResetBusy(true);
+    try {
+      setResetMessage(null);
+      const result = await api.passwordResetRequest(resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase());
+      if (result.ok) {
+        setResetMessage("계정이 존재하면 이메일로 인증 코드를 보냈습니다.");
+        setResetChallenge(result.challenge_id ?? null);
+      } else setResetMessage(result.error ?? "재설정 메일을 보내지 못했습니다.");
+    } finally {
+      setResetBusy(false);
+    }
   };
 
   const confirmReset = async () => {
+    if (resetBusy) return;
     if (!resetChallenge || resetChallenge === "pending") {
       setResetMessage("먼저 인증 메일을 요청하세요.");
       return;
     }
-    const pwHash = await hashPassword(resetPassword, saltForUser(resetUsername.trim().toLowerCase()));
-    const result = await api.passwordResetConfirm(
-      resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase(), resetChallenge, resetCode.trim(), pwHash,
-    );
-    setResetMessage(result.ok ? "비밀번호가 변경되었습니다. 로그인해 주세요." : result.error ?? "인증 코드가 올바르지 않습니다.");
-    if (result.ok) {
-      setResetOpen(false);
-      setResetChallenge(null);
-      setPassword("");
+    setResetBusy(true);
+    try {
+      const pwHash = await hashPassword(resetPassword, saltForUser(resetUsername.trim().toLowerCase()));
+      const result = await api.passwordResetConfirm(
+        resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase(), resetChallenge, resetCode.trim(), pwHash,
+      );
+      setResetMessage(result.ok ? "비밀번호가 변경되었습니다. 로그인해 주세요." : result.error ?? "인증 코드가 올바르지 않습니다.");
+      if (result.ok) {
+        setResetOpen(false);
+        setResetChallenge(null);
+        setPassword("");
+      }
+    } finally {
+      setResetBusy(false);
     }
   };
 
@@ -205,7 +223,7 @@ export default function Onboarding() {
               {resetChallenge && <input value={resetCode} onChange={(e) => setResetCode(e.target.value)} inputMode="numeric" maxLength={6} className="field" placeholder="6자리 인증 코드" />}
               {resetChallenge && <input type="password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} minLength={8} className="field" placeholder="새 비밀번호 (8자 이상)" />}
               {resetMessage && <p className="text-[11px] leading-relaxed text-white/65">{resetMessage}</p>}
-              <button type="button" onClick={() => void (resetChallenge ? confirmReset() : requestReset())} className="btn-ghost w-full !py-2.5 text-xs">{resetChallenge ? "비밀번호 변경" : "인증 코드 받기"}</button>
+              <button type="button" disabled={resetBusy} onClick={() => void (resetChallenge ? confirmReset() : requestReset())} className="btn-ghost w-full !py-2.5 text-xs disabled:opacity-40">{resetBusy ? "처리 중…" : resetChallenge ? "비밀번호 변경" : "인증 코드 받기"}</button>
             </div>
           )}
 

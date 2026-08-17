@@ -138,6 +138,69 @@ class ServerSmokeTest(unittest.TestCase):
             )
             self.assertEqual(reset.status_code, 200, reset.json)
 
+    def test_password_reset_revokes_every_device_session(self):
+        """A completed password reset must immediately invalidate every device.
+
+        Covers the recovery-hardening invariant end to end: all device JWTs
+        stop authenticating REST calls and live Socket.IO connects are refused
+        with the structured auth_rejected code (session_version is rotated
+        for the whole account, not just one device).
+        """
+        second = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "reset-second-device",
+                "pub_key": "B" * 43,
+            }
+        )
+        second_token = second.json["token"]
+        second_headers = {"Authorization": f"Bearer {second_token}"}
+        email = f"{self.username}@example.test"
+        # setUp registers without an email; attach a verified one directly so
+        # password-reset/request can issue a real challenge.
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE users SET email = ?, email_verified_at = 1 WHERE id = ?",
+                (email, self.uid),
+            )
+        live = socketio.test_client(app, auth={"token": self.token})
+        self.assertTrue(live.is_connected())
+        self.assertEqual(self.client.get("/api/devices", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/devices", headers=second_headers).status_code, 200)
+
+        with mock.patch("emailer.send_code") as send_code:
+            requested = self.client.post(
+                "/api/password-reset/request",
+                json={"username": self.username, "email": email},
+            )
+            self.assertEqual(requested.status_code, 200, requested.json)
+            reset = self.client.post(
+                "/api/password-reset/confirm",
+                json={
+                    "username": self.username,
+                    "email": email,
+                    "challenge_id": requested.json["challenge_id"],
+                    "code": send_code.call_args.args[2],
+                    "pw_hash": "C" * 43,
+                },
+            )
+            self.assertEqual(reset.status_code, 200, reset.json)
+
+        # Old password no longer works, both device tokens are dead for REST…
+        stale_login = self.client.post(
+            "/api/login",
+            json={"username": self.username, "pw_hash": self.pw_hash},
+        )
+        self.assertEqual(stale_login.status_code, 401, stale_login.json)
+        self.assertEqual(self.client.get("/api/devices", headers=self.headers).status_code, 401)
+        self.assertEqual(self.client.get("/api/devices", headers=second_headers).status_code, 401)
+        # …and new socket connections with them are refused outright.
+        refused = socketio.test_client(app, auth={"token": self.token})
+        self.assertFalse(refused.is_connected())
+        refused_second = socketio.test_client(app, auth={"token": second_token})
+        self.assertFalse(refused_second.is_connected())
+
     def test_resend_email_provider_posts_server_side_api_request(self):
         import emailer
         from urllib.request import Request

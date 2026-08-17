@@ -85,9 +85,14 @@ fun MainScreen(
     // the foreground UI instead of being reduced to a logcat entry.
     LaunchedEffect(creds.sid) {
         while (isActive) {
+            var authRejected = false
             pendingApprovalCount = withContext(Dispatchers.IO) {
                 runCatching {
                     val response = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }.listDevices()
+                    if (!response.optBoolean("ok") && response.optInt("_http_status") == 401) {
+                        authRejected = true
+                        return@runCatching 0
+                    }
                     val devices = response.optJSONArray("devices") ?: return@runCatching 0
                     (0 until devices.length()).count { index ->
                         val device = devices.optJSONObject(index)
@@ -95,7 +100,12 @@ fun MainScreen(
                     }
                 }.getOrDefault(0)
             }
-            delay(5_000)
+            if (authRejected) {
+                // The session is gone (logout/revocation/expiry). Stop polling the
+                // auth API with a dead token; the login screen takes over.
+                break
+            }
+            delay(15_000)
         }
     }
 

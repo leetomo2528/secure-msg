@@ -231,11 +231,10 @@ fun SettingsPane(
 
     LaunchedEffect(creds.sid) {
         reloadShared()
+        // One refresh per settings visit. Pending-device changes arrive via the
+        // service's device_pending socket event and MainScreen already polls the
+        // device list for its badge, so this pane no longer adds its own loop.
         refreshDeviceSecurity()
-        while (isActive) {
-            delay(15_000)
-            refreshDeviceSecurity()
-        }
     }
 
     Column(

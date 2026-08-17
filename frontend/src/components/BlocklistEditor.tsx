@@ -3,11 +3,13 @@ import { useStore } from "../store/useStore";
 import { CollapsibleCard } from "./ui";
 
 export default function BlocklistEditor() {
-  const {
-    blockKeywords, blockedSenders,
-    addBlock, removeBlock, addBlockedSenderRule, removeBlockedSenderRule,
-    refreshBlocklist,
-  } = useStore();
+  const blockKeywords = useStore((s) => s.blockKeywords);
+  const blockedSenders = useStore((s) => s.blockedSenders);
+  const addBlock = useStore((s) => s.addBlock);
+  const removeBlock = useStore((s) => s.removeBlock);
+  const addBlockedSenderRule = useStore((s) => s.addBlockedSenderRule);
+  const removeBlockedSenderRule = useStore((s) => s.removeBlockedSenderRule);
+  const refreshBlocklist = useStore((s) => s.refreshBlocklist);
   const [kw, setKw] = useState("");
   const [sender, setSender] = useState("");
   const [open, setOpen] = useState(false);

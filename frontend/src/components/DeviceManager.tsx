@@ -22,7 +22,9 @@ function securityError(error: unknown): string {
 }
 
 export default function DeviceManager() {
-  const { sid: mySid, uid, keypair } = useStore();
+  const mySid = useStore((s) => s.sid);
+  const uid = useStore((s) => s.uid);
+  const keypair = useStore((s) => s.keypair);
   const [open, setOpen] = useState(false);
   const [directory, setDirectory] = useState<DeviceDirectoryResult | null>(null);
   const [busySid, setBusySid] = useState<string | null>(null);
@@ -135,6 +137,8 @@ export default function DeviceManager() {
       }
       if (device.sid === mySid) await useStore.getState().forgetLocalDevice();
       else await load();
+    } catch (error) {
+      useStore.setState({ error: securityError(error) });
     } finally {
       setBusySid(null);
     }
@@ -184,6 +188,8 @@ export default function DeviceManager() {
         return;
       }
       await load();
+    } catch (error) {
+      useStore.setState({ error: securityError(error) });
     } finally {
       setBusySid(null);
     }
@@ -208,6 +214,8 @@ export default function DeviceManager() {
         return;
       }
       await load();
+    } catch (error) {
+      useStore.setState({ error: securityError(error) });
     } finally {
       setBusySid(null);
     }

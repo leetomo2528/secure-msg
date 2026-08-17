@@ -240,6 +240,10 @@ interface ThreadDao {
 
     @Query("UPDATE sms_threads SET contactName = :name WHERE cid = :cid")
     suspend fun updateServerNameByCid(cid: String, name: String?)
+
+    /** Logout path: drop threads (phone-number metadata) while keeping idempotency ledgers. */
+    @Query("DELETE FROM sms_threads")
+    suspend fun clearAll()
 }
 
 @Dao
@@ -272,6 +276,10 @@ interface MessageDao {
 
     @Query("DELETE FROM messages WHERE serverKey = :serverKey AND id != :localId")
     suspend fun deleteServerDuplicate(serverKey: String, localId: Long)
+
+    /** Logout path: remove decrypted plaintext history; re-pulled from the relay after re-login. */
+    @Query("DELETE FROM messages")
+    suspend fun clearAll()
 
     @Query("UPDATE messages SET blocked = :blocked WHERE cid = :cid AND seq = :seq")
     suspend fun setBlocked(cid: String, seq: Int, blocked: Boolean)
@@ -330,6 +338,10 @@ interface BlockedSmsDao {
 
     @Delete
     suspend fun delete(msg: BlockedSms)
+
+    /** Logout path: quarantined spam bodies are local-only and must not survive logout. */
+    @Query("DELETE FROM blocked_sms")
+    suspend fun clearAll()
 }
 
 @Dao
@@ -459,6 +471,10 @@ interface RelayOutboxDao {
 
     @Query("SELECT * FROM relay_outbox WHERE mid = :mid LIMIT 1")
     suspend fun getByMid(mid: String): RelayOutbox?
+
+    /** Logout path: plaintext of relay-acked rows is presentation-only; pending rows keep theirs to finish sending. */
+    @Query("UPDATE relay_outbox SET plaintext = '' WHERE relayState = 'sent' AND plaintext != ''")
+    suspend fun clearSentPlaintext()
 
     @Query("SELECT EXISTS(SELECT 1 FROM relay_outbox WHERE cid = :cid AND serverSeq = :seq AND relayState = 'sent')")
     suspend fun hasAcknowledgedSequence(cid: String, seq: Int): Boolean

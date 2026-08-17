@@ -5,7 +5,10 @@ import BrandMark from "./BrandMark";
 import { api } from "../net/api";
 
 export default function PendingDeviceApproval() {
-  const { keypair, sid, refreshPendingApproval, forgetLocalDevice } = useStore();
+  const keypair = useStore((s) => s.keypair);
+  const sid = useStore((s) => s.sid);
+  const refreshPendingApproval = useStore((s) => s.refreshPendingApproval);
+  const forgetLocalDevice = useStore((s) => s.forgetLocalDevice);
   const fingerprint = useMemo(() => {
     if (!keypair) return null;
     try { return deviceFingerprint(keypair.box.pk, keypair.sign.pk); } catch { return null; }
