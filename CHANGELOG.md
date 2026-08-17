@@ -1,5 +1,33 @@
 # 업데이트 내역
 
+## v0.10.8 (2026-08-17) — 보안 경직화·신뢰 문서·CI
+
+전 코드베이스 리뷰 기반 보안 패치와 "신뢰할 수 있는 E2EE SMS 동기화" 로드맵 1차 산출물.
+
+보안
+- 이메일 인증·비밀번호 재설정 4개 엔드포인트에 rate limit 추가(발송 5/분·검증 10/분, IP+대상 기준) — 메일 폭격·코드 무차열 대입 차단
+- Socket.IO 연결 거부에 기계 판독 `auth_rejected:` 코드 접두 추가, 웹·Android 클라이언트 우선 판정(구 문구 매칭은 폴백 유지)
+- Android 로그아웃 시 복호화 로컬 평문 삭제(메시지·스레드·차단 격리함·ACK 완료 outbox 평문). 기기 키는 보존해 재로그인 후 서버 이력 재동기화
+- 웹 CSV 내보내기 스프레드시트 수식 인젝션 방지(=+-@ 탭 CR 접두 중화), 첨부 이미지 인라인 렌더를 png/jpeg/gif/webp/bmp 화이트리스트로 제한
+- Android 로그인 실패를 "미가입"으로 오해석해 인증 메일을 몰아 보내던 폴백 수정 — 가입 이메일 미입력 시 자격증명 오류로 안내
+- logcat 사용자명 평문 제거, SMS 수신 시뮬레이션 함수 자체에 DEBUG 가드, relay API cid URL 인코딩
+
+복구 경험
+- 비밀번호 재설정 완료 → 계정 전 기기 세션·소켓 즉시 폐기 회귀 테스트 추가(서버)
+- envelope 변조(wrapped key·nonce 교체·송신자 사칭) 복호화 거부 테스트 추가(웹), Argon2id salt 필수화로 조용한 인증 실패 원천 차단
+
+안정성·성능
+- 웹 주요 컴포넌트 zustand 셀렉터 좁히기 — 메시지 수신마다 앱 전체 리렌더 제거
+- Android 승인 대기 폴링 5초→15초 + 401 감지 시 중단, 설정 탭 중복 폴링 루프 제거
+- 기기 폐기·거부·보안 업그레이드 실패 시 사용자 오류 표시(웹), 검색 프로미스 catch, 재설정 중복 클릭 가드, ack 타임아웃 재시도 판정 구조화
+
+문서·인프라
+- `docs/CRYPTO_SPEC.md` 신설 — 키 계층·KDF·AEAD·논스·재생 방어·세션 폐기·전방 비밀성 미지원 명시
+- `docs/THREAT_MODEL.md` 이메일 복구·로그아웃 평문 삭제·MLS 실험 현황 반영 갱신
+- `docs/QR_PAIRING_DESIGN.md` 신설 — v0.11 QR 페어링 프로토콜·서버 스키마·API 설계안
+- GitHub Actions CI 추가: 서버 unittest·웹 vitest+E2E+빌드·Android gradle·Rust crypto-core cargo test·gitleaks
+- 서버 68 / 웹 142 / Android unit 테스트 통과, Android versionCode 20 / versionName 0.10.8
+
 ## v0.10.7 (2026-08-15) — Android 이메일 계정 복구·가입 인증
 
 - Android 로그인 화면에서 이메일 인증코드 기반 비밀번호 재설정 제공
