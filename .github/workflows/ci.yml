@@ -80,6 +80,10 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: gradle/actions/setup-gradle@v4
+      # Unit tests load the system libsodium via JNA (SodiumAndroid ->
+      # Native.register("sodium")); the runner image ships without it.
+      - name: Install libsodium for JVM unit tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsodium-dev
       - name: Unit tests
         run: ./gradlew testDebugUnitTest --no-daemon
       - name: Debug APK (release update asset is debug-signed)
