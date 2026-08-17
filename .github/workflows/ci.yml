@@ -78,7 +78,9 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          # lazysodium-android 5.2.0 ships Java 21 bytecode (class file 65),
+          # so JVM unit tests need a 21+ runtime; AGP 8.6 supports it.
+          java-version: "21"
       - uses: gradle/actions/setup-gradle@v4
       # Unit tests load the system libsodium via JNA (SodiumAndroid ->
       # Native.register("sodium")); the runner image ships without it.
