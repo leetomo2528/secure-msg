@@ -21,14 +21,14 @@
 }
 
 .dark {
-  --bg: 10 15 22;           /* #0a0f16 */
-  --bg-soft: 13 20 32;      /* #0d1420 */
+  --bg: 11 16 32;           /* #0B1020 */
+  --bg-soft: 18 26 43;      /* #121A2B */
   --fg: 255 255 255;
   --tx-1: 241 245 249;
   --tx-2: 226 232 240;
-  --tx-3: 148 163 184;
-  --tx-4: 100 116 139;
-  --accent-tx: 94 234 212;  /* teal-300 */
+  --tx-3: 154 168 191;      /* #9AA8BF */
+  --tx-4: 112 128 151;
+  --accent-tx: 49 215 193;  /* #31D7C1 */
   --danger-tx: 254 202 202; /* red-200 */
   --glow: rgba(45, 212, 191, 0.45);
   --shadow-bubble: rgba(0, 0, 0, 0.5);
@@ -36,18 +36,18 @@
 
 /* Authenticated web surface mirrors the Android palette. */
 .app-shell {
-  --bg: 10 15 22;
-  --bg-soft: 16 24 39;
+  --bg: 11 16 32;
+  --bg-soft: 18 26 43;
   --fg: 255 255 255;
   --tx-1: 241 245 249;
-  --tx-2: 203 213 225;
-  --tx-3: 148 163 184;
-  --tx-4: 100 116 139;
-  --accent-tx: 45 212 191;
+  --tx-2: 218 226 238;
+  --tx-3: 154 168 191;
+  --tx-4: 112 128 151;
+  --accent-tx: 49 215 193;
   --danger-tx: 254 202 202;
-  --glow: rgba(45, 212, 191, 0.42);
+  --glow: rgba(49, 215, 193, 0.30);
   --shadow-bubble: rgba(0, 0, 0, 0.5);
-  background-image: radial-gradient(900px 520px at 70% -15%, rgba(45, 212, 191, .08), transparent 65%);
+  background-image: radial-gradient(900px 520px at 70% -15%, rgba(49, 215, 193, .09), transparent 65%), linear-gradient(135deg, rgba(85,167,255,.025), transparent 45%);
 }
 
 html, body, #root {
@@ -123,10 +123,17 @@ body {
 }
 
 button { -webkit-tap-highlight-color: transparent; }
+button, [role="button"] { min-height: 2.75rem; }
 input, textarea { background: transparent; color: inherit; }
 input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
 
 ::selection { background: rgba(45, 212, 191, 0.28); }
+
+:focus-visible { outline: 2px solid rgb(var(--accent-tx)); outline-offset: 3px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: rgb(var(--fg) / 0.14); border-radius: 999px; }
@@ -136,7 +143,7 @@ input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
 @layer components {
   /* Shared form field */
   .field {
-    @apply w-full rounded-xl bg-fg/[0.04] ring-1 ring-fg/10 px-3.5 py-2.5 text-sm text-tx-1 transition focus:outline-none focus:ring-2 focus:ring-accent-tx/50;
+    @apply w-full rounded-xl bg-fg/[0.045] ring-1 ring-fg/10 px-3.5 py-3 text-sm text-tx-1 transition focus:outline-none focus:ring-2 focus:ring-accent-tx/50;
   }
   .btn-primary {
     @apply inline-flex items-center justify-center gap-1.5 rounded-xl bg-brand-gradient px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-glow transition hover:brightness-110 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
@@ -145,9 +152,17 @@ input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
     @apply inline-flex items-center justify-center gap-1.5 rounded-xl bg-fg/[0.03] px-3 py-2 text-sm text-tx-2 ring-1 ring-fg/10 transition hover:bg-fg/[0.07] active:scale-[0.98];
   }
   .card {
-    @apply rounded-2xl bg-fg/[0.03] ring-1 ring-fg/[0.06];
+    @apply rounded-2xl bg-fg/[0.035] ring-1 ring-fg/[0.08];
   }
   .form-label {
     @apply block text-[11px] font-medium tracking-wide text-tx-3;
   }
 }
+
+/* SecureMsg editorial surfaces: restrained glass, clear hierarchy. */
+.app-shell > aside { background: rgba(18, 26, 43, .78); backdrop-filter: blur(18px); }
+.app-shell main { background: rgba(11, 16, 32, .58); }
+.app-shell aside > div:first-child { border-bottom: 1px solid rgba(255,255,255,.06); }
+.app-shell aside button:hover { background-color: rgba(255,255,255,.055); }
+.app-shell aside input { min-height: 2.5rem; }
+.onboarding-card { border-color: rgba(49,215,193,.18); background: linear-gradient(145deg, rgba(18,26,43,.94), rgba(11,16,32,.9)); }
