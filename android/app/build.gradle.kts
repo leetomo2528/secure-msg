@@ -13,8 +13,8 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.10.7"
+        versionCode = 20
+        versionName = "0.10.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
