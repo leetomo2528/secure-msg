@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Unit tests (incl. Socket.IO device-trust suite)
+        run: python -m unittest discover -s tests -v
+      - name: ruff (non-blocking lint, warns only)
+        run: |
+          pip install ruff
+          ruff check . --exit-zero
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # The E2E suites spawn the real Flask relay from server/.venv/bin/python.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision relay server venv for E2E
+        working-directory: server
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+      - run: npm ci
+      - name: Unit + E2E tests
+        run: npm test -- --run
+      - name: Production build (tsc + vite + PWA)
+        run: npm run build
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+      - name: Debug APK (release update asset is debug-signed)
+        run: ./gradlew assembleDebug --no-daemon
+
+  crypto-core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crypto-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crypto-core
+      - name: cargo test
+        run: cargo test --quiet
