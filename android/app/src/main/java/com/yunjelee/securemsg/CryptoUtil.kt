@@ -26,6 +26,15 @@ object CryptoUtil {
     internal fun unb64u(s: String): ByteArray =
         Base64.getUrlDecoder().decode(s)
 
+    /**
+     * 32 random bytes, base64url. Used for the QR pairing nonce, which is
+     * public but must be unpredictable and unique per pending registration.
+     * java.security.SecureRandom rather than libsodium so this stays usable
+     * without the native binding (and in JVM unit tests).
+     */
+    fun randomNonceB64u(): String =
+        b64u(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })
+
     data class DeviceKeypair(
         val boxPk: String,
         val boxSk: String,

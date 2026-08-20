@@ -6,6 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { io, type Socket } from "socket.io-client";
+import { registerViaEmail } from "./registerViaEmail";
 import { initCrypto, generateKeypair, hashPassword, saltForUser, encryptMessage } from "../crypto/keys";
 import { signDeviceApproval } from "../crypto/deviceTrust";
 import { api, getSocket, setSocketBase } from "../net/api";
@@ -30,6 +31,7 @@ const PASSWORD = "Ab1!가나다라마바사";
 const PHONE = "+821099990001";
 
 let serverProc: ChildProcess;
+let outbox: string;
 const realFetch = globalThis.fetch.bind(globalThis);
 
 function fetchJson(url: string, init?: RequestInit): Promise<any> {
@@ -45,6 +47,7 @@ beforeAll(async () => {
   setSocketBase(BASE);
 
   const tmp = mkdtempSync(path.join(tmpdir(), "securemsg-relay-e2e-"));
+  outbox = path.join(tmp, "outbox.jsonl");
   serverProc = spawn(PYTHON, ["app.py"], {
     cwd: SERVER_DIR,
     env: {
@@ -55,6 +58,8 @@ beforeAll(async () => {
       SECUREMSG_DB: path.join(tmp, "relay.db"),
       SECUREMSG_JWT_SECRET: "relay-e2e-secret-" + "x".repeat(48),
       SECUREMSG_CORS: "http://localhost:5173",
+      SECUREMSG_EMAIL_PROVIDER: "console",
+      SECUREMSG_EMAIL_OUTBOX: outbox,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -82,7 +87,7 @@ describe("phone ↔ web relay interlock", () => {
   let smsCid = "";
 
   it("web registers and connects its realtime socket", async () => {
-    const ok = await useStore.getState().register(USERNAME, PASSWORD);
+    const ok = await registerViaEmail(outbox, USERNAME, PASSWORD);
     expect(useStore.getState().error).toBeNull();
     expect(ok).toBe(true);
     // postLogin wires the socket; wait for the actual connection.

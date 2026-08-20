@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -44,11 +45,15 @@ import com.yunjelee.securemsg.BuildConfig
 import com.yunjelee.securemsg.ContactSync
 import com.yunjelee.securemsg.ContactSyncStatus
 import com.yunjelee.securemsg.Credentials
+import com.yunjelee.securemsg.CryptoUtil
 import com.yunjelee.securemsg.DeviceSecurityController
 import com.yunjelee.securemsg.DeviceSecurityView
 import com.yunjelee.securemsg.DeviceTrustCrypto
 import com.yunjelee.securemsg.DeviceTrustRepository
+import com.yunjelee.securemsg.PairingHandshake
+import com.yunjelee.securemsg.PairingQrFields
 import com.yunjelee.securemsg.PendingDeviceApproval
+import com.yunjelee.securemsg.parsePairingQr
 import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.RelayTrustedDeviceApi
@@ -123,6 +128,10 @@ fun SettingsPane(
     var deviceSecurity by remember { mutableStateOf(DeviceSecurityView()) }
     var deviceSecurityLoading by remember { mutableStateOf(false) }
     var deviceActionMessage by remember { mutableStateOf<String?>(null) }
+    var scanningPairing by remember { mutableStateOf(false) }
+    var pendingPairing by remember {
+        mutableStateOf<Pair<PendingDeviceApproval, PairingHandshake>?>(null)
+    }
 
     fun securityController(): DeviceSecurityController {
         val relay = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }
@@ -159,6 +168,55 @@ fun SettingsPane(
                 } else {
                     "기기 요청 처리에 실패했습니다. 서버 상태를 확인해 주세요."
                 }
+                refreshDeviceSecurity()
+            }
+        }
+    }
+
+    /**
+     * QR pairing, approver half. The scan only opens a session; the human
+     * comparing the safety number on both screens is the authorization, so
+     * nothing is signed until [confirmPairing].
+     */
+    fun onPairingPayload(payload: String) {
+        scanningPairing = false
+        deviceActionMessage = null
+        val scanned: PairingQrFields? = parsePairingQr(payload)
+        if (scanned == null) {
+            deviceActionMessage = "QR을 읽지 못했습니다. 새 기기 화면의 코드를 다시 스캔하세요."
+            return
+        }
+        val target = deviceSecurity.pending.firstOrNull { it.sid == scanned.sid }
+        if (target == null) {
+            deviceActionMessage = "이 코드에 해당하는 승인 대기 기기를 찾지 못했습니다."
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val handshake = runCatching {
+                securityController().openPairing(target, scanned)
+            }.getOrNull()
+            withContext(Dispatchers.Main) {
+                if (handshake == null) {
+                    deviceActionMessage =
+                        "페어링을 시작하지 못했습니다. QR의 키가 서버 등록 정보와 다르면 승인하지 마세요."
+                } else {
+                    pendingPairing = target to handshake
+                }
+            }
+        }
+    }
+
+    fun confirmPairing() {
+        val (device, handshake) = pendingPairing ?: return
+        deviceActionMessage = null
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                securityController().approvePaired(device, handshake)
+            }.getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                pendingPairing = null
+                deviceActionMessage = if (ok) "기기를 승인했습니다."
+                    else "승인에 실패했습니다. 페어링이 만료됐을 수 있습니다."
                 refreshDeviceSecurity()
             }
         }
@@ -276,6 +334,27 @@ fun SettingsPane(
                 deviceSecurity.pending.isEmpty() -> Caption("승인 대기 중인 기기가 없습니다.")
             }
             if (deviceSecurity.selfPending) {
+                val challenge = deviceSecurity.selfPendingChallenge
+                if (challenge != null) {
+                    // The nonce must survive a recomposition or a screen
+                    // revisit: an approver may already be looking at a safety
+                    // number derived from it, and a fresh one would make the
+                    // two screens disagree — which reads as an attack.
+                    val nonce = remember(creds.sid) { CryptoUtil.randomNonceB64u() }
+                    PairingQrCard(
+                        payload = pairingQrPayload(
+                            server = ServerConfig.url(context),
+                            username = creds.username,
+                            sid = creds.sid,
+                            challenge = challenge,
+                            boxPk = creds.keypair.boxPk,
+                            sigPk = creds.keypair.signPk,
+                            nonceNew = nonce,
+                            nowSeconds = System.currentTimeMillis() / 1000,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
                 SmGhostButton(
                     text = "이 기기의 승인 요청 취소",
                     onClick = ::cancelOwnPending,
@@ -292,6 +371,38 @@ fun SettingsPane(
                 SmGradientButton(
                     text = "기기 보안 업그레이드",
                     onClick = ::upgradeLegacySecurity,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            val confirmation = pendingPairing
+            if (confirmation != null) {
+                SectionTitle("두 화면의 숫자가 같습니까?")
+                Caption("새 기기 화면에도 같은 숫자가 떠 있어야 합니다. 다르면 승인하지 말고 취소하세요.")
+                Text(
+                    confirmation.second.safetyNumber,
+                    color = Sm.teal, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                )
+                SmGradientButton(
+                    text = "숫자가 같습니다 · 승인",
+                    onClick = ::confirmPairing,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                SmGhostButton(
+                    text = "취소",
+                    onClick = { pendingPairing = null },
+                    modifier = Modifier.fillMaxWidth(),
+                    textColor = Sm.danger,
+                )
+            } else if (scanningPairing) {
+                PairingScanner(
+                    onPayload = ::onPairingPayload,
+                    onCancel = { scanningPairing = false },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else if (deviceSecurity.pending.isNotEmpty()) {
+                SmGradientButton(
+                    text = "QR 스캔으로 승인",
+                    onClick = { scanningPairing = true },
                     modifier = Modifier.fillMaxWidth(),
                 )
             }

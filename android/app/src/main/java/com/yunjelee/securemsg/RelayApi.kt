@@ -122,14 +122,34 @@ class RelayApi(
         post("/api/security-upgrade", JSONObject()
             .put("parent_epoch", parentEpoch).put("signature", signature))
 
+    /**
+     * Approve a pending device. Passing [pairing] signs and commits the v2
+     * (QR) form, binding the approval to one scanned session; omitting it
+     * keeps the v1 fingerprint-compare form.
+     */
     fun approveDevice(
         subjectSid: String,
         parentEpoch: Long,
         signature: String,
+        pairing: PairingBinding? = null,
     ): JSONObject = post("/api/device-approve", JSONObject()
         .put("subject_sid", subjectSid)
         .put("parent_epoch", parentEpoch)
-        .put("signature", signature))
+        .put("signature", signature)
+        .also { body ->
+            if (pairing != null) {
+                body.put("pairing_id", pairing.pairingId)
+                body.put("nonce_new", pairing.nonceNew)
+                body.put("nonce_approver", pairing.nonceApprover)
+            }
+        })
+
+    /** Approver side of QR pairing: bind a scanned nonce to one pending device. */
+    fun createPairingSession(sid: String, challenge: String, nonceNew: String): JSONObject =
+        post("/api/pairing/session", JSONObject()
+            .put("sid", sid)
+            .put("challenge", challenge)
+            .put("nonce_new", nonceNew))
 
     fun revokeDevice(sid: String, parentEpoch: Long, signature: String): JSONObject =
         post("/api/device-revoke", JSONObject()

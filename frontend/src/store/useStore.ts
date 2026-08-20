@@ -140,6 +140,9 @@ interface State {
   conversations: Conversation[];
   activeCid: string | null;
   activeMessages: MessageRow[];
+  /** Live QR pairing session + registration challenge while this device awaits approval. */
+  pendingPairing: { pairingId: string; nonceApprover: string; expiresAt: number } | null;
+  pendingChallenge: string | null;
   blockKeywords: BlockRow[];
   blockedSenders: SenderRow[];
   notifyEnabled: boolean;
@@ -147,7 +150,6 @@ interface State {
   error: string | null;
 
   init: () => Promise<void>;
-  register: (username: string, password: string) => Promise<boolean>;
   requestEmailRegistration: (username: string, email: string, password: string) => Promise<string | null>;
   verifyEmailRegistration: (username: string, email: string, password: string, challengeId: string, code: string) => Promise<boolean>;
   login: (username: string, password: string) => Promise<boolean>;
@@ -187,6 +189,8 @@ export const useStore = create<State>((set, get) => ({
   conversations: [],
   activeCid: null,
   activeMessages: [],
+  pendingPairing: null,
+  pendingChallenge: null,
   blockKeywords: [],
   blockedSenders: [],
   notifyEnabled: readNotifyPref(),
@@ -223,42 +227,6 @@ export const useStore = create<State>((set, get) => ({
       set({ error: errorText(error) });
     } finally {
       set({ ready: true });
-    }
-  },
-
-  register: async (username, password) => {
-    const entryGeneration = get().securityGeneration;
-    try {
-      if (!/^[a-z0-9_]{3,20}$/.test(username)) {
-        set({ error: "아이디는 영소문자·숫자·_ 3~20자로 입력하세요" });
-        return false;
-      }
-      if (password.length < 8 || password.length > 1024) {
-        set({
-          error:
-            "비밀번호는 영문·숫자·특수문자 조합 제한 없이 8~1,024자로 입력하세요",
-        });
-        return false;
-      }
-      const existingMeta = await getMeta();
-      if (get().securityGeneration !== entryGeneration) return false;
-      if (existingMeta) {
-        set({
-          error: `이 브라우저에는 ${existingMeta.username} 기기 키가 남아 있습니다. 새 계정을 만들기 전에 로컬 기기를 초기화하세요.`,
-        });
-        return false;
-      }
-      const salt = saltForUser(username);
-      const pwHash = await hashPassword(password, salt);
-      if (get().securityGeneration !== entryGeneration) return false;
-      const r = await api.register(username, pwHash);
-      if (get().securityGeneration !== entryGeneration) return false;
-      if (!r.ok) { set({ error: r.error || "register failed" }); return false; }
-      // After register, immediately register first device.
-      return await get().addDevice(username, password, "first-device");
-    } catch (error) {
-      set({ error: errorText(error) });
-      return false;
     }
   },
 
@@ -454,11 +422,28 @@ export const useStore = create<State>((set, get) => ({
       return "error";
     }
     if (result.trust_state === "approved") {
-      set({ approvalPending: false, error: null });
+      set({
+        approvalPending: false,
+        error: null,
+        pendingPairing: null,
+        pendingChallenge: null,
+      });
       await postLogin(context);
       return "approved";
     }
     if (result.trust_state === "revoked" || result.trust_state === "rejected") return "revoked";
+    // Pending: expose the registration challenge (QR payload) and any live
+    // pairing session so the UI can render the safety number.
+    set({
+      pendingChallenge: result.challenge ?? null,
+      pendingPairing: result.pairing
+        ? {
+            pairingId: result.pairing.pairing_id,
+            nonceApprover: result.pairing.nonce_approver,
+            expiresAt: result.pairing.expires_at,
+          }
+        : null,
+    });
     return "pending";
   },
 
@@ -618,7 +603,7 @@ export const useStore = create<State>((set, get) => ({
     set({ deviceCache: memberMap });
     if (!canUseCrypto(context)) return;
     const cached = await runSessionEffect(context, () => cacheDevices(members.map((m) => ({
-      sid: m.sid, user_id: m.user_id, name: m.name, pub_key: m.pub_key, sig_pub: m.sig_pub,
+      sid: m.sid, user_id: m.user_id, pub_key: m.pub_key, sig_pub: m.sig_pub,
     }))));
     if (!cached) return;
 
@@ -1079,8 +1064,14 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
       const directory = await api.keyDirectory();
       if (!canUseCrypto(context)) return;
       if (!directory.ok) {
-        // Only an explicitly old server may use the compatibility path.
-        if (directory.status === 404) return;
+        // A 404 used to skip verification and pinning entirely, for relays
+        // predating /key-directory. Every supported server implements it now,
+        // so a missing directory is a hostile or broken relay, not an old one:
+        // suppressing this one response must not buy an attacker a session
+        // with no identity pin.
+        if (directory.status === 404) {
+          throw new Error("서버가 키 디렉터리를 제공하지 않습니다. 신뢰할 수 없는 릴레이입니다.");
+        }
         if (directory.status === 0 || (directory.status != null && directory.status >= 500)) {
           throw new RetryablePostLoginError(
             `${directory.error ?? "키 디렉터리를 불러오지 못했습니다."} 잠시 후 다시 시도하세요.`,

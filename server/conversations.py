@@ -52,13 +52,18 @@ def create_conversation():
         return _err("invalid member username", 400)
 
     # Resolve member ids. Current user is implicitly a member.
+    #
+    # Every rejection below is the SAME message on purpose. Naming the member
+    # that does not exist turns this endpoint into a username oracle, which
+    # would undo the constant-time credential check /login goes to the trouble
+    # of doing.
     resolved = []
     for uname in dict.fromkeys(members):
         if not USERNAME_RE.fullmatch(uname):
-            return _err("invalid member username", 400)
+            return _err("invalid member list", 400)
         u = store.get_user_by_name(uname)
         if not u:
-            return _err(f"unknown user: {uname}", 404)
+            return _err("invalid member list", 400)
         resolved.append(u["id"])
 
     cid = secrets.token_urlsafe(9)  # opaque conversation id
@@ -181,7 +186,9 @@ def sync_contact_names():
 @auth_required
 def list_conversations():
     """Return conversations the current user is in, plus their other members."""
-    with store.conn_ctx() as c:
+    # One pass for the conversations and one for every membership in them,
+    # rather than a members query per conversation.
+    with store.read_snapshot() as c:
         rows = c.execute(
             "SELECT cv.cid, cv.id AS conv_id, cv.name, cv.synced_contact_name, "
             "cv.created_at FROM conversation_members m "
@@ -189,23 +196,28 @@ def list_conversations():
             "ORDER BY cv.created_at DESC, cv.id DESC",
             (g.auth["uid"],),
         ).fetchall()
-        out = []
-        for r in rows:
-            members_rows = c.execute(
-                "SELECT u.username FROM conversation_members m "
-                "JOIN users u ON u.id = m.user_id WHERE m.conv_id = ?",
-                (r["conv_id"],),
-            ).fetchall()
-            out.append(
-                {
-                    "cid": r["cid"],
-                    "conv_id": r["conv_id"],
-                    "name": r["name"],
-                    "synced_contact_name": r["synced_contact_name"],
-                    "members": [mr["username"] for mr in members_rows],
-                    "created_at": r["created_at"],
-                }
-            )
+        member_rows = c.execute(
+            "SELECT peers.conv_id AS conv_id, u.username AS username "
+            "FROM conversation_members mine "
+            "JOIN conversation_members peers ON peers.conv_id = mine.conv_id "
+            "JOIN users u ON u.id = peers.user_id "
+            "WHERE mine.user_id = ?",
+            (g.auth["uid"],),
+        ).fetchall()
+    members_by_conv: dict[int, list[str]] = {}
+    for row in member_rows:
+        members_by_conv.setdefault(int(row["conv_id"]), []).append(row["username"])
+    out = [
+        {
+            "cid": r["cid"],
+            "conv_id": r["conv_id"],
+            "name": r["name"],
+            "synced_contact_name": r["synced_contact_name"],
+            "members": members_by_conv.get(int(r["conv_id"]), []),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
     return _ok(conversations=out)
 
 
@@ -241,12 +253,16 @@ def conv_members(cid: str):
         recipient_keyset_hash=recipient_keyset_hash,
         directory_checkpoints=snapshot["directory_checkpoints"],
         directory_proofs=snapshot["directory_proofs"],
+        # Deliberately NO device `name`: envelope encryption needs the keys and
+        # the SID, never the human label. Anyone who can name you in a
+        # conversation could otherwise read your device names ("Yunje's
+        # MacBook") straight out of this endpoint. Your own device names still
+        # come back from /devices, which is scoped to your account.
         members=[
             {
                 "user_id": d["user_id"],
                 "device_id": d["device_id"],
                 "sid": d["sid"],
-                "name": d["name"],
                 "pub_key": d["pub_key"],
                 "sig_pub": d["sig_pub"],
                 "kind": d["kind"],

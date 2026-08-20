@@ -12,6 +12,7 @@ import java.math.BigInteger
 import java.util.Locale
 
 private const val APPROVAL_DOMAIN = "securemsg-device-approval-v1"
+private const val APPROVAL_DOMAIN_V2 = "securemsg-device-approval-v2"
 private const val FINGERPRINT_DOMAIN = "securemsg-device-fingerprint-v1\n"
 private const val SAFETY_DOMAIN = "securemsg-account-safety-v1\n"
 
@@ -55,6 +56,81 @@ data class DeviceApprovalStatement(
             "kind=$kind\n" +
             "challenge=$challenge\n" +
             "parent_epoch=$parentEpoch\n"
+    }
+}
+
+/** The QR pairing session an approval certificate is bound to (v2 only). */
+data class PairingBinding(
+    val pairingId: String,
+    val nonceNew: String,
+    val nonceApprover: String,
+)
+
+/**
+ * v2 binds one QR pairing session into the approval certificate so a signature
+ * can never be replayed onto a different scan. Field order must match the
+ * relay's `approval_statement` and the web client byte for byte; all three are
+ * pinned by golden-vector tests.
+ */
+data class DeviceApprovalStatementV2(
+    val fields: DeviceApprovalStatement,
+    val pairing: PairingBinding,
+) {
+    fun canonical(): String {
+        require(fields.uid >= 0) { "uid must be non-negative" }
+        require(fields.parentEpoch >= 0) { "parent_epoch must be non-negative" }
+        requireToken("subject_sid", fields.subjectSid)
+        requireToken("kind", fields.kind)
+        requireB64u("pub_key", fields.pubKey, 32)
+        requireB64u("sig_pub", fields.sigPub, 32)
+        requireB64u("challenge", fields.challenge, 32)
+        requireToken("pairing_id", pairing.pairingId)
+        requireB64u("nonce_new", pairing.nonceNew, 32)
+        requireB64u("nonce_approver", pairing.nonceApprover, 32)
+        return "$APPROVAL_DOMAIN_V2\n" +
+            "uid=${fields.uid}\n" +
+            "subject_sid=${fields.subjectSid}\n" +
+            "pub_key=${fields.pubKey}\n" +
+            "sig_pub=${fields.sigPub}\n" +
+            "kind=${fields.kind}\n" +
+            "challenge=${fields.challenge}\n" +
+            "pairing_id=${pairing.pairingId}\n" +
+            "nonce_new=${pairing.nonceNew}\n" +
+            "nonce_approver=${pairing.nonceApprover}\n" +
+            "parent_epoch=${fields.parentEpoch}\n"
+    }
+}
+
+/** Read one `key=value` line out of a canonical statement. */
+private fun statementField(statement: String, key: String): String? =
+    statement.lineSequence().firstOrNull { it.startsWith("$key=") }?.substring(key.length + 1)
+
+/**
+ * Recover the pairing binding a v2 statement claims. The caller MUST re-render
+ * the canonical statement from the result and compare it to the original —
+ * that byte comparison, not this parse, is what rejects smuggled content.
+ */
+fun pairingBindingFromStatement(statement: String): PairingBinding? {
+    val pairingId = statementField(statement, "pairing_id") ?: return null
+    val nonceNew = statementField(statement, "nonce_new") ?: return null
+    val nonceApprover = statementField(statement, "nonce_approver") ?: return null
+    return PairingBinding(pairingId, nonceNew, nonceApprover)
+}
+
+/**
+ * The canonical form a stored certificate must match. v1 (password +
+ * fingerprint compare) and v2 (QR pairing) certificates coexist in one chain,
+ * and the statement's own domain line decides which. A statement that claims
+ * v2 but carries no binding is rejected rather than re-checked under v1.
+ */
+fun canonicalApprovalForStatement(
+    fields: DeviceApprovalStatement,
+    statement: String,
+): String? = if (!statement.startsWith("$APPROVAL_DOMAIN_V2\n")) {
+    runCatching { fields.canonical() }.getOrNull()
+} else {
+    pairingBindingFromStatement(statement)?.let { binding ->
+        runCatching { DeviceApprovalStatementV2(fields, binding).canonical() }.getOrNull()
     }
 }
 
@@ -182,8 +258,14 @@ sealed interface PendingDevicesResult {
 
 interface TrustedDeviceApi {
     fun pendingDevices(): PendingDevicesResult
-    fun approveDevice(device: PendingDeviceApproval, signature: String): Boolean
+    fun approveDevice(
+        device: PendingDeviceApproval,
+        signature: String,
+        pairing: PairingBinding? = null,
+    ): Boolean
     fun rejectPendingDevice(device: PendingDeviceApproval): Boolean
+    /** Returns (pairing_id, nonce_approver) or null when the relay refuses. */
+    fun openPairingSession(device: PendingDeviceApproval, nonceNew: String): Pair<String, String>?
 }
 
 class RelayTrustedDeviceApi(
@@ -228,12 +310,34 @@ class RelayTrustedDeviceApi(
         PendingDevicesResult.Failed(e.message ?: "기기 목록 조회 실패")
     }
 
-    override fun approveDevice(device: PendingDeviceApproval, signature: String): Boolean =
-        api.approveDevice(device.sid, device.parentEpoch, signature).optBoolean("ok")
+    override fun approveDevice(
+        device: PendingDeviceApproval,
+        signature: String,
+        pairing: PairingBinding?,
+    ): Boolean = api.approveDevice(device.sid, device.parentEpoch, signature, pairing)
+        .optBoolean("ok")
+
+    override fun openPairingSession(
+        device: PendingDeviceApproval,
+        nonceNew: String,
+    ): Pair<String, String>? {
+        val response = api.createPairingSession(device.sid, device.challenge, nonceNew)
+        if (!response.optBoolean("ok")) return null
+        val pairingId = response.optString("pairing_id")
+        val nonceApprover = response.optString("nonce_approver")
+        if (pairingId.isEmpty() || nonceApprover.isEmpty()) return null
+        return pairingId to nonceApprover
+    }
 
     override fun rejectPendingDevice(device: PendingDeviceApproval): Boolean =
         api.rejectPendingDevice(device.sid, device.challenge, device.parentEpoch).optBoolean("ok")
 }
+
+/** A live pairing session plus the number the two screens must agree on. */
+data class PairingHandshake(
+    val binding: PairingBinding,
+    val safetyNumber: String,
+)
 
 data class DeviceSecurityView(
     val pending: List<PendingDeviceApproval> = emptyList(),
@@ -241,6 +345,8 @@ data class DeviceSecurityView(
     val error: String? = null,
     val trustWarning: String? = null,
     val selfPending: Boolean = false,
+    /** This device's own registration challenge while it awaits approval. */
+    val selfPendingChallenge: String? = null,
     val securityMode: String? = null,
 )
 
@@ -257,7 +363,10 @@ class DeviceSecurityController(
             if (directoryResponse.optInt("_http_status") == 403) {
                 val status = runCatching { api.pendingStatus() }.getOrNull()
                 if (status?.optBoolean("ok") == true && status.optString("trust_state") == "pending") {
-                    return DeviceSecurityView(selfPending = true)
+                    return DeviceSecurityView(
+                        selfPending = true,
+                        selfPendingChallenge = status.optString("challenge").takeIf { it.isNotEmpty() },
+                    )
                 }
             }
             return DeviceSecurityView(error = directoryResponse.optString("error", "키 디렉터리 조회 실패"))
@@ -344,6 +453,41 @@ class DeviceSecurityController(
         return api.approveDevice(device, signature)
     }
 
+    /**
+     * Bind a scanned QR to one pending device. Returns the safety number both
+     * screens must show; the caller shows it to the user and only calls
+     * [approvePaired] once a human confirms the two match.
+     */
+    fun openPairing(device: PendingDeviceApproval, scanned: PairingQrFields): PairingHandshake? {
+        require(device.uid == credentials.uid.toLong()) { "pending device belongs to another account" }
+        // The relay's own pending row is the authority on the subject's keys.
+        // A QR claiming different ones is stale or an attempted key swap.
+        if (device.sid != scanned.sid || device.pubKey != scanned.boxPk ||
+            device.sigPub != scanned.sigPk || device.challenge != scanned.challenge
+        ) return null
+        val (pairingId, nonceApprover) =
+            api.openPairingSession(device, scanned.nonceNew) ?: return null
+        return PairingHandshake(
+            binding = PairingBinding(pairingId, scanned.nonceNew, nonceApprover),
+            safetyNumber = pairingSafetyNumber(
+                nonceNew = scanned.nonceNew,
+                nonceApprover = nonceApprover,
+                sid = device.sid,
+                pubKey = device.pubKey,
+                sigPub = device.sigPub,
+            ),
+        )
+    }
+
+    fun approvePaired(device: PendingDeviceApproval, handshake: PairingHandshake): Boolean {
+        require(device.uid == credentials.uid.toLong()) { "pending device belongs to another account" }
+        val signature = DeviceTrustCrypto.signApprovalV2(
+            DeviceApprovalStatementV2(device.statement(), handshake.binding),
+            credentials.keypair.signSk,
+        )
+        return api.approveDevice(device, signature, handshake.binding)
+    }
+
     fun reject(device: PendingDeviceApproval): Boolean = api.rejectPendingDevice(device)
 
     fun cancelOwnPending(): Boolean = api.revokeOwnPending()
@@ -363,6 +507,9 @@ class DeviceSecurityController(
 
 object DeviceTrustCrypto {
     fun signApproval(statement: DeviceApprovalStatement, signSecretKey: String): String =
+        CryptoUtil.signDetached(statement.canonical().toByteArray(Charsets.UTF_8), signSecretKey)
+
+    fun signApprovalV2(statement: DeviceApprovalStatementV2, signSecretKey: String): String =
         CryptoUtil.signDetached(statement.canonical().toByteArray(Charsets.UTF_8), signSecretKey)
 
     fun verifyApproval(
@@ -511,8 +658,12 @@ internal fun verifyDirectoryProof(
     snapshot: TrustedDirectorySnapshot,
     firstUse: Boolean,
     knownTrustedSids: Set<String> = emptySet(),
-    verifySignature: (DeviceApprovalStatement, String, String) -> Boolean =
-        DeviceTrustCrypto::verifyApproval,
+    // Takes the ALREADY-canonical statement text, so v1 and v2 approvals share
+    // one verifier and unit tests can still inject a stub instead of the
+    // native sodium binding.
+    verifySignature: (String, String, String) -> Boolean = { statement, signature, signerPublicKey ->
+        CryptoUtil.verifyDetached(statement.toByteArray(Charsets.UTF_8), signature, signerPublicKey)
+    },
 ): String? {
     if (proof.userId != snapshot.uid || proof.identitySigPub != snapshot.identityKey ||
         proof.securityEpoch != snapshot.epoch || proof.directoryHash != snapshot.claimedDirectoryHash
@@ -559,9 +710,10 @@ internal fun verifyDirectoryProof(
                     proof.userId, subject.sid, subject.pubKey, subject.sigPub, subject.kind,
                     subject.challenge, cert.parentEpoch,
                 )
-                if (cert.statement != runCatching { statement.canonical() }.getOrNull() ||
+                val canonical = canonicalApprovalForStatement(statement, cert.statement)
+                if (canonical == null || cert.statement != canonical ||
                     cert.signature != subject.approvalSignature ||
-                    !verifySignature(statement, cert.signature, approver.sigPub)
+                    !verifySignature(canonical, cert.signature, approver.sigPub)
                 ) return "approval certificate signature or statement invalid"
                 trusted += subject.sid
                 activeAtEpoch += subject.sid

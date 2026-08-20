@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import smtplib
 import ssl
-import json
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from email.message import EmailMessage
 
 import config
 
+log = logging.getLogger("securemsg.emailer")
+
 
 def configured() -> bool:
+    if config.EMAIL_PROVIDER == "console":
+        # Development delivery: nothing external to configure. Refused in
+        # production by config.enforce_secret().
+        return True
     if config.EMAIL_PROVIDER == "resend":
         return bool(config.RESEND_API_KEY and config.RESEND_FROM)
     return bool(config.SMTP_HOST and config.SMTP_FROM)
@@ -27,6 +35,20 @@ def send_code(recipient: str, subject: str, code: str, purpose: str) -> None:
         f"이 코드는 {config.EMAIL_CODE_TTL_SECONDS // 60}분 동안 유효합니다. "
         "본인이 요청하지 않았다면 이 메일을 무시하세요.\n"
     )
+    if config.EMAIL_PROVIDER == "console":
+        # Local development and automated tests: no mail provider account
+        # needed to walk the real registration flow. The code is written where
+        # the developer running the relay can read it, and nowhere else.
+        record = {"to": recipient, "subject": subject, "code": code, "purpose": purpose}
+        if config.EMAIL_OUTBOX:
+            outbox = Path(config.EMAIL_OUTBOX)
+            outbox.parent.mkdir(parents=True, exist_ok=True)
+            with outbox.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        else:
+            log.warning("console email delivery — %s code for %s: %s", purpose, recipient, code)
+        return
+
     if config.EMAIL_PROVIDER == "resend":
         payload = json.dumps({
             "from": config.RESEND_FROM,

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app, socketio
 from auth import approval_statement, revoke_statement, device_login_statement
+import config
 import store
 
 app.config["TESTING"] = True
@@ -32,6 +33,26 @@ app.config["TESTING"] = True
 def tearDownModule():
     for suffix in ("", "-wal", "-shm"):
         _db_path.with_name(_db_path.name + suffix).unlink(missing_ok=True)
+
+
+def register_account(client, username: str, pw_hash: str):
+    """Create an account the only way the server still allows: email-verified.
+
+    Returns the /register/email/verify response, which carries the same
+    ``uid``/``username`` fields the removed /api/register used to return.
+    """
+    email = f"{username}@example.test"
+    with mock.patch("emailer.send_code") as send_code:
+        requested = client.post(
+            "/api/register/email/request",
+            json={"username": username, "email": email, "pw_hash": pw_hash},
+        )
+        assert requested.status_code == 200, requested.json
+        code = send_code.call_args.args[2]
+    return client.post(
+        "/api/register/email/verify",
+        json={"challenge_id": requested.json["challenge_id"], "code": code},
+    )
 
 
 class ServerSmokeTest(unittest.TestCase):
@@ -45,10 +66,7 @@ class ServerSmokeTest(unittest.TestCase):
         self.device_signing_keys = {}
         method_id = hashlib.sha256(self._testMethodName.encode()).hexdigest()[:12]
         self.username = "alice_" + method_id
-        register = self.client.post(
-            "/api/register",
-            json={"username": self.username, "pw_hash": self.pw_hash},
-        )
+        register = register_account(self.client, self.username, self.pw_hash)
         self.assertEqual(register.status_code, 200, register.json)
         device = self.client.post(
             "/api/device-register",
@@ -79,6 +97,98 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(created.status_code, 200, created.json)
         return created.json
 
+    def test_approval_statements_match_the_client_golden_vectors(self):
+        """Pin both canonical forms byte-for-byte.
+
+        The web and Android clients re-render these statements locally and
+        compare them to what the relay stored; a one-character drift on either
+        side silently invalidates every certificate in the chain. The same two
+        literals are pinned in frontend/src/crypto/deviceTrust.test.ts.
+        """
+        zero32 = "A" * 43
+        one32 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+        two32 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+        subject = {
+            "sid": "dev_new-01",
+            "pub_key": zero32,
+            "sig_pub": one32,
+            "kind": "android_gateway",
+            "challenge": two32,
+        }
+        self.assertEqual(
+            approval_statement(42, subject, 7),
+            "securemsg-device-approval-v1\n"
+            "uid=42\n"
+            "subject_sid=dev_new-01\n"
+            f"pub_key={zero32}\n"
+            f"sig_pub={one32}\n"
+            "kind=android_gateway\n"
+            f"challenge={two32}\n"
+            "parent_epoch=7\n",
+        )
+        nonce_new = base64.urlsafe_b64encode(bytes([3] * 32)).decode().rstrip("=")
+        nonce_approver = base64.urlsafe_b64encode(bytes([4] * 32)).decode().rstrip("=")
+        self.assertEqual(
+            approval_statement(42, subject, 7, {
+                "pairing_id": "pair_abc-123",
+                "nonce_new": nonce_new,
+                "nonce_approver": nonce_approver,
+            }),
+            "securemsg-device-approval-v2\n"
+            "uid=42\n"
+            "subject_sid=dev_new-01\n"
+            f"pub_key={zero32}\n"
+            f"sig_pub={one32}\n"
+            "kind=android_gateway\n"
+            f"challenge={two32}\n"
+            "pairing_id=pair_abc-123\n"
+            f"nonce_new={nonce_new}\n"
+            f"nonce_approver={nonce_approver}\n"
+            "parent_epoch=7\n",
+        )
+
+    def test_unverified_registration_endpoint_is_gone(self):
+        """Accounts must go through email verification; the old path is removed."""
+        response = self.client.post(
+            "/api/register",
+            json={"username": "sneaky_" + self.username[-6:], "pw_hash": self.pw_hash},
+        )
+        self.assertEqual(response.status_code, 404, response.json)
+        self.assertIsNone(store.get_user_by_name("sneaky_" + self.username[-6:]))
+
+    def test_conversation_create_does_not_confirm_who_exists(self):
+        """An unknown member and a malformed one must be indistinguishable."""
+        unknown = self.client.post(
+            "/api/conversation",
+            headers=self.headers,
+            json={"members": ["ghost_" + self.username[-6:]], "name": "probe"},
+        )
+        malformed = self.client.post(
+            "/api/conversation",
+            headers=self.headers,
+            json={"members": ["Not A Username"], "name": "probe"},
+        )
+        self.assertEqual(unknown.status_code, 400, unknown.json)
+        self.assertEqual(malformed.status_code, unknown.status_code)
+        self.assertEqual(malformed.json["error"], unknown.json["error"])
+        self.assertNotIn("ghost_", unknown.json["error"])
+
+    def test_conversation_members_do_not_leak_device_names(self):
+        """Device labels are account-private; keys are all a sender needs."""
+        created = self.create_conversation("+821011112222")
+        members = self.client.get(
+            f"/api/conversation/{created['cid']}/members", headers=self.headers
+        )
+        self.assertEqual(members.status_code, 200, members.json)
+        self.assertTrue(members.json["members"])
+        for member in members.json["members"]:
+            self.assertNotIn("name", member)
+            self.assertIn("pub_key", member)
+            self.assertIn("sid", member)
+        # The account's own device list still carries the label it chose.
+        own = self.client.get("/api/devices", headers=self.headers)
+        self.assertEqual(own.json["devices"][0]["name"], "test")
+
     def register_and_approve_device(self, payload):
         """Register another device and cross-sign it with the bootstrap device."""
         payload = dict(payload)
@@ -100,6 +210,93 @@ class ServerSmokeTest(unittest.TestCase):
             )
             self.assertEqual(approved.status_code, 200, approved.json)
         return response
+
+    def test_consumed_challenges_are_swept_after_retention(self):
+        """These tables had no delete path at all and grew without bound."""
+        username = "sweep_" + self.username[-6:]
+        self.assertEqual(
+            register_account(self.client, username, self.pw_hash).status_code, 200
+        )
+        with store.conn_ctx() as c:
+            live = c.execute(
+                "SELECT COUNT(*) AS n FROM email_verification_challenges WHERE username = ?",
+                (username,),
+            ).fetchone()
+            self.assertEqual(int(live["n"]), 1)
+            # Age the consumed row past the retention window.
+            c.execute(
+                "UPDATE email_verification_challenges SET created_at = ? WHERE username = ?",
+                (store.now() - config.CHALLENGE_RETENTION_SECONDS - 60, username),
+            )
+        store.prune_challenges()
+        with store.conn_ctx() as c:
+            left = c.execute(
+                "SELECT COUNT(*) AS n FROM email_verification_challenges WHERE username = ?",
+                (username,),
+            ).fetchone()
+        self.assertEqual(int(left["n"]), 0)
+
+    def test_block_rules_are_capped_per_account(self):
+        with mock.patch.object(config, "MAX_BLOCK_RULES", 3):
+            for index in range(3):
+                added = self.client.post(
+                    "/api/blocklist",
+                    headers=self.headers,
+                    json={"type": "keyword", "value": f"광고{index}"},
+                )
+                self.assertEqual(added.status_code, 200, added.json)
+            refused = self.client.post(
+                "/api/blocklist",
+                headers=self.headers,
+                json={"type": "keyword", "value": "광고3"},
+            )
+            self.assertEqual(refused.status_code, 409, refused.json)
+            # Re-adding one that already exists stays idempotent at the cap.
+            again = self.client.post(
+                "/api/blocklist",
+                headers=self.headers,
+                json={"type": "keyword", "value": "광고0"},
+            )
+            self.assertEqual(again.status_code, 200, again.json)
+
+    def test_wrong_reset_code_costs_no_key_derivation(self):
+        """A rejected code must not spend bcrypt work on the single worker.
+
+        The hash used to be computed before the code was checked, so anyone
+        holding a username/email pair could burn ~250ms of server CPU per
+        request — and rotating challenge_id dodged the rate limiter.
+        """
+        username = "resetcost_" + self.username[-6:]
+        email = f"{username}@example.test"
+        self.assertEqual(
+            register_account(self.client, username, self.pw_hash).status_code, 200
+        )
+        with mock.patch("emailer.send_code") as send_code:
+            requested = self.client.post(
+                "/api/password-reset/request",
+                json={"username": username, "email": email},
+            )
+            self.assertEqual(requested.status_code, 200, requested.json)
+            real_code = send_code.call_args.args[2]
+        wrong_code = "000000" if real_code != "000000" else "111111"
+        with mock.patch("auth.bcrypt.hashpw") as hashpw:
+            rejected = self.client.post(
+                "/api/password-reset/confirm",
+                json={
+                    "username": username,
+                    "email": email,
+                    "challenge_id": requested.json["challenge_id"],
+                    "code": wrong_code,
+                    "pw_hash": "B" * 43,
+                },
+            )
+        self.assertEqual(rejected.status_code, 400, rejected.json)
+        hashpw.assert_not_called()
+        # The stored password is untouched, so the original one still logs in.
+        login = self.client.post(
+            "/api/login", json={"username": username, "pw_hash": self.pw_hash}
+        )
+        self.assertEqual(login.status_code, 200, login.json)
 
     def test_email_registration_and_password_reset_codes(self):
         username = "mail_" + self._testMethodName[-8:]
@@ -200,6 +397,166 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertFalse(refused.is_connected())
         refused_second = socketio.test_client(app, auth={"token": second_token})
         self.assertFalse(refused_second.is_connected())
+
+    def _register_pending(self, name):
+        device = self.client.post(
+            "/api/device-register",
+            json={
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": name,
+                "pub_key": "B" * 43,
+                "sig_pub": self.sig_pub,
+            },
+        )
+        self.assertEqual(device.status_code, 200, device.json)
+        return device
+
+    def _sign(self, statement):
+        return base64.urlsafe_b64encode(
+            bytes(self.signing_key.sign(statement.encode("utf-8")).signature)
+        ).decode("ascii").rstrip("=")
+
+    def test_qr_pairing_session_and_v2_approval_flow(self):
+        pending = self._register_pending("qr-phone")
+        sid = pending.json["sid"]
+        challenge = pending.json["challenge"]
+        nonce_new = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+        epoch = int(store.get_user(self.uid)["security_epoch"])
+
+        # Input validation.
+        self.assertEqual(
+            self.client.post("/api/pairing/session", headers=self.headers, json={}).status_code,
+            400,
+        )
+        wrong_challenge = self.client.post(
+            "/api/pairing/session",
+            headers=self.headers,
+            json={"sid": sid, "challenge": "A" * 43, "nonce_new": nonce_new},
+        )
+        self.assertEqual(wrong_challenge.status_code, 404, wrong_challenge.json)
+
+        # A live session is exposed to the pending device through its poll.
+        session = self.client.post(
+            "/api/pairing/session",
+            headers=self.headers,
+            json={"sid": sid, "challenge": challenge, "nonce_new": nonce_new},
+        )
+        self.assertEqual(session.status_code, 200, session.json)
+        self.assertIn("nonce_approver", session.json)
+        pairing = {
+            "pairing_id": session.json["pairing_id"],
+            "nonce_new": nonce_new,
+            "nonce_approver": session.json["nonce_approver"],
+        }
+        status = self.client.get(
+            "/api/device-pending-status",
+            headers={"Authorization": f"Bearer {pending.json['token']}"},
+        )
+        self.assertEqual(status.status_code, 200, status.json)
+        self.assertEqual(status.json["pairing"]["nonce_approver"], pairing["nonce_approver"])
+
+        # A signature over swapped nonces must not verify against the server's
+        # canonical statement (mitm substitution of the safety-number material).
+        subject = store.get_device_by_sid(sid)
+        forged = approval_statement(
+            self.uid, subject, epoch, {**pairing, "nonce_approver": "B" * 43}
+        )
+        tampered = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json={
+                "subject_sid": sid,
+                "parent_epoch": epoch,
+                "signature": self._sign(forged),
+                **pairing,
+            },
+        )
+        self.assertEqual(tampered.status_code, 403, tampered.json)
+
+        approved = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json={
+                "subject_sid": sid,
+                "parent_epoch": epoch,
+                "signature": self._sign(approval_statement(self.uid, subject, epoch, pairing)),
+                **pairing,
+            },
+        )
+        self.assertEqual(approved.status_code, 200, approved.json)
+        self.assertEqual(store.get_device_by_sid(sid)["trust_state"], "approved")
+        # The pairing session no longer leaks into the subject's poll result.
+        self.assertIsNone(store.get_live_pairing_session(sid, int(__import__("time").time())))
+
+        # Replaying the consumed session for another device is rejected even
+        # with a perfectly valid signature over the full v2 statement.
+        second = self._register_pending("qr-replay")
+        second_sid = second.json["sid"]
+        second_subject = store.get_device_by_sid(second_sid)
+        new_epoch = int(store.get_user(self.uid)["security_epoch"])
+        replay = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json={
+                "subject_sid": second_sid,
+                "parent_epoch": new_epoch,
+                "signature": self._sign(
+                    approval_statement(self.uid, second_subject, new_epoch, pairing)
+                ),
+                **pairing,
+            },
+        )
+        self.assertEqual(replay.status_code, 409, replay.json)
+        self.assertIn("pairing session", replay.json["error"])
+        self.assertEqual(store.get_device_by_sid(second_sid)["trust_state"], "pending")
+
+    def test_qr_pairing_session_expiry_and_v1_fallback(self):
+        pending = self._register_pending("qr-expired")
+        sid = pending.json["sid"]
+        nonce_new = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+        session = self.client.post(
+            "/api/pairing/session",
+            headers=self.headers,
+            json={"sid": sid, "challenge": pending.json["challenge"], "nonce_new": nonce_new},
+        )
+        self.assertEqual(session.status_code, 200, session.json)
+        pairing = {
+            "pairing_id": session.json["pairing_id"],
+            "nonce_new": nonce_new,
+            "nonce_approver": session.json["nonce_approver"],
+        }
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE pairing_sessions SET expires_at = 1 WHERE pairing_id = ?",
+                (pairing["pairing_id"],),
+            )
+        expired_epoch = int(store.get_user(self.uid)["security_epoch"])
+        expired_subject = store.get_device_by_sid(sid)
+        expired = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json={
+                "subject_sid": sid,
+                "parent_epoch": expired_epoch,
+                "signature": self._sign(
+                    approval_statement(self.uid, expired_subject, expired_epoch, pairing)
+                ),
+                **pairing,
+            },
+        )
+        self.assertEqual(expired.status_code, 409, expired.json)
+        self.assertIn("pairing session", expired.json["error"])
+        self.assertEqual(store.get_device_by_sid(sid)["trust_state"], "pending")
+
+        # Old clients keep working: the same device is still approvable via v1.
+        v1 = self.client.post(
+            "/api/device-approve",
+            headers=self.headers,
+            json=self.approval_payload(pending),
+        )
+        self.assertEqual(v1.status_code, 200, v1.json)
+        self.assertEqual(store.get_device_by_sid(sid)["trust_state"], "approved")
 
     def test_resend_email_provider_posts_server_side_api_request(self):
         import emailer
@@ -693,15 +1050,23 @@ class ServerSmokeTest(unittest.TestCase):
 
     def test_username_is_ascii_only(self):
         response = self.client.post(
-            "/api/register",
-            json={"username": "사용자123", "pw_hash": self.pw_hash},
+            "/api/register/email/request",
+            json={
+                "username": "사용자123",
+                "email": "ascii@example.test",
+                "pw_hash": self.pw_hash,
+            },
         )
         self.assertEqual(response.status_code, 400, response.json)
 
     def test_non_string_fields_return_400_instead_of_500(self):
         registration = self.client.post(
-            "/api/register",
-            json={"username": ["alice"], "pw_hash": self.pw_hash},
+            "/api/register/email/request",
+            json={
+                "username": ["alice"],
+                "email": "nonstring@example.test",
+                "pw_hash": self.pw_hash,
+            },
         )
         self.assertEqual(registration.status_code, 400, registration.json)
         conversation = self.client.post(
@@ -1149,10 +1514,7 @@ class ServerSmokeTest(unittest.TestCase):
         bob_username = "bob_" + hashlib.sha256(
             self._testMethodName.encode()
         ).hexdigest()[:12]
-        registered = self.client.post(
-            "/api/register",
-            json={"username": bob_username, "pw_hash": self.pw_hash},
-        )
+        registered = register_account(self.client, bob_username, self.pw_hash)
         self.assertEqual(registered.status_code, 200, registered.json)
         bob_gateway = self.client.post(
             "/api/device-register",
@@ -1524,9 +1886,8 @@ class ServerSmokeTest(unittest.TestCase):
 
     def test_blocklist_is_per_user(self):
         self.add_rule("keyword", "비밀")
-        other = self.client.post(
-            "/api/register",
-            json={"username": "blockpeer_" + self.username[-6:], "pw_hash": self.pw_hash},
+        other = register_account(
+            self.client, "blockpeer_" + self.username[-6:], self.pw_hash
         )
         self.assertEqual(other.status_code, 200, other.json)
         other_device = self.client.post(
@@ -1711,9 +2072,8 @@ class ServerSmokeTest(unittest.TestCase):
         import store
 
         valid = self.create_conversation("+821033330001")
-        other = self.client.post(
-            "/api/register",
-            json={"username": "bulk_" + self.username[-6:], "pw_hash": self.pw_hash},
+        other = register_account(
+            self.client, "bulk_" + self.username[-6:], self.pw_hash
         )
         other_user = store.get_user_by_name(other.json["username"])
         multi_conv_id = store.create_conversation("bulk-multi", "+821033330002")
@@ -1786,9 +2146,8 @@ class ServerSmokeTest(unittest.TestCase):
 
     def test_rename_forbidden_for_non_member(self):
         created = self.create_conversation("+821077778888")
-        other = self.client.post(
-            "/api/register",
-            json={"username": "renamer_" + self.username[-6:], "pw_hash": self.pw_hash},
+        other = register_account(
+            self.client, "renamer_" + self.username[-6:], self.pw_hash
         )
         other_device = self.client.post(
             "/api/device-register",

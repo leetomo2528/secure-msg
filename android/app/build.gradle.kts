@@ -13,8 +13,8 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.10.8"
+        versionCode = 21
+        versionName = "0.11.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -71,6 +71,17 @@ dependencies {
         exclude(group = "net.java.dev.jna", module = "jna")
     }
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+
+    // CameraX + on-device barcode scanning for QR device pairing. ML Kit's
+    // bundled model keeps the scan offline — no Play Services download, no
+    // image ever leaving the device.
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    // QR *encoding* for the other direction: this phone as the new device.
+    implementation("com.google.zxing:core:3.5.3")
 
     // JSON
     implementation("org.json:json:20240303")

@@ -333,8 +333,10 @@ describe("register password policy", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const ok = await useStore.getState().register("policy_a", "Ab1!xyz");
-    expect(ok).toBe(false);
+    const challenge = await useStore.getState().requestEmailRegistration(
+      "policy_a", "policy_a@example.test", "Ab1!xyz",
+    );
+    expect(challenge).toBeNull();
     expect(useStore.getState().error).toContain("8");
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -345,12 +347,14 @@ describe("register password policy", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const ok = await useStore.getState().register("policy_b", "Ab1!가나다라마바사");
-    expect(ok).toBe(false);
+    const challenge = await useStore.getState().requestEmailRegistration(
+      "policy_b", "policy_b@example.test", "Ab1!가나다라마바사",
+    );
+    expect(challenge).toBeNull();
     // The failure must come from the (mocked) server, not from local
     // password validation — otherwise a composition rule has crept back in.
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0][0])).toContain("/register");
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/register/email/request");
     expect(useStore.getState().error).toBe("username already taken");
   });
 });

@@ -49,11 +49,15 @@ export function canonicalDeviceLoginProof(fields: {
     `challenge=${fields.challenge}\nsession_version=${fields.session_version}\n`;
 }
 
+/**
+ * One recipient device in a conversation. Carries keys and identity only —
+ * the relay does not hand out other accounts' device names (see the server's
+ * /conversation/<cid>/members).
+ */
 export interface ConvMember {
   user_id: number;
   device_id: number;
   sid: string;
-  name: string;
   pub_key: string;
   sig_pub: string;
   kind: "web" | "android_gateway";
@@ -171,11 +175,21 @@ export interface KeyDirectoryResult extends ApiResult {
   security_upgrade_certificates?: SecurityUpgradeCertificate[];
 }
 
+export interface PairingSessionInfo {
+  pairing_id: string;
+  nonce_approver: string;
+  expires_at: number;
+}
+
+export interface PairingSessionResult extends ApiResult, Partial<PairingSessionInfo> {}
+
 export interface DeviceApprovalStatusResult extends ApiResult {
   trust_state?: DeviceTrustState;
   sid?: string;
   challenge?: string;
   parent_epoch?: number;
+  /** Live QR pairing session for this pending device, if an approver scanned. */
+  pairing?: PairingSessionInfo | null;
 }
 
 export type BlockRuleType = "keyword" | "sender";
@@ -283,9 +297,6 @@ export class Api {
     return this.request<T>(path);
   }
 
-  register(username: string, pwHash: string) {
-    return this.post("/register", { username, pw_hash: pwHash });
-  }
   login(username: string, pwHash: string): Promise<LoginResult> {
     return this.post("/login", { username, pw_hash: pwHash });
   }
@@ -325,11 +336,31 @@ export class Api {
   keyDirectory(): Promise<KeyDirectoryResult> { return this.get("/key-directory"); }
   deviceApprovalStatus(): Promise<DeviceApprovalStatusResult> { return this.get("/device-pending-status"); }
   pendingDeviceRevoke(): Promise<ApiResult> { return this.post("/device-pending-revoke", {}); }
-  deviceApprove(sid: string, challenge: string, parentEpoch: number, signature: string): Promise<ApiResult> {
+  /**
+   * Approve a pending device. Passing `pairing` signs and commits the v2
+   * (QR) form, which binds the approval to one scanned session; omitting it
+   * keeps the v1 fingerprint-compare form.
+   */
+  deviceApprove(
+    sid: string,
+    challenge: string,
+    parentEpoch: number,
+    signature: string,
+    pairing?: { pairing_id: string; nonce_new: string; nonce_approver: string },
+  ): Promise<ApiResult> {
     // challenge is covered by the signature and retained in this method's
     // interface for callers; the server resolves it from the pending row.
     void challenge;
-    return this.post("/device-approve", { subject_sid: sid, parent_epoch: parentEpoch, signature });
+    return this.post("/device-approve", {
+      subject_sid: sid,
+      parent_epoch: parentEpoch,
+      signature,
+      ...(pairing ?? {}),
+    });
+  }
+  /** Approver side of QR pairing: bind a scanned nonce to one pending device. */
+  pairingSession(sid: string, challenge: string, nonceNew: string): Promise<PairingSessionResult> {
+    return this.post("/pairing/session", { sid, challenge, nonce_new: nonceNew });
   }
   deviceRevoke(sid: string, parentEpoch: number, signature: string): Promise<ApiResult> {
     return this.post("/device-revoke", {

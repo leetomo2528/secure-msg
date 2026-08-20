@@ -39,25 +39,36 @@ export function CollapsibleCard({
   );
 }
 
-/** Segmented tab switch (login/register, SMS/chat). */
+/**
+ * Segmented tab switch (login/register, SMS/chat).
+ *
+ * `tone` picks how the active tab reads: "brand" is the gradient pill used on
+ * the dark app shell; "surface" is a raised pill in the surrounding surface
+ * color, which is what stays legible on the theme-following onboarding card.
+ */
 export function Segmented<T extends string>({
-  options, value, onChange,
+  options, value, onChange, tone = "brand",
 }: {
   options: { value: T; label: string }[];
   value: T;
   onChange: (v: T) => void;
+  tone?: "brand" | "surface";
 }) {
+  const active = tone === "brand"
+    ? "bg-brand-gradient font-semibold text-slate-950 shadow"
+    : "bg-night-soft font-semibold text-tx-1 shadow-bubble";
   return (
-    <div className="grid gap-1 rounded-xl bg-fg/[0.04] p-1 ring-1 ring-fg/10" style={{ gridTemplateColumns: `repeat(${options.length}, 1fr)` }}>
+    <div
+      className={`grid gap-1 rounded-xl p-1 ${tone === "brand" ? "bg-fg/[0.04] ring-1 ring-fg/10" : "bg-fg/[0.06]"}`}
+      style={{ gridTemplateColumns: `repeat(${options.length}, 1fr)` }}
+    >
       {options.map((opt) => (
         <button
           key={opt.value}
           type="button"
           onClick={() => onChange(opt.value)}
           className={`rounded-lg py-2 text-sm transition ${
-            value === opt.value
-              ? "bg-brand-gradient font-semibold text-slate-950 shadow"
-              : "text-tx-3 hover:text-tx-1"
+            value === opt.value ? active : "text-tx-3 hover:text-tx-1"
           }`}
         >
           {opt.label}

@@ -20,6 +20,13 @@ JWT_TTL_SECONDS = int(os.environ.get("SECUREMSG_JWT_TTL") or 604800)  # 7 days
 MAX_HTTP_BODY_BYTES = int(os.environ.get("SECUREMSG_MAX_HTTP_BODY", "2097152"))
 MAX_ENVELOPE_BYTES = int(os.environ.get("SECUREMSG_MAX_ENVELOPE", "1572864"))
 MAX_DEVICES_PER_USER = int(os.environ.get("SECUREMSG_MAX_DEVICES", "20"))
+# Block rules fan out to every device of the account and run against every
+# decrypted message, so the list stays bounded.
+MAX_BLOCK_RULES = int(os.environ.get("SECUREMSG_MAX_BLOCK_RULES", "500"))
+# Consumed/expired one-time challenges are swept once they are this old.
+CHALLENGE_RETENTION_SECONDS = int(
+    os.environ.get("SECUREMSG_CHALLENGE_RETENTION", "86400")
+)
 
 # Flask-SocketIO's threading mode uses simple-websocket and runs under a
 # single gthread Gunicorn worker in production (polling + WebSocket compatible).
@@ -37,7 +44,11 @@ CORS_ORIGINS = [
 # Email verification/password recovery. Keep credentials outside the repo.
 # Resend is preferred for hosted deployments; SMTP remains available as a
 # fallback for self-hosted installations.
+# "resend" | "smtp" | "console". The console provider writes verification
+# codes to a local outbox/log instead of sending mail — development only, and
+# rejected outright in production by enforce_secret().
 EMAIL_PROVIDER = os.environ.get("SECUREMSG_EMAIL_PROVIDER", "resend").strip().lower()
+EMAIL_OUTBOX = os.environ.get("SECUREMSG_EMAIL_OUTBOX", "")
 RESEND_API_KEY = os.environ.get("SECUREMSG_RESEND_API_KEY", "")
 RESEND_FROM = os.environ.get("SECUREMSG_RESEND_FROM", "")
 RESEND_API_URL = os.environ.get("SECUREMSG_RESEND_API_URL", "https://api.resend.com/emails")
@@ -70,6 +81,17 @@ def enforce_secret() -> None:
         )
     if not 1 <= MAX_DEVICES_PER_USER <= 100:
         raise RuntimeError("SECUREMSG_MAX_DEVICES must be between 1 and 100")
+    if production and EMAIL_PROVIDER == "console":
+        raise RuntimeError(
+            "SECUREMSG_EMAIL_PROVIDER=console prints verification codes and "
+            "must never run in production"
+        )
+    if not 10 <= MAX_BLOCK_RULES <= 10_000:
+        raise RuntimeError("SECUREMSG_MAX_BLOCK_RULES must be between 10 and 10000")
+    if not 3600 <= CHALLENGE_RETENTION_SECONDS <= 30 * 24 * 60 * 60:
+        raise RuntimeError(
+            "SECUREMSG_CHALLENGE_RETENTION must be between 1 hour and 30 days"
+        )
     if ASYNC_MODE != "threading":
         raise RuntimeError("SECUREMSG_ASYNC_MODE must be threading for this deployment")
     if production and (

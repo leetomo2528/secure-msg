@@ -1,6 +1,6 @@
-# QR 기기 페어링 설계 (v0.11 설계안, 미구현)
+# QR 기기 페어링 (v0.11, 구현 완료)
 
-상태: **설계 문서. 구현은 v0.11.** 현재(v0.10.8) 기기 추가는 "새 기기가 비밀번호로 pending 등록 → 기존 기기가 지문 비교 후 Ed25519 서명 승인" 절차를 따른다. 이 설계는 그 절차의 1·2·3단계(요청 전달·지문 비교)를 QR과 짧은 안전번호로 교체해 실수·중간자 표면을 줄이는 것이 목적이며, **승인 서명 구조(`approval_statement`, 보안 epoch, 인증서 체인)는 그대로 재사용한다.**
+상태: **구현됨.** 서버·웹·Android 3면 모두 이 문서대로 동작한다. 아래 본문은 설계 의도를 그대로 남긴 것이고, 구현 위치는 문서 끝의 「구현 현황」을 참고한다. 원래 문장: 현재(v0.10.8) 기기 추가는 "새 기기가 비밀번호로 pending 등록 → 기존 기기가 지문 비교 후 Ed25519 서명 승인" 절차를 따른다. 이 설계는 그 절차의 1·2·3단계(요청 전달·지문 비교)를 QR과 짧은 안전번호로 교체해 실수·중간자 표면을 줄이는 것이 목적이며, **승인 서명 구조(`approval_statement`, 보안 epoch, 인증서 체인)는 그대로 재사용한다.**
 
 ## 설계 원칙
 
@@ -94,3 +94,23 @@ Rate limit: sid당 10/분.
 - QR payload 재사용(재생): 같은 `nonce_new`로 두 번 세션 생성 → 첫 세션만 유효, 승인은 1회.
 - v1 폴백 승인이 v0.10 클라이언트에서 계속 동작.
 - 안전번호 양측 계산 일치 golden vector (Rust/TS/Kotlin 3개 구현 공유).
+
+
+## 구현 현황
+
+| 구성 | 위치 |
+|------|------|
+| 서버: 페어링 세션·v2 승인 | `server/auth.py` (`/api/pairing/session`, `approval_statement`), `server/store.py` (`create_pairing_session`) |
+| 웹: QR 표시(신규 기기) | `frontend/src/components/PendingDeviceApproval.tsx` |
+| 웹: 스캔·승인(승인 기기) | `frontend/src/components/PairingScanner.tsx`, `DeviceManager.tsx` |
+| 웹: v2 정본·검증 | `frontend/src/crypto/deviceTrust.ts` (`canonicalDeviceApprovalV2`, `canonicalApprovalForStatement`) |
+| Android: 스캔·승인 | `ui/PairingScanner.kt` (CameraX + ML Kit), `ui/SettingsPane.kt` |
+| Android: QR 표시(신규 기기) | `ui/PairingQrCard.kt` (ZXing 인코딩) |
+| Android: v2 정본·검증 | `DeviceTrust.kt` (`DeviceApprovalStatementV2`, `canonicalApprovalForStatement`), `Pairing.kt` |
+
+설계와 달라진 점:
+
+- **웹 승인 기기도 스캔한다.** 설계에서 "선택 구현"이던 웹 카메라 스캔을 넣었다. `BarcodeDetector`가 있으면 카메라로, 없으면(Firefox·Safari) QR 내용 붙여넣기로 같은 경로를 탄다. QR은 공개 데이터라 붙여넣기가 카메라보다 신뢰도가 낮지 않으며, 인증은 어느 쪽이든 안전번호 대면 비교다.
+- **v1 폴백은 그대로 유지**된다. 한 계정의 인증서 체인에 v1·v2가 섞여 있어도 검증된다. 정본 형태는 저장된 명세문의 도메인 줄로 고르고, 파싱한 값으로 정본을 다시 만들어 원문과 바이트 비교한다 — 이 비교가 명세문에 끼워 넣은 내용을 걸러낸다.
+- **안전번호 골든 벡터**를 웹(`crypto/pairing.test.ts`)과 Android(`PairingTest.kt`)에 같은 값으로 고정했다. 승인 명세문 v1·v2 형식은 서버(`test_smoke.py`)까지 3면에 고정돼 있다.
+- **만료된 페어링 세션 정리**: 설계의 "주기적 정리"는 `store.py`의 `_prune_challenges_locked`가 담당한다(챌린지 테이블 4종 공통, 보존기간 `SECUREMSG_CHALLENGE_RETENTION`).

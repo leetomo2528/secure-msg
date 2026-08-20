@@ -28,6 +28,7 @@ SMS의 통신사 구간 자체는 SMS 표준 특성상 E2E 암호화가 아니�
 - 비밀번호는 클라이언트(웹/Android)에서 **Argon2id**로 해시된 값만 서버로 전송되므로 서버는 원문 비밀번호를 보지 못하고, 서버는 이를 다시 bcrypt로 감싸 저장한다.
 - 비밀번호와 Argon2id 결과는 클라이언트에 저장하지 않는다. 웹 JWT는 메모리에만 두고, Android JWT와 기기 개인키는 Android Keystore 기반 AES-256-GCM 암호문으로만 DataStore에 저장한다.
 - 로그아웃 시 서버의 기기별 세션 버전을 회전해 현재 토큰과 기존 Socket.IO 세션을 즉시 무효화한다. 기기 키는 보존하므로 다음 로그인에서 같은 기기를 안전하게 재사용할 수 있다.
+- **가입은 이메일 인증 경로만 가능하다**(v0.11+). 인증 없이 계정을 만들던 `/api/register`는 제거됐다.
 - **비밀번호 재설정은 가입 시 인증한 이메일의 6자리 코드로만 가능하다**(v0.10.6+). 코드는 10분·5회 시도 제한이며, 재설정 완료 시 계정의 모든 기기 세션(토큰·Socket.IO)이 즉시 폐기된다. 이메일을 등록하지 않은 구 계정은 재설정 수단이 없다. 비밀번호는 메시지 암호화 키가 아니므로, 재설정으로 과거 메시지를 새 기기에서 읽을 수는 없다.
 - **새 브라우저·새 앱 설치는 해당 기기 등록 이전의 메시지를 복호화할 수 없다.** 과거 envelope에는 새 기기의 wrapped key가 없기 때문이다. 현재 기존 기기 간 로컬 전송과 암호화된 서버 백업을 모두 제공하지 않으므로, 브라우저 사이트 데이터·앱 데이터·기기 개인키를 삭제하면 그 기기만 읽을 수 있던 과거 내역을 복구하지 못할 수 있다. Android 로그아웃 시 복호화 평문은 기기에서 삭제되고(기기 키는 보존) 재로그인 후 서버 이력을 다시 동기화한다.
 
@@ -65,6 +66,7 @@ secure-msg/
 │       ├── MmsProvider.kt           # MMS Provider/part 읽기·수신 저장
 │       ├── MmsPduComposer.kt        # WAP multipart/related MMS PDU
 │       ├── MmsSender.kt             # framework MMSC MMS 발신
+│       ├── Pairing.kt              # QR 페어링 payload 파싱 + 안전번호
 │       ├── RelayContent.kt          # text/MMS envelope 내부 포맷
 │       ├── CarrierStatusReceiver.kt # SMS/MMS SENT·DELIVERED 결과
 │       ├── Database.kt             # Room: 스레드·격리함·처리 이력
@@ -91,6 +93,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export SECUREMSG_JWT_SECRET="$(openssl rand -hex 32)"
 export SECUREMSG_CORS="http://localhost:5173"
+# 메일 제공자 없이 개발할 때: 인증 코드를 서버 로그로 받는다.
+# (프로덕션에서 이 값을 쓰면 기동이 거부된다)
+export SECUREMSG_EMAIL_PROVIDER=console
 python app.py                         # http://127.0.0.1:5050
 ```
 
@@ -197,6 +202,8 @@ npm run build
 
 ## 주요 업데이트 요약
 
+- (v0.11) **QR 기기 페어링**: 새 기기가 QR을 띄우고 기존 기기가 스캔한 뒤, 양쪽 화면의 안전번호를 사람이 비교해 승인한다. 승인 서명이 페어링 세션을 바인딩하므로 재생이 불가능하다. 지문을 눈으로 대조하던 기존 v1 경로도 계속 동작한다. [설계·구현 위치](docs/QR_PAIRING_DESIGN.md)
+- (v0.11) **온보딩 재설계·보안 정리**: 폼 중심 로그인 화면(테마 추종), 비밀번호 재설정 경로의 CPU 소모 취약점 수정, 대화 멤버 응답에서 타 계정 기기 이름 제거, 사용자 열거 차단, 키 디렉터리 다운그레이드 경로 제거
 - (v0.10.8) **보안 경직화·신뢰 문서·CI**: 이메일 엔드포인트 rate limit, Android 로그아웃 시 로컬 평문 삭제, 구조화된 인증 거부 코드, [암호 명세](docs/CRYPTO_SPEC.md)·[QR 페어링 설계](docs/QR_PAIRING_DESIGN.md) 문서화, GitHub Actions CI(서버·웹·Android·Rust·시크릿 스캔)
 - (v0.9) **GitHub 이슈 4건 해결 + Android 검색**: 차단 규칙 삭제 부활 방지, 안전한 인앱 설치 결과 처리, 로컬 연락처 이름 동기화, `010`↔`+82` 답장 스레드 통합·오프라인 즉시 표시, 대화·메시지 로컬 검색
 - (v0.10) **인증·알림·연락처 동기화 강화**: Android Keystore 자격 증명 보호, 서버 로그아웃 즉시 세션 폐기, 최신 문자 하단 고정, 알림 탭 시 해당 Room 대화 직접 열기, 연락처 이름 웹·다른 Android 기기 동기화

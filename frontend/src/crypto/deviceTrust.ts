@@ -3,6 +3,7 @@ import { b64u, unb64u } from "./keys";
 import type { AccountDevice, DirectoryProof } from "../net/api";
 
 export const DEVICE_APPROVAL_DOMAIN = "securemsg-device-approval-v1";
+export const DEVICE_APPROVAL_DOMAIN_V2 = "securemsg-device-approval-v2";
 const DEVICE_FINGERPRINT_DOMAIN = "securemsg-device-fingerprint-v1\n";
 const ACCOUNT_SAFETY_NUMBER_DOMAIN = "securemsg-account-safety-v1\n";
 
@@ -14,6 +15,13 @@ export interface DeviceApprovalFields {
   kind: string;
   challenge: string;
   parentEpoch: number;
+}
+
+/** The QR pairing session an approval certificate is bound to (v2 only). */
+export interface PairingBinding {
+  pairingId: string;
+  nonceNew: string;
+  nonceApprover: string;
 }
 
 export interface DeviceRevokeFields {
@@ -48,6 +56,12 @@ function assertToken(value: string, label: string): void {
   if (!value || /[\r\n]/.test(value)) throw new Error(`${label} must be a non-empty single line`);
 }
 
+function assertB64uToken(value: string, label: string): void {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(value)) {
+    throw new Error(`${label} must be a base64url token`);
+  }
+}
+
 function assertKey(value: string, expectedBytes: number, label: string): void {
   let decoded: Uint8Array;
   try { decoded = unb64u(value); } catch { throw new Error(`${label} must be base64url`); }
@@ -68,20 +82,105 @@ export function canonicalDeviceApproval(fields: DeviceApprovalFields): string {
   return `${DEVICE_APPROVAL_DOMAIN}\nuid=${fields.uid}\nsubject_sid=${fields.subjectSid}\npub_key=${fields.pubKey}\nsig_pub=${fields.sigPub}\nkind=${fields.kind}\nchallenge=${fields.challenge}\nparent_epoch=${fields.parentEpoch}\n`;
 }
 
+/**
+ * v2 binds one QR pairing session into the approval certificate, so a
+ * signature can never be replayed onto a different scan. Field order is part
+ * of the contract — it must match the server's `approval_statement` byte for
+ * byte (docs/QR_PAIRING_DESIGN.md).
+ */
+export function canonicalDeviceApprovalV2(
+  fields: DeviceApprovalFields,
+  pairing: PairingBinding,
+): string {
+  assertDecimalInteger(fields.uid, "uid");
+  assertDecimalInteger(fields.parentEpoch, "parent_epoch");
+  assertToken(fields.subjectSid, "subject_sid");
+  assertToken(fields.kind, "kind");
+  assertKey(fields.pubKey, sodium.crypto_box_PUBLICKEYBYTES, "pub_key");
+  assertKey(fields.sigPub, sodium.crypto_sign_PUBLICKEYBYTES, "sig_pub");
+  assertKey(fields.challenge, 32, "challenge");
+  assertB64uToken(pairing.pairingId, "pairing_id");
+  assertKey(pairing.nonceNew, 32, "nonce_new");
+  assertKey(pairing.nonceApprover, 32, "nonce_approver");
+  return `${DEVICE_APPROVAL_DOMAIN_V2}\nuid=${fields.uid}\nsubject_sid=${fields.subjectSid}\npub_key=${fields.pubKey}\nsig_pub=${fields.sigPub}\nkind=${fields.kind}\nchallenge=${fields.challenge}\npairing_id=${pairing.pairingId}\nnonce_new=${pairing.nonceNew}\nnonce_approver=${pairing.nonceApprover}\nparent_epoch=${fields.parentEpoch}\n`;
+}
+
+/** Read one `key=value` line out of a canonical statement. */
+function statementField(statement: string, key: string): string | null {
+  const prefix = `${key}=`;
+  for (const line of statement.split("\n")) {
+    if (line.startsWith(prefix)) return line.slice(prefix.length);
+  }
+  return null;
+}
+
+/**
+ * Recover the pairing binding a v2 statement claims. Callers MUST re-render
+ * the canonical statement from the result and compare it to the original —
+ * that byte comparison, not this parse, is what rejects smuggled content.
+ */
+export function pairingBindingFromStatement(statement: string): PairingBinding | null {
+  const pairingId = statementField(statement, "pairing_id");
+  const nonceNew = statementField(statement, "nonce_new");
+  const nonceApprover = statementField(statement, "nonce_approver");
+  if (pairingId == null || nonceNew == null || nonceApprover == null) return null;
+  return { pairingId, nonceNew, nonceApprover };
+}
+
+function canonicalApprovalForStatement(
+  fields: DeviceApprovalFields,
+  statement: string,
+): string | null {
+  if (!statement.startsWith(`${DEVICE_APPROVAL_DOMAIN_V2}\n`)) {
+    return canonicalDeviceApproval(fields);
+  }
+  const pairing = pairingBindingFromStatement(statement);
+  // A statement claiming v2 must verify as v2. Falling back to the v1
+  // canonical form here would let a malformed certificate be checked against
+  // a statement that never bound the pairing session at all.
+  if (!pairing) return null;
+  return canonicalDeviceApprovalV2(fields, pairing);
+}
+
 export function signDeviceApproval(fields: DeviceApprovalFields, signingSecretKey: string): string {
   assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
   return b64u(sodium.crypto_sign_detached(encoder.encode(canonicalDeviceApproval(fields)), unb64u(signingSecretKey)));
 }
 
-export function verifyDeviceApproval(fields: DeviceApprovalFields, signature: string, signerPublicKey: string): boolean {
+export function signDeviceApprovalV2(
+  fields: DeviceApprovalFields,
+  pairing: PairingBinding,
+  signingSecretKey: string,
+): string {
+  assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
+  return b64u(sodium.crypto_sign_detached(
+    encoder.encode(canonicalDeviceApprovalV2(fields, pairing)),
+    unb64u(signingSecretKey),
+  ));
+}
+
+/** Verify a detached Ed25519 signature over an already-canonical statement. */
+export function verifySignedStatement(
+  statement: string,
+  signature: string,
+  signerPublicKey: string,
+): boolean {
   try {
     assertKey(signature, sodium.crypto_sign_BYTES, "signature");
     assertKey(signerPublicKey, sodium.crypto_sign_PUBLICKEYBYTES, "signer public key");
     return sodium.crypto_sign_verify_detached(
       unb64u(signature),
-      encoder.encode(canonicalDeviceApproval(fields)),
+      encoder.encode(statement),
       unb64u(signerPublicKey),
     );
+  } catch {
+    return false;
+  }
+}
+
+export function verifyDeviceApproval(fields: DeviceApprovalFields, signature: string, signerPublicKey: string): boolean {
+  try {
+    return verifySignedStatement(canonicalDeviceApproval(fields), signature, signerPublicKey);
   } catch {
     return false;
   }
@@ -259,8 +358,14 @@ export function verifyDirectoryProof(
         challenge: subject.challenge,
         parentEpoch: approval.parent_epoch,
       };
-      if (approval.statement !== canonicalDeviceApproval(fields)
-        || !verifyDeviceApproval(fields, approval.signature, approver.sig_pub)
+      // v1 (password + fingerprint compare) and v2 (QR pairing) certificates
+      // coexist in one chain: an account approved a device the old way before
+      // it ever scanned a QR. The statement's own domain line picks the form,
+      // and re-rendering it canonically is what rejects anything smuggled in.
+      const canonical = canonicalApprovalForStatement(fields, approval.statement);
+      if (canonical == null
+        || approval.statement !== canonical
+        || !verifySignedStatement(canonical, approval.signature, approver.sig_pub)
         || approval.approver_sid !== subject.approved_by_sid) {
         throw new Error("invalid device approval certificate signature or statement");
       }

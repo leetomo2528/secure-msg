@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS device_login_challenges (
 CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device
     ON device_login_challenges(device_id, created_at);
 
+-- v0.11 QR device pairing. One short-lived single-use session per pending
+-- subject device; consumed atomically with the v2 approval signature that
+-- binds both nonces. QR data itself is public — the safety number derived
+-- from nonce_new + nonce_approver is what humans compare.
+CREATE TABLE IF NOT EXISTS pairing_sessions (
+    pairing_id     TEXT PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subject_sid    TEXT NOT NULL,
+    approver_sid   TEXT NOT NULL,
+    nonce_new      TEXT NOT NULL,
+    nonce_approver TEXT NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    consumed_at    INTEGER,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pairing_sessions_subject
+    ON pairing_sessions(subject_sid, created_at);
+
 -- Short-lived email codes. Raw codes are never stored; code_digest is an
 -- HMAC keyed by the server JWT secret and the challenge id.
 CREATE TABLE IF NOT EXISTS email_verification_challenges (

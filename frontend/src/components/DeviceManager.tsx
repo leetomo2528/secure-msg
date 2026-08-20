@@ -8,13 +8,25 @@ import {
   accountSafetyNumber,
   deviceFingerprint,
   signDeviceApproval,
+  signDeviceApprovalV2,
   signDeviceRevoke,
   signLegacyUpgrade,
   verifyDirectoryProof,
 } from "../crypto/deviceTrust";
+import { parsePairingQr, pairingSafetyNumber } from "../crypto/pairing";
+import PairingScanner from "./PairingScanner";
 import { pinTrustedDirectory, TrustViolationError } from "../store/db";
 import { useStore } from "../store/useStore";
 import { CollapsibleCard } from "./ui";
+
+/** A scanned pairing session awaiting the human safety-number comparison. */
+interface PairingConfirmation {
+  subjectSid: string;
+  pairingId: string;
+  nonceNew: string;
+  nonceApprover: string;
+  safety: string;
+}
 
 function securityError(error: unknown): string {
   if (error instanceof TrustViolationError) return `보안 경고: ${error.message} 키 사용을 중단했습니다.`;
@@ -29,6 +41,8 @@ export default function DeviceManager() {
   const [directory, setDirectory] = useState<DeviceDirectoryResult | null>(null);
   const [busySid, setBusySid] = useState<string | null>(null);
   const [securityWarning, setSecurityWarning] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [pairing, setPairing] = useState<PairingConfirmation | null>(null);
 
   const devices = directory?.devices ?? [];
   const pending = devices.filter((device) => device.trust_state === "pending");
@@ -174,6 +188,105 @@ export default function DeviceManager() {
     }
   };
 
+  /**
+   * QR pairing, approver half. The scan only transports public data; the
+   * pairing session it opens is what the human then confirms by comparing the
+   * safety number shown on both screens. Approving signs the v2 statement, so
+   * the certificate is bound to this one scan and cannot be replayed.
+   */
+  const startPairing = async (payload: string) => {
+    const parsed = parsePairingQr(payload);
+    if (!parsed) {
+      useStore.setState({ error: "QR 내용을 읽을 수 없습니다. 새 기기 화면의 코드를 다시 스캔하세요." });
+      return;
+    }
+    if (parsed.server !== window.location.origin) {
+      useStore.setState({ error: "다른 서버의 페어링 코드입니다. 같은 릴레이의 기기만 연결할 수 있습니다." });
+      return;
+    }
+    const subject = devices.find((device) => device.sid === parsed.sid);
+    if (!subject || subject.trust_state !== "pending") {
+      useStore.setState({ error: "이 코드에 해당하는 승인 대기 기기를 찾지 못했습니다." });
+      return;
+    }
+    // The relay's own pending row is the authority on the subject's keys; a QR
+    // claiming different ones is either stale or an attempt to swap in a key.
+    if (subject.pub_key !== parsed.box_pk || subject.sig_pub !== parsed.sig_pk
+      || subject.challenge !== parsed.challenge) {
+      useStore.setState({ error: "QR의 키가 서버에 등록된 대기 기기와 일치하지 않습니다. 승인하지 마세요." });
+      return;
+    }
+    setBusySid(parsed.sid);
+    try {
+      const session = await api.pairingSession(parsed.sid, parsed.challenge, parsed.nonce_new);
+      if (!session.ok || !session.pairing_id || !session.nonce_approver) {
+        useStore.setState({ error: session.error ?? "페어링 세션을 만들지 못했습니다." });
+        return;
+      }
+      setScanning(false);
+      setPairing({
+        subjectSid: parsed.sid,
+        pairingId: session.pairing_id,
+        nonceNew: parsed.nonce_new,
+        nonceApprover: session.nonce_approver,
+        safety: pairingSafetyNumber({
+          nonceNew: parsed.nonce_new,
+          nonceApprover: session.nonce_approver,
+          sid: parsed.sid,
+          pubKey: parsed.box_pk,
+          sigPub: parsed.sig_pk,
+        }),
+      });
+    } catch (error) {
+      useStore.setState({ error: securityError(error) });
+    } finally {
+      setBusySid(null);
+    }
+  };
+
+  const confirmPairing = async () => {
+    const parentEpoch = directory?.security_epoch;
+    const session = pairing;
+    if (!session) return;
+    const subject = devices.find((device) => device.sid === session.subjectSid);
+    if (!keypair || uid == null || parentEpoch == null || !subject?.challenge) {
+      useStore.setState({ error: "승인 challenge 또는 현재 기기 서명 키가 없습니다." });
+      return;
+    }
+    setBusySid(session.subjectSid);
+    try {
+      const binding = {
+        pairingId: session.pairingId,
+        nonceNew: session.nonceNew,
+        nonceApprover: session.nonceApprover,
+      };
+      const signature = signDeviceApprovalV2({
+        uid,
+        subjectSid: subject.sid,
+        pubKey: subject.pub_key,
+        sigPub: subject.sig_pub,
+        kind: subject.kind,
+        challenge: subject.challenge,
+        parentEpoch,
+      }, binding, keypair.sign.sk);
+      const result = await api.deviceApprove(subject.sid, subject.challenge, parentEpoch, signature, {
+        pairing_id: session.pairingId,
+        nonce_new: session.nonceNew,
+        nonce_approver: session.nonceApprover,
+      });
+      if (!result.ok) {
+        useStore.setState({ error: result.error ?? "새 기기를 승인하지 못했습니다." });
+        return;
+      }
+      setPairing(null);
+      await load();
+    } catch (error) {
+      useStore.setState({ error: securityError(error) });
+    } finally {
+      setBusySid(null);
+    }
+  };
+
   const reject = async (device: AccountDevice) => {
     const parentEpoch = directory?.security_epoch;
     if (!device.challenge || parentEpoch == null) {
@@ -233,6 +346,46 @@ export default function DeviceManager() {
         <div role="alert" className="rounded-lg border border-amber-400/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-200">
           새 기기 {pending.length}대가 승인을 기다립니다. 본인이 추가한 기기가 아니라면 거부하고 비밀번호를 변경하세요.
         </div>
+      )}
+
+      {pairing ? (
+        <div className="space-y-3 rounded-lg bg-fg/[0.04] p-3">
+          <div>
+            <p className="text-xs font-semibold text-tx-1">두 화면의 숫자가 같습니까?</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-tx-3">
+              새 기기 화면에도 같은 숫자가 떠 있어야 합니다. 다르면 승인하지 말고 취소하세요.
+            </p>
+          </div>
+          <p className="rounded-lg bg-fg/[0.05] px-2 py-3 text-center font-mono text-sm font-semibold tracking-[0.08em] text-accent-tx">
+            {pairing.safety}
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={busySid === pairing.subjectSid}
+              onClick={() => void confirmPairing()}
+              className="btn-primary flex-1 !py-2 text-xs disabled:opacity-40"
+            >
+              {busySid === pairing.subjectSid ? "승인 중…" : "숫자가 같습니다 · 승인"}
+            </button>
+            <button type="button" onClick={() => setPairing(null)} className="btn-ghost !py-2 text-xs">
+              취소
+            </button>
+          </div>
+        </div>
+      ) : scanning ? (
+        <PairingScanner
+          onPayload={(payload) => void startPairing(payload)}
+          onCancel={() => setScanning(false)}
+        />
+      ) : pending.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setScanning(true)}
+          className="btn-ghost w-full !py-2 text-xs"
+        >
+          QR 스캔으로 승인
+        </button>
       )}
       {directory?.security_mode === "legacy_v1" && (
         <div role="alert" className="rounded-lg border border-amber-400/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-200">

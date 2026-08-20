@@ -222,39 +222,6 @@ def pending_auth_required(fn):
 # ----- endpoints --------------------------------------------------------
 
 
-@bp.post("/register")
-def register():
-    """Body: { username, pw_hash }.
-    `username` must match ^[a-z0-9_]{3,20}$ — opaque, NOT real name/email/phone.
-    `pw_hash` is the Argon2id hash computed client-side over the user's password+salt.
-    """
-    body = _json_body()
-    if body is None:
-        return _err("JSON object required", 400)
-    retry_after = rate_limit("register", "", 10, 60)
-    if retry_after:
-        return _rate_error(retry_after)
-    username = _text(body, "username").strip().lower()
-    pw_hash = _text(body, "pw_hash")
-
-    if not USERNAME_RE.fullmatch(username):
-        return _err("username must be 3-20 chars of [a-z0-9_]", 400)
-    if not _valid_client_hash(pw_hash):
-        return _err("pw_hash must be base64url for 32 bytes", 400)
-    if store.get_user_by_name(username):
-        return _err("username already taken", 409)
-
-    # bcrypt over the already-client-hashed value (defense in depth). 12 rounds.
-    server_hash = bcrypt.hashpw(
-        pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=12)
-    ).decode("utf-8")
-    try:
-        uid = store.create_user(username, server_hash)
-    except sqlite3.IntegrityError:
-        return _err("username already taken", 409)
-    return _ok(uid=uid, username=username)
-
-
 @bp.post("/register/email/request")
 def register_email_request():
     """Start a web registration with a verified recovery email."""
@@ -363,13 +330,21 @@ def password_reset_confirm():
             or not B64U_RE.fullmatch(challenge_id) or not re.fullmatch(r"[0-9]{6}", code)
             or not _valid_client_hash(pw_hash)):
         return _err("invalid password reset request", 400)
-    retry_after = rate_limit("password-reset-confirm", challenge_id, 10, 60)
+    # Keyed on the username, NOT the caller-supplied challenge_id: a fresh
+    # challenge_id would otherwise open a fresh bucket on every request and
+    # leave this endpoint effectively unlimited.
+    retry_after = rate_limit("password-reset-confirm", username, 10, 60)
     if retry_after:
         return _rate_error(retry_after)
     user = store.get_user_by_name(username)
     if not user or user.get("email") != email:
         return _err("invalid password reset request", 400)
-    server_hash = bcrypt.hashpw(pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    # bcrypt runs only once the code itself verifies (store calls this inside
+    # the same transaction). Hashing first would let anyone who knows a
+    # username/email pair spend ~250ms of the single worker per bad code.
+    def server_hash() -> str:
+        return bcrypt.hashpw(pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
     reset_username = store.consume_password_reset(
         challenge_id, email, _code_digest(challenge_id, code), server_hash, int(time.time()),
     )
@@ -739,10 +714,44 @@ def reject_pending_device():
     return _ok(rejected=sid)
 
 
+@bp.post("/pairing/session")
+@auth_required
+def pairing_session():
+    """Approver side of QR pairing: bind a scanned QR nonce to one pending device.
+
+    Body: { sid, challenge, nonce_new } -> { pairing_id, nonce_approver, expires_at }.
+    The QR payload is public data; authorization stays with the approver's
+    bearer token and the human safety-number comparison of both nonces.
+    """
+    body = _json_body()
+    if body is None:
+        return _err("JSON object required", 400)
+    retry_after = rate_limit("pairing-session", g.auth["sid"], 10, 60)
+    if retry_after:
+        return _rate_error(retry_after)
+    sid = _text(body, "sid")
+    challenge = _text(body, "challenge")
+    nonce_new = _text(body, "nonce_new")
+    if not SID_RE.fullmatch(sid) or not _valid_b64u(challenge, 32) or not _valid_b64u(nonce_new, 32):
+        return _err("sid, challenge and nonce_new required", 400)
+    try:
+        record = store.create_pairing_session(
+            g.auth["uid"], g.auth["sid"], sid, challenge, nonce_new,
+        )
+    except ValueError:
+        return _err("approver is no longer approved", 401)
+    except LookupError as exc:
+        return _err(str(exc), 404)
+    return _ok(**record)
+
+
 @bp.get("/device-pending-status")
 @pending_auth_required
 def pending_status():
     device = store.get_device_by_sid(g.auth["sid"])
+    # The pending device cannot hold a socket, so it discovers the QR pairing
+    # session (and its approver nonce for the safety number) through this poll.
+    pairing = store.get_live_pairing_session(g.auth["sid"], int(time.time()))
     return _ok(
         sid=device["sid"],
         trust_state=device["trust_state"],
@@ -752,10 +761,32 @@ def pending_status():
         directory_hash=device["directory_hash"],
         identity_sig_pub=device["identity_sig_pub"],
         security_mode=device["security_mode"],
+        pairing=pairing,
     )
 
 
-def approval_statement(uid: int, subject: dict, parent_epoch: int) -> str:
+def approval_statement(
+    uid: int,
+    subject: dict,
+    parent_epoch: int,
+    pairing: dict[str, str] | None = None,
+) -> str:
+    """Canonical approval statement. With ``pairing`` the v2 domain binds the
+    QR pairing session's two nonces into the signed certificate."""
+    if pairing is not None:
+        return (
+            "securemsg-device-approval-v2\n"
+            f"uid={uid}\n"
+            f"subject_sid={subject['sid']}\n"
+            f"pub_key={subject['pub_key']}\n"
+            f"sig_pub={subject['sig_pub']}\n"
+            f"kind={subject['kind']}\n"
+            f"challenge={subject['challenge']}\n"
+            f"pairing_id={pairing['pairing_id']}\n"
+            f"nonce_new={pairing['nonce_new']}\n"
+            f"nonce_approver={pairing['nonce_approver']}\n"
+            f"parent_epoch={parent_epoch}\n"
+        )
     return (
         "securemsg-device-approval-v1\n"
         f"uid={uid}\n"
@@ -824,8 +855,22 @@ def device_approve():
     user = store.get_user(g.auth["uid"])
     if int(user["security_epoch"]) != parent_epoch:
         return _err("security epoch changed", 409)
+    # v2: the approval signature additionally binds the QR pairing session.
+    pairing: dict[str, str] | None = None
+    if any(field in body for field in ("pairing_id", "nonce_new", "nonce_approver")):
+        pairing = {
+            "pairing_id": _text(body, "pairing_id"),
+            "nonce_new": _text(body, "nonce_new"),
+            "nonce_approver": _text(body, "nonce_approver"),
+        }
+        if not (
+            B64U_RE.fullmatch(pairing["pairing_id"])
+            and _valid_b64u(pairing["nonce_new"], 32)
+            and _valid_b64u(pairing["nonce_approver"], 32)
+        ):
+            return _err("pairing_id, nonce_new and nonce_approver required", 400)
     approver = store.get_device_by_sid(g.auth["sid"])
-    statement = approval_statement(g.auth["uid"], subject, parent_epoch)
+    statement = approval_statement(g.auth["uid"], subject, parent_epoch, pairing)
     try:
         VerifyKey(_decode_b64u(approver["sig_pub"])).verify(statement.encode(), _decode_b64u(signature))
     except (BadSignatureError, ValueError):
@@ -839,6 +884,7 @@ def device_approve():
             statement,
             signature,
             g.auth["session_version"],
+            pairing=pairing,
         )
     except sqlite3.IntegrityError:
         return _err("an Android SMS gateway is already approved", 409)
@@ -846,8 +892,10 @@ def device_approve():
         return _err("approver is no longer approved", 401)
     except LookupError:
         return _err("device not found", 404)
-    except ValueError:
-        return _err("device is not pending", 409)
+    except ValueError as exc:
+        # Store messages are stable client-facing reasons: "device is not
+        # pending", "pairing session is invalid or expired", ...
+        return _err(str(exc), 409)
     except RuntimeError:
         return _err("security epoch changed", 409)
     from sockets import emit_to_user_devices

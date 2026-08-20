@@ -29,7 +29,8 @@ interface MetaRow {
 export interface DeviceRow {
   sid: string;
   user_id: number;
-  name: string;
+  /** Only ever set for the account's own devices; peers never expose a label. */
+  name?: string;
   pub_key: string;
   sig_pub?: string;
 }

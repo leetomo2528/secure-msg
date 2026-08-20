@@ -18,8 +18,10 @@ const listeners = new Set<() => void>();
 
 function readStored(): ThemeMode {
   try {
+    // Default must match the pre-paint script in index.html ("system"), or the
+    // first visit paints one theme and then flips to the other.
     const v = localStorage.getItem(STORAGE_KEY);
-    return v === "light" || v === "dark" || v === "system" ? v : "dark";
+    return v === "light" || v === "dark" || v === "system" ? v : "system";
   } catch {
     return "system";
   }

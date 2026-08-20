@@ -59,7 +59,10 @@ def add_rule():
     if validated is None:
         return _err("type must be keyword|sender with a valid value", 400)
     rule_type, value = validated
-    rule = store.add_block_rule(g.auth["uid"], rule_type, value)
+    try:
+        rule = store.add_block_rule(g.auth["uid"], rule_type, value)
+    except ValueError as exc:
+        return _err(str(exc), 409)
     emit_to_user_devices(
         g.auth["uid"],
         "blocklist_updated",

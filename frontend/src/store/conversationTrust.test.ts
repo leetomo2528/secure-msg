@@ -12,7 +12,7 @@ describe("conversation member key-directory enforcement", () => {
   const makeMember = (userId: number, sid: string, kind: ConvMember["kind"] = "web"): ConvMember => {
     const keys = generateKeypair();
     return {
-      user_id: userId, device_id: userId * 10, sid, name: sid,
+      user_id: userId, device_id: userId * 10, sid,
       pub_key: keys.box.pk, sig_pub: keys.sign.pk, kind,
     };
   };

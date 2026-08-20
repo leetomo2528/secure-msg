@@ -12,7 +12,7 @@ import hmac
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from typing import Any
 
@@ -101,6 +101,20 @@ def init_schema() -> None:
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device ON device_login_challenges(device_id, created_at)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS pairing_sessions (
+                pairing_id     TEXT PRIMARY KEY,
+                user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                subject_sid    TEXT NOT NULL,
+                approver_sid   TEXT NOT NULL,
+                nonce_new      TEXT NOT NULL,
+                nonce_approver TEXT NOT NULL,
+                expires_at     INTEGER NOT NULL,
+                consumed_at    INTEGER,
+                created_at     INTEGER NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pairing_sessions_subject ON pairing_sessions(subject_sid, created_at)")
         user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)")}
         if "identity_sig_pub" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN identity_sig_pub TEXT NOT NULL DEFAULT ''")
@@ -420,12 +434,55 @@ def get_user_by_email(email: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+_CHALLENGE_TABLES = (
+    "email_verification_challenges",
+    "password_reset_challenges",
+    "device_login_challenges",
+    "pairing_sessions",
+)
+
+
+def _prune_challenges_locked(c: sqlite3.Connection, timestamp: int) -> int:
+    """Drop one-time challenges that can no longer be used, inside the caller's
+    open transaction.
+
+    Nothing else ever deleted from these tables, so a busy relay accumulated a
+    row per verification, reset, device login and QR scan forever. A challenge
+    is dead once it is consumed or expired; keeping a retention window past
+    that leaves recent rows around for debugging.
+    """
+    cutoff = timestamp - config.CHALLENGE_RETENTION_SECONDS
+    removed = 0
+    for table in _CHALLENGE_TABLES:
+        cur = c.execute(
+            f"DELETE FROM {table} WHERE created_at < ? "  # noqa: S608 - fixed table names
+            "AND (consumed_at IS NOT NULL OR expires_at < ?)",
+            (cutoff, timestamp),
+        )
+        removed += cur.rowcount if cur.rowcount > 0 else 0
+    return removed
+
+
+def prune_challenges() -> int:
+    """Standalone sweep, for a maintenance call or a test."""
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            removed = _prune_challenges_locked(c, now())
+            c.execute("COMMIT")
+            return removed
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
+
 def create_email_verification_challenge(
     challenge_id: str, email: str, username: str, pw_hash: str,
     code_digest: str, expires_at: int,
 ) -> None:
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
+        _prune_challenges_locked(c, now())
         c.execute(
             "UPDATE email_verification_challenges SET consumed_at=COALESCE(consumed_at, created_at) WHERE email=? AND consumed_at IS NULL",
             (email,),
@@ -465,6 +522,7 @@ def create_password_reset_challenge(
 ) -> None:
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
+        _prune_challenges_locked(c, now())
         c.execute(
             "UPDATE password_reset_challenges SET consumed_at=COALESCE(consumed_at, created_at) WHERE user_id=? AND consumed_at IS NULL",
             (user_id,),
@@ -477,8 +535,18 @@ def create_password_reset_challenge(
 
 
 def consume_password_reset(
-    challenge_id: str, email: str, code_digest: str, new_pw_hash: str, timestamp: int,
+    challenge_id: str,
+    email: str,
+    code_digest: str,
+    new_pw_hash: Callable[[], str],
+    timestamp: int,
 ) -> str | None:
+    """Verify a reset code and, only then, materialize the new password hash.
+
+    ``new_pw_hash`` is a callable rather than a value so the caller's bcrypt
+    work happens after the code, expiry, attempt count and mailbox all check
+    out — a rejected code must not cost the server a key-derivation.
+    """
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute(
@@ -503,7 +571,7 @@ def consume_password_reset(
         # linked address, so the first successful reset also verifies it.
         c.execute(
             "UPDATE users SET pw_hash=?, email_verified_at=COALESCE(email_verified_at, ?) WHERE id=?",
-            (new_pw_hash, timestamp, row["user_id"]),
+            (new_pw_hash(), timestamp, row["user_id"]),
         )
         c.execute("UPDATE devices SET session_version=session_version+1 WHERE user_id=?", (row["user_id"],))
         c.execute("COMMIT")
@@ -667,6 +735,7 @@ def create_device_login_challenge(device_id: int, user_id: int, sid: str, sessio
     }
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
+        _prune_challenges_locked(c, timestamp)
         current = c.execute(
             "SELECT session_version,trust_state FROM devices WHERE id=? AND user_id=? AND sid=?",
             (device_id, user_id, sid),
@@ -719,6 +788,81 @@ def consume_device_login_challenge(
             return None
         c.execute("COMMIT")
         return session_version + 1, str(device["trust_state"])
+
+
+def create_pairing_session(
+    user_id: int,
+    approver_sid: str,
+    subject_sid: str,
+    challenge: str,
+    nonce_new: str,
+    ttl_seconds: int = 120,
+) -> dict[str, Any]:
+    """Create a single-use QR pairing session bound to one pending device.
+
+    Raises ``LookupError`` with a client-facing reason when the subject is not
+    a pending device of the same account or its registration challenge does
+    not match, and ``ValueError`` when the approver is no longer approved.
+    A rescan replaces the subject's previous live session (QR nonce binding
+    must be unique at any moment).
+    """
+    pairing_id = secrets.token_urlsafe(18)
+    nonce_approver = _b64u(secrets.token_bytes(32))
+    timestamp = now()
+    expires_at = timestamp + ttl_seconds
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            _prune_challenges_locked(c, timestamp)
+            approver = c.execute(
+                "SELECT trust_state FROM devices WHERE user_id = ? AND sid = ?",
+                (user_id, approver_sid),
+            ).fetchone()
+            if not approver or approver["trust_state"] != "approved":
+                raise ValueError("approver is no longer approved")
+            subject = c.execute(
+                "SELECT trust_state, challenge FROM devices WHERE user_id = ? AND sid = ?",
+                (user_id, subject_sid),
+            ).fetchone()
+            if not subject:
+                raise LookupError("subject device not found")
+            if subject["trust_state"] != "pending":
+                raise LookupError("subject device is not pending")
+            if str(subject["challenge"]) != challenge:
+                raise LookupError("subject challenge mismatch")
+            epoch = int(c.execute(
+                "SELECT security_epoch FROM users WHERE id = ?", (user_id,)
+            ).fetchone()["security_epoch"])
+            c.execute(
+                "UPDATE pairing_sessions SET consumed_at = COALESCE(consumed_at, created_at) "
+                "WHERE subject_sid = ? AND consumed_at IS NULL",
+                (subject_sid,),
+            )
+            c.execute(
+                "INSERT INTO pairing_sessions(pairing_id,user_id,subject_sid,approver_sid,nonce_new,nonce_approver,expires_at,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (pairing_id, user_id, subject_sid, approver_sid, nonce_new, nonce_approver, expires_at, timestamp),
+            )
+            _append_security_event_locked(
+                c, user_id, "pairing_session_created", approver_sid, subject_sid, epoch,
+                {"pairing_id": pairing_id},
+            )
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+    return {"pairing_id": pairing_id, "nonce_approver": nonce_approver, "expires_at": expires_at}
+
+
+def get_live_pairing_session(subject_sid: str, timestamp: int) -> dict[str, Any] | None:
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT pairing_id, nonce_approver, expires_at FROM pairing_sessions "
+            "WHERE subject_sid = ? AND consumed_at IS NULL AND expires_at > ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (subject_sid, timestamp),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def revoke_device(
@@ -833,8 +977,15 @@ def approve_pending_device(
     statement: str,
     signature: str,
     approver_session_version: int,
+    pairing: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Approve once, conditional on the signed directory epoch."""
+    """Approve once, conditional on the signed directory epoch.
+
+    ``pairing`` carries the v2 QR binding (pairing_id, nonce_new,
+    nonce_approver). The session is validated and consumed inside the same
+    write transaction as the approval, so an expired, reused, or
+    mismatched session can never produce an approval certificate.
+    """
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
         try:
@@ -861,8 +1012,23 @@ def approve_pending_device(
                 raise ValueError("device is not pending")
             if int(user["security_epoch"]) != parent_epoch:
                 raise RuntimeError("security epoch changed")
-            epoch = parent_epoch + 1
             timestamp = now()
+            if pairing is not None:
+                session = c.execute(
+                    "SELECT subject_sid, nonce_new, nonce_approver, expires_at, consumed_at "
+                    "FROM pairing_sessions WHERE pairing_id = ?",
+                    (pairing["pairing_id"],),
+                ).fetchone()
+                if (
+                    not session
+                    or session["consumed_at"] is not None
+                    or int(session["expires_at"]) <= timestamp
+                    or str(session["subject_sid"]) != subject_sid
+                    or str(session["nonce_new"]) != pairing["nonce_new"]
+                    or str(session["nonce_approver"]) != pairing["nonce_approver"]
+                ):
+                    raise ValueError("pairing session is invalid or expired")
+            epoch = parent_epoch + 1
             c.execute(
                 "UPDATE devices SET trust_state = 'approved', verification_state='verified', approved_by_sid = ?, approved_at = ?, approval_signature = ? WHERE user_id = ? AND sid = ? AND trust_state = 'pending'",
                 (approver_sid, timestamp, signature, user_id, subject_sid),
@@ -871,9 +1037,14 @@ def approve_pending_device(
                 "INSERT INTO device_approvals(user_id,subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (user_id, subject_sid, approver_sid, parent_epoch, epoch, statement, signature, timestamp),
             )
+            if pairing is not None:
+                c.execute(
+                    "UPDATE pairing_sessions SET consumed_at = ? WHERE pairing_id = ? AND consumed_at IS NULL",
+                    (timestamp, pairing["pairing_id"]),
+                )
             c.execute("UPDATE users SET security_epoch = ? WHERE id = ?", (epoch, user_id))
             directory_hash = _refresh_directory_locked(c, user_id)
-            _append_security_event_locked(c, user_id, "device_approved", approver_sid, subject_sid, epoch, {"directory_hash": directory_hash, "approval_signature": signature})
+            _append_security_event_locked(c, user_id, "device_approved", approver_sid, subject_sid, epoch, {"directory_hash": directory_hash, "approval_signature": signature, "pairing": pairing is not None})
             c.execute("COMMIT")
             return {"security_epoch": epoch, "directory_hash": directory_hash}
         except Exception:
@@ -1499,19 +1670,45 @@ def list_block_rules(user_id: int) -> list[dict[str, Any]]:
 
 
 def add_block_rule(user_id: int, rule_type: str, value: str) -> dict[str, Any]:
-    """Insert-or-keep a rule; always returns the canonical stored row."""
+    """Insert-or-keep a rule; always returns the canonical stored row.
+
+    Raises ``ValueError('block rule limit reached')`` past
+    ``config.MAX_BLOCK_RULES``. Every rule is pushed to all of the account's
+    devices and evaluated against every decrypted message, so an unbounded
+    list is a foot-gun even when only the owner can add to it.
+    """
     with conn_ctx() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO block_rules(user_id, type, value, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, rule_type, value, now()),
-        )
-        row = c.execute(
-            "SELECT id, type, value, created_at FROM block_rules "
-            "WHERE user_id = ? AND type = ? AND value = ?",
-            (user_id, rule_type, value),
-        ).fetchone()
-        return dict(row)
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            existing = c.execute(
+                "SELECT id, type, value, created_at FROM block_rules "
+                "WHERE user_id = ? AND type = ? AND value = ?",
+                (user_id, rule_type, value),
+            ).fetchone()
+            if existing:
+                c.execute("COMMIT")
+                return dict(existing)
+            count = c.execute(
+                "SELECT COUNT(*) AS n FROM block_rules WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if int(count["n"]) >= config.MAX_BLOCK_RULES:
+                raise ValueError("block rule limit reached")
+            c.execute(
+                "INSERT INTO block_rules(user_id, type, value, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, rule_type, value, now()),
+            )
+            row = c.execute(
+                "SELECT id, type, value, created_at FROM block_rules "
+                "WHERE user_id = ? AND type = ? AND value = ?",
+                (user_id, rule_type, value),
+            ).fetchone()
+            c.execute("COMMIT")
+            return dict(row)
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
 
 
 def remove_block_rule(user_id: int, rule_id: int) -> bool:

@@ -3,6 +3,8 @@ import { b64u, generateKeypair, initCrypto } from "./keys";
 import {
   accountSafetyNumber,
   canonicalDeviceApproval,
+  canonicalDeviceApprovalV2,
+  signDeviceApprovalV2,
   deviceFingerprint,
   signDeviceApproval,
   verifyDeviceApproval,
@@ -151,6 +153,127 @@ describe("trusted-device crypto", () => {
     };
 
     expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+  });
+
+  describe("QR pairing (v2) approval certificates", () => {
+    const NONCE_NEW = b64u(new Uint8Array(32).fill(3));
+    const NONCE_APPROVER = b64u(new Uint8Array(32).fill(4));
+    const PAIRING = { pairingId: "pair_abc-123", nonceNew: NONCE_NEW, nonceApprover: NONCE_APPROVER };
+
+    const buildPairedProof = () => {
+      const root = generateKeypair();
+      const phone = generateKeypair();
+      const active = [
+        { sid: "root", pub_key: root.box.pk, sig_pub: root.sign.pk, kind: "web" as const },
+        { sid: "phone", pub_key: phone.box.pk, sig_pub: phone.sign.pk, kind: "android_gateway" as const },
+      ];
+      const fields = {
+        uid: 90,
+        subjectSid: "phone",
+        pubKey: phone.box.pk,
+        sigPub: phone.sign.pk,
+        kind: "android_gateway",
+        challenge: TWO32,
+        parentEpoch: 1,
+      };
+      const proof = {
+        user_id: 90,
+        identity_sig_pub: root.sign.pk,
+        security_epoch: 2,
+        security_mode: "verified_v2" as const,
+        directory_hash: serverDirectoryHash(active),
+        device_history: [
+          {
+            ...active[0],
+            fingerprint: deviceFingerprint(root.box.pk, root.sign.pk).hash,
+            trust_state: "approved" as const,
+            challenge: ZERO32,
+            approved_by_sid: "root",
+            verification_state: "verified" as const,
+          },
+          {
+            ...active[1],
+            fingerprint: deviceFingerprint(phone.box.pk, phone.sign.pk).hash,
+            trust_state: "approved" as const,
+            challenge: TWO32,
+            approved_by_sid: "root",
+            verification_state: "verified" as const,
+          },
+        ],
+        approval_certificates: [{
+          subject_sid: "phone",
+          approver_sid: "root",
+          parent_epoch: 1,
+          resulting_epoch: 2,
+          statement: canonicalDeviceApprovalV2(fields, PAIRING),
+          signature: signDeviceApprovalV2(fields, PAIRING, root.sign.sk),
+          created_at: 1,
+        }],
+        revocation_certificates: [],
+        security_upgrade_certificates: [],
+      };
+      return { proof, active, fields, root };
+    };
+
+    it("matches the relay's v2 statement byte-for-byte", () => {
+      expect(canonicalDeviceApprovalV2({
+        uid: 42,
+        subjectSid: "dev_new-01",
+        pubKey: ZERO32,
+        sigPub: ONE32,
+        kind: "android_gateway",
+        challenge: TWO32,
+        parentEpoch: 7,
+      }, PAIRING)).toBe(
+        "securemsg-device-approval-v2\n"
+        + "uid=42\n"
+        + "subject_sid=dev_new-01\n"
+        + `pub_key=${ZERO32}\n`
+        + `sig_pub=${ONE32}\n`
+        + "kind=android_gateway\n"
+        + `challenge=${TWO32}\n`
+        + "pairing_id=pair_abc-123\n"
+        + `nonce_new=${NONCE_NEW}\n`
+        + `nonce_approver=${NONCE_APPROVER}\n`
+        + "parent_epoch=7\n",
+      );
+    });
+
+    it("accepts a directory whose device was approved over QR pairing", () => {
+      // Before v2 was understood here, ONE such certificate made the whole
+      // account's directory unverifiable and locked every client.
+      const { proof, active } = buildPairedProof();
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("rejects a v2 certificate whose nonces were swapped after signing", () => {
+      const { proof, active } = buildPairedProof();
+      const tampered = {
+        ...proof,
+        approval_certificates: [{
+          ...proof.approval_certificates[0],
+          statement: proof.approval_certificates[0].statement
+            .replace(`nonce_approver=${NONCE_APPROVER}`, `nonce_approver=${ZERO32}`),
+        }],
+      };
+      expect(() => verifyDirectoryProof(tampered, active)).toThrow(/approval certificate/);
+    });
+
+    it("rejects a statement that claims v2 but carries no pairing binding", () => {
+      const { proof, active, fields, root } = buildPairedProof();
+      // A v1 body relabelled as v2 must not be re-checked under v1 rules.
+      const downgraded = canonicalDeviceApproval(fields)
+        .replace("securemsg-device-approval-v1", "securemsg-device-approval-v2");
+      const tampered = {
+        ...proof,
+        approval_certificates: [{
+          ...proof.approval_certificates[0],
+          statement: downgraded,
+          signature: signDeviceApproval(fields, root.sign.sk),
+        }],
+      };
+      expect(() => verifyDirectoryProof(tampered, active)).toThrow(/approval certificate/);
+    });
   });
 
   it("accepts a verified_v2 legacy-upgrade chain that starts after epoch 1", () => {

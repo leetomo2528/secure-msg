@@ -80,10 +80,7 @@ class TrustedDeviceTest(unittest.TestCase):
         suffix = hashlib.sha256(self._testMethodName.encode()).hexdigest()[:10]
         self.username = f"trust_{suffix}"
         self.pw_hash = "A" * 43
-        registered = self.client.post(
-            "/api/register",
-            json={"username": self.username, "pw_hash": self.pw_hash},
-        )
+        registered = self._register_account(self.username, self.pw_hash)
         self.assertEqual(registered.status_code, 200, registered.json)
         self.uid = registered.json["uid"]
         self.first_box, self.first_signing, self.first_sig_public = _key_material(11)
@@ -100,6 +97,21 @@ class TrustedDeviceTest(unittest.TestCase):
     @staticmethod
     def _headers(token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
+
+    def _register_account(self, username: str, pw_hash: str):
+        """Accounts are created through the email-verified flow only."""
+        email = f"{username}@example.test"
+        with mock.patch("emailer.send_code") as send_code:
+            requested = self.client.post(
+                "/api/register/email/request",
+                json={"username": username, "email": email, "pw_hash": pw_hash},
+            )
+            self.assertEqual(requested.status_code, 200, requested.json)
+            code = send_code.call_args.args[2]
+        return self.client.post(
+            "/api/register/email/verify",
+            json={"challenge_id": requested.json["challenge_id"], "code": code},
+        )
 
     def _register_device(
         self,

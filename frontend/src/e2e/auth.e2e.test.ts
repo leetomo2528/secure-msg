@@ -8,6 +8,7 @@ import path from "node:path";
 import { initCrypto } from "../crypto/keys";
 import { clearAllData, getMeta } from "../store/db";
 import { useStore } from "../store/useStore";
+import { registerViaEmail } from "./registerViaEmail";
 
 /**
  * End-to-end auth test against a REAL local Flask relay server.
@@ -47,6 +48,7 @@ vi.mock("../net/api", async (importOriginal) => {
 });
 
 let serverProc: ChildProcess;
+let outbox: string;
 const realFetch = globalThis.fetch.bind(globalThis);
 
 beforeAll(async () => {
@@ -59,6 +61,7 @@ beforeAll(async () => {
   });
 
   const tmp = mkdtempSync(path.join(tmpdir(), "securemsg-e2e-"));
+  outbox = path.join(tmp, "outbox.jsonl");
   serverProc = spawn(PYTHON, ["app.py"], {
     cwd: SERVER_DIR,
     env: {
@@ -69,6 +72,10 @@ beforeAll(async () => {
       SECUREMSG_DB: path.join(tmp, "e2e.db"),
       SECUREMSG_JWT_SECRET: "e2e-only-secret-" + "x".repeat(48),
       SECUREMSG_CORS: "http://localhost:5173",
+      // Registration is email-verified only; the console provider writes the
+      // code to a file this test reads instead of sending mail.
+      SECUREMSG_EMAIL_PROVIDER: "console",
+      SECUREMSG_EMAIL_OUTBOX: outbox,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -90,7 +97,7 @@ afterAll(() => {
 
 describe("auth end-to-end against a real relay server", () => {
   it("register: mixed-charset 8+ char password, device meta persisted", async () => {
-    const ok = await useStore.getState().register("e2e_alice", PASSWORD);
+    const ok = await registerViaEmail(outbox, "e2e_alice", PASSWORD);
     expect(useStore.getState().error).toBeNull();
     expect(ok).toBe(true);
     expect(useStore.getState().authed).toBe(true);
@@ -131,7 +138,7 @@ describe("auth end-to-end against a real relay server", () => {
 
   it("duplicate registration is rejected with the server error", async () => {
     await clearAllData(); // fresh-browser register path reaches the server
-    const ok = await useStore.getState().register("e2e_alice", PASSWORD);
+    const ok = await registerViaEmail(outbox, "e2e_alice", PASSWORD);
     expect(ok).toBe(false);
     expect(useStore.getState().error).toContain("already");
   }, 60_000);

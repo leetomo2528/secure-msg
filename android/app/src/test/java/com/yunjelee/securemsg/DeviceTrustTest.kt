@@ -35,6 +35,54 @@ class DeviceTrustTest {
         )
     }
 
+    private val four = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+
+    private fun pairing() = PairingBinding(
+        pairingId = "pair_abc-123",
+        nonceNew = three,
+        nonceApprover = four,
+    )
+
+    @Test fun approvalCanonicalV2GoldenIsByteExact() {
+        // The same field order and framing are pinned in the relay
+        // (server/tests/test_smoke.py) and the web client
+        // (frontend/src/crypto/deviceTrust.test.ts). A drift on any one side
+        // invalidates every certificate the other two verify.
+        assertEquals(
+            "securemsg-device-approval-v2\n" +
+                "uid=42\n" +
+                "subject_sid=android_A1\n" +
+                "pub_key=$one\n" +
+                "sig_pub=$two\n" +
+                "kind=android_gateway\n" +
+                "challenge=$zero\n" +
+                "pairing_id=pair_abc-123\n" +
+                "nonce_new=$three\n" +
+                "nonce_approver=$four\n" +
+                "parent_epoch=7\n",
+            DeviceApprovalStatementV2(statement(), pairing()).canonical(),
+        )
+    }
+
+    @Test fun canonicalFormFollowsTheStatementsOwnDomainLine() {
+        val v1 = statement().canonical()
+        val v2 = DeviceApprovalStatementV2(statement(), pairing()).canonical()
+        assertEquals(v1, canonicalApprovalForStatement(statement(), v1))
+        assertEquals(v2, canonicalApprovalForStatement(statement(), v2))
+        // Claiming v2 without carrying a binding must not fall back to v1.
+        val mislabelled = v1.replace("securemsg-device-approval-v1", "securemsg-device-approval-v2")
+        assertEquals(null, canonicalApprovalForStatement(statement(), mislabelled))
+    }
+
+    @Test fun v2StatementRejectsTamperedNonces() {
+        val genuine = DeviceApprovalStatementV2(statement(), pairing()).canonical()
+        val swapped = genuine.replace("nonce_approver=$four", "nonce_approver=$zero")
+        // The parse still succeeds, but re-rendering no longer matches, which
+        // is exactly the check that rejects it.
+        assertEquals(false, swapped == canonicalApprovalForStatement(statement(), genuine))
+        assertTrue(pairingBindingFromStatement(swapped)!!.nonceApprover == zero)
+    }
+
     @Test fun approvalCanonicalRejectsInjectionAndBadChallenge() {
         val injected = statement().copy(subjectSid = "sid\nparent_epoch=0")
         assertFails { injected.canonical() }

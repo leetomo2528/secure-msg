@@ -68,52 +68,33 @@ body {
   transition: background-color 0.25s ease, color 0.25s ease;
 }
 
-/* Dark-first onboarding surface: security products should feel intentional,
-   not washed out by the user's default light theme. */
+/* Onboarding follows the user's theme like any ordinary pre-auth surface.
+   Only the authenticated shell (.app-shell) pins itself dark, so that the web
+   client and the Android app show the same palette once you are signed in. */
 .onboarding-shell {
-  --fg: 255 255 255;
-  --tx-1: 248 250 252;
-  --tx-2: 203 213 225;
-  --tx-3: 148 163 184;
-  --tx-4: 100 116 139;
-  --accent-tx: 94 234 212;
-  background: #071018;
-  color: #f8fafc;
-}
-
-.onboarding-orb {
-  border-radius: 999px;
-  filter: blur(2px);
-  pointer-events: none;
-}
-
-.onboarding-orb-a {
-  top: -180px;
-  left: 8%;
-  width: 560px;
-  height: 560px;
-  background: radial-gradient(circle, rgba(20, 184, 166, .2), transparent 68%);
-}
-
-.onboarding-orb-b {
-  right: -180px;
-  bottom: -240px;
-  width: 620px;
-  height: 620px;
-  background: radial-gradient(circle, rgba(14, 165, 233, .12), transparent 68%);
+  background: rgb(var(--bg));
+  color: rgb(var(--tx-1));
 }
 
 .onboarding-card {
-  padding: 1.5rem;
-  border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 1.5rem;
-  background: linear-gradient(145deg, rgba(20, 35, 49, .92), rgba(10, 21, 31, .88));
-  box-shadow: 0 24px 80px rgba(0, 0, 0, .34), inset 0 1px 0 rgba(255, 255, 255, .05);
-  backdrop-filter: blur(20px);
+  padding: 1.75rem;
+  border: 1px solid rgb(var(--fg) / 0.10);
+  border-radius: 1.25rem;
+  background: rgb(var(--bg-soft));
+  box-shadow: 0 1px 2px var(--shadow-bubble), 0 12px 32px -12px var(--shadow-bubble);
 }
 
 @media (max-width: 640px) {
-  .onboarding-card { padding: 1.25rem; }
+  .onboarding-card { padding: 1.5rem; }
+}
+
+/* The brand gradient is built for the dark app shell; on the light onboarding
+   surface it reads washed out and drops the label's contrast. Solid accent. */
+.onboarding-shell .btn-primary {
+  background-image: none;
+  background-color: rgb(var(--accent-tx));
+  color: rgb(var(--bg-soft));
+  box-shadow: none;
 }
 
 /* safe-area for iOS PWA */
@@ -165,4 +146,3 @@ input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
 .app-shell aside > div:first-child { border-bottom: 1px solid rgba(255,255,255,.06); }
 .app-shell aside button:hover { background-color: rgba(255,255,255,.055); }
 .app-shell aside input { min-height: 2.5rem; }
-.onboarding-card { border-color: rgba(49,215,193,.18); background: linear-gradient(145deg, rgba(18,26,43,.94), rgba(11,16,32,.9)); }
