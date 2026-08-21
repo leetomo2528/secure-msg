@@ -156,8 +156,11 @@ describe("trusted-device crypto", () => {
   });
 
   describe("QR pairing (v2) approval certificates", () => {
-    const NONCE_NEW = b64u(new Uint8Array(32).fill(3));
-    const NONCE_APPROVER = b64u(new Uint8Array(32).fill(4));
+    // Literals, not b64u(...): a describe body runs at collection time,
+    // before beforeAll's initCrypto(), so calling into libsodium here races
+    // its WASM startup. It won locally and lost on CI.
+    const NONCE_NEW = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
+    const NONCE_APPROVER = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ";
     const PAIRING = { pairingId: "pair_abc-123", nonceNew: NONCE_NEW, nonceApprover: NONCE_APPROVER };
 
     const buildPairedProof = () => {
