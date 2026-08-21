@@ -30,6 +30,8 @@
 		Referrer-Policy no-referrer
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
-		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		# camera=(self): the QR pairing scanner needs getUserMedia on this
+		# origin. camera=() silently made the web approver flow impossible.
+		Permissions-Policy "geolocation=(), microphone=(), camera=(self)"
 	}
 }

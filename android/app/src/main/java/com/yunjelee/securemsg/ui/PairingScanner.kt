@@ -33,6 +33,8 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 
 /**
@@ -105,35 +107,49 @@ fun PairingScanner(
             val previewView = remember { PreviewView(context) }
             val executor = remember { Executors.newSingleThreadExecutor() }
             val scanner = remember { BarcodeScanning.getClient() }
+            // Held so the camera is actually released when this leaves the
+            // composition; without it the torch/preview can stay bound.
+            val boundProvider = remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
             DisposableEffect(Unit) {
                 onDispose {
+                    boundProvider.value?.unbindAll()
+                    boundProvider.value = null
                     executor.shutdown()
                     scanner.close()
                 }
             }
 
             LaunchedEffect(previewView) {
-                val provider = ProcessCameraProvider.getInstance(context).get()
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                analysis.setAnalyzer(executor) { proxy ->
-                    scanFrame(proxy, scanner, skip = { handled }) { value ->
-                        if (!handled) {
-                            handled = true
-                            onPayload(value)
+                runCatching {
+                    // getInstance().get() BLOCKS. On the main dispatcher that
+                    // is an ANR, and outside runCatching a provider failure
+                    // took down the composition instead of showing the
+                    // message right below this block.
+                    val provider = withContext(Dispatchers.IO) {
+                        ProcessCameraProvider.getInstance(context).get()
+                    }
+                    val preview = Preview.Builder().build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+                    val analysis = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                    analysis.setAnalyzer(executor) { proxy ->
+                        scanFrame(proxy, scanner, skip = { handled }) { value ->
+                            if (!handled) {
+                                handled = true
+                                onPayload(value)
+                            }
                         }
                     }
-                }
-                runCatching {
                     provider.unbindAll()
+                    // bindToLifecycle must run on the main thread; the
+                    // LaunchedEffect body is already there.
                     provider.bindToLifecycle(
                         lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis,
                     )
+                    boundProvider.value = provider
                 }.onFailure { failure = "카메라를 열지 못했습니다." }
             }
 

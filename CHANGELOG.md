@@ -31,7 +31,7 @@
 - `SECUREMSG_EMAIL_PROVIDER=console`: 메일 제공자 계정 없이 인증 코드를 로컬 아웃박스/로그로 받는다. 프로덕션에서는 기동 자체가 거부된다.
 - `/api/conversations`의 N+1 쿼리 제거.
 
-- 서버 77 / 웹 153 / Android 187 테스트 통과, Android versionCode 21 / versionName 0.11.0, Android lint·debug APK 빌드 통과.
+- 서버 79 / 웹 153 / Android 159 테스트 통과, Android versionCode 21 / versionName 0.11.0, Android lint·debug APK 빌드 통과.
 
 ## v0.10.8 (2026-08-17) — 보안 경직화·신뢰 문서·CI
 
