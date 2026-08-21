@@ -180,6 +180,22 @@ CREATE TABLE IF NOT EXISTS conversation_members (
     PRIMARY KEY (conv_id, user_id)
 );
 
+-- Deleting a user cascades to its memberships, but `conversations` has no FK
+-- back to users, so the conversation row itself used to survive — carrying the
+-- phone number in `name` and the synced contact label with it. A conversation
+-- nobody is a member of has no owner who could ever read it, so drop it with
+-- the last membership. Nothing in the app removes memberships, which makes
+-- account deletion the only trigger in practice.
+CREATE TRIGGER IF NOT EXISTS drop_conversation_without_members
+AFTER DELETE ON conversation_members
+BEGIN
+    DELETE FROM conversations
+     WHERE id = OLD.conv_id
+       AND NOT EXISTS (
+             SELECT 1 FROM conversation_members WHERE conv_id = OLD.conv_id
+           );
+END;
+
 -- Messages: the encrypted envelope. `payload` is a JSON blob:
 --   { "ct":  base64 ciphertext (secretbox over plaintext),
 --     "nonce": base64 nonce,

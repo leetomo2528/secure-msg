@@ -147,6 +147,38 @@ class ServerSmokeTest(unittest.TestCase):
             "parent_epoch=7\n",
         )
 
+    def test_deleting_an_account_takes_its_conversations_with_it(self):
+        """Conversations have no FK to users, so they used to be stranded.
+
+        The leftover row still held the phone number in `name` and the
+        gateway's synced contact label — personal data outliving the account
+        it belonged to.
+        """
+        username = "orphan_" + self.username[-6:]
+        self.assertEqual(
+            register_account(self.client, username, self.pw_hash).status_code, 200
+        )
+        user = store.get_user_by_name(username)
+        conv_id = store.create_conversation("orphan-cid-" + username, "+821099998888")
+        store.add_member(conv_id, int(user["id"]))
+        self.assertIsNotNone(store.get_conversation_by_cid("orphan-cid-" + username))
+
+        with store.conn_ctx() as c:
+            c.execute("PRAGMA foreign_keys = ON")
+            c.execute("DELETE FROM users WHERE id = ?", (user["id"],))
+
+        self.assertIsNone(store.get_conversation_by_cid("orphan-cid-" + username))
+
+    def test_orphan_conversation_sweep_clears_rows_from_older_databases(self):
+        """Databases written before the trigger existed still carry orphans."""
+        cid = "stranded-" + self.username[-6:]
+        conv_id = store.create_conversation(cid, "+821077776666")
+        # No membership at all: exactly the shape an old account deletion left.
+        self.assertIsNotNone(store.get_conversation_by_cid(cid))
+        self.assertGreaterEqual(store.prune_orphan_conversations(), 1)
+        self.assertIsNone(store.get_conversation_by_cid(cid))
+        del conv_id
+
     def test_unverified_registration_endpoint_is_gone(self):
         """Accounts must go through email verification; the old path is removed."""
         response = self.client.post(

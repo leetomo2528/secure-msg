@@ -463,6 +463,42 @@ def _prune_challenges_locked(c: sqlite3.Connection, timestamp: int) -> int:
     return removed
 
 
+def _delete_orphan_conversations_locked(c: sqlite3.Connection) -> int:
+    """Remove conversations nobody is a member of, inside an open transaction.
+
+    Such a row is unreachable — every read path filters by membership — but it
+    still holds the conversation `name` (a phone number) and the gateway's
+    synced contact label, so leaving it behind keeps personal data for an
+    account that no longer exists.
+    """
+    cur = c.execute(
+        "DELETE FROM conversations WHERE id NOT IN "
+        "(SELECT conv_id FROM conversation_members)"
+    )
+    return cur.rowcount if cur.rowcount > 0 else 0
+
+
+def prune_orphan_conversations() -> int:
+    """Clear conversations already stranded by an account deleted before the
+    drop_conversation_without_members trigger existed.
+
+    Deliberately NOT run at startup. ``create_conversation`` and
+    ``add_member`` are separate transactions at some call sites, so a
+    membership-free conversation is not proof of an orphan — it can also be a
+    creation caught mid-flight. Run this explicitly, after an account
+    deletion, when that ambiguity does not apply.
+    """
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            removed = _delete_orphan_conversations_locked(c)
+            c.execute("COMMIT")
+            return removed
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
+
 def prune_challenges() -> int:
     """Standalone sweep, for a maintenance call or a test."""
     with conn_ctx() as c:
