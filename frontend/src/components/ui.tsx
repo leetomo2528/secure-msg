@@ -55,7 +55,7 @@ export function Segmented<T extends string>({
   tone?: "brand" | "surface";
 }) {
   const active = tone === "brand"
-    ? "bg-brand-gradient font-semibold text-slate-950 shadow"
+    ? "bg-brand-gradient font-semibold text-white shadow"
     : "bg-night-soft font-semibold text-tx-1 shadow-bubble";
   return (
     <div

@@ -3,51 +3,31 @@
 @tailwind utilities;
 
 /* ------------------------------------------------------------------ */
-/* Theme tokens. Light is the default; `.dark` on <html> flips them.  */
-/* Colors are rgb triplets so Tailwind opacity modifiers keep working. */
+/* Theme tokens — ONE light palette for every surface, matching the      */
+/* Android app. Colors are rgb triplets so Tailwind opacity modifiers    */
+/* keep working. There is deliberately no dark variant: the app shell    */
+/* never had one, so a dark toggle only ever half-worked.                */
 /* ------------------------------------------------------------------ */
 :root {
-  --bg: 243 246 250;        /* app background */
-  --bg-soft: 255 255 255;   /* sidebar / header surface */
+  --bg: 246 247 251;        /* app background */
+  --bg-soft: 255 255 255;   /* sidebar / card surface */
   --fg: 15 23 42;           /* overlay base (slate-900) */
-  --tx-1: 15 23 42;         /* primary text */
-  --tx-2: 51 65 85;         /* body text */
+  --tx-1: 17 24 39;         /* primary text */
+  --tx-2: 55 65 81;         /* body text */
   --tx-3: 71 85 105;        /* secondary text */
-  --tx-4: 100 116 139;      /* faint text / placeholders */
-  --accent-tx: 15 118 110;  /* teal-700 */
+  --tx-4: 107 114 128;      /* faint text — slate-400 is only 2.56:1 on white */
+  --accent-tx: 37 99 235;   /* blue-600 */
   --danger-tx: 185 28 28;   /* red-700 */
-  --glow: rgba(13, 148, 136, 0.28);
-  --shadow-bubble: rgba(15, 23, 42, 0.10);
+  --glow: rgba(37, 99, 235, 0.22);
+  --shadow-bubble: rgba(15, 23, 42, 0.12);
 }
 
-.dark {
-  --bg: 11 16 32;           /* #0B1020 */
-  --bg-soft: 18 26 43;      /* #121A2B */
-  --fg: 255 255 255;
-  --tx-1: 241 245 249;
-  --tx-2: 226 232 240;
-  --tx-3: 154 168 191;      /* #9AA8BF */
-  --tx-4: 112 128 151;
-  --accent-tx: 49 215 193;  /* #31D7C1 */
-  --danger-tx: 254 202 202; /* red-200 */
-  --glow: rgba(45, 212, 191, 0.45);
-  --shadow-bubble: rgba(0, 0, 0, 0.5);
-}
-
-/* Authenticated web surface mirrors the Android palette. */
+/* Authenticated web surface. */
 .app-shell {
-  --bg: 11 16 32;
-  --bg-soft: 18 26 43;
-  --fg: 255 255 255;
-  --tx-1: 241 245 249;
-  --tx-2: 218 226 238;
-  --tx-3: 154 168 191;
-  --tx-4: 112 128 151;
-  --accent-tx: 49 215 193;
-  --danger-tx: 254 202 202;
-  --glow: rgba(49, 215, 193, 0.30);
-  --shadow-bubble: rgba(0, 0, 0, 0.5);
-  background-image: radial-gradient(900px 520px at 70% -15%, rgba(49, 215, 193, .09), transparent 65%), linear-gradient(135deg, rgba(85,167,255,.025), transparent 45%);
+  /* Ambience only — the palette has one source now (:root). */
+  background-image:
+    radial-gradient(520px 360px at 72% -8%, rgb(var(--accent-tx) / 0.10), transparent 72%),
+    linear-gradient(180deg, rgb(var(--bg-soft) / 0.55) 0%, transparent 100%);
 }
 
 html, body, #root {
@@ -68,11 +48,12 @@ body {
   transition: background-color 0.25s ease, color 0.25s ease;
 }
 
-/* Onboarding follows the user's theme like any ordinary pre-auth surface.
-   Only the authenticated shell (.app-shell) pins itself dark, so that the web
-   client and the Android app show the same palette once you are signed in. */
 .onboarding-shell {
+  /* Sign-in and the app are one surface; only the content differs. */
   background: rgb(var(--bg));
+  background-image:
+    radial-gradient(520px 360px at 72% -8%, rgb(var(--accent-tx) / 0.10), transparent 72%),
+    linear-gradient(180deg, rgb(var(--bg-soft) / 0.55) 0%, transparent 100%);
   color: rgb(var(--tx-1));
 }
 
@@ -88,15 +69,6 @@ body {
   .onboarding-card { padding: 1.5rem; }
 }
 
-/* The brand gradient is built for the dark app shell; on the light onboarding
-   surface it reads washed out and drops the label's contrast. Solid accent. */
-.onboarding-shell .btn-primary {
-  background-image: none;
-  background-color: rgb(var(--accent-tx));
-  color: rgb(var(--bg-soft));
-  box-shadow: none;
-}
-
 /* safe-area for iOS PWA */
 :root {
   --safe-top: env(safe-area-inset-top, 0px);
@@ -108,7 +80,7 @@ button, [role="button"] { min-height: 2.75rem; }
 input, textarea { background: transparent; color: inherit; }
 input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
 
-::selection { background: rgba(45, 212, 191, 0.28); }
+::selection { background: rgb(var(--accent-tx) / 0.24); }
 
 :focus-visible { outline: 2px solid rgb(var(--accent-tx)); outline-offset: 3px; }
 
@@ -127,7 +99,7 @@ input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
     @apply w-full rounded-xl bg-fg/[0.045] ring-1 ring-fg/10 px-3.5 py-3 text-sm text-tx-1 transition focus:outline-none focus:ring-2 focus:ring-accent-tx/50;
   }
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-xl bg-brand-gradient px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-glow transition hover:brightness-110 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-xl bg-brand-gradient px-4 py-2.5 text-sm font-semibold text-white shadow-glow transition hover:brightness-110 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
   }
   .btn-ghost {
     @apply inline-flex items-center justify-center gap-1.5 rounded-xl bg-fg/[0.03] px-3 py-2 text-sm text-tx-2 ring-1 ring-fg/10 transition hover:bg-fg/[0.07] active:scale-[0.98];
@@ -141,8 +113,4 @@ input::placeholder, textarea::placeholder { color: rgb(var(--tx-4)); }
 }
 
 /* SecureMsg editorial surfaces: restrained glass, clear hierarchy. */
-.app-shell > aside { background: rgba(18, 26, 43, .78); backdrop-filter: blur(18px); }
-.app-shell main { background: rgba(11, 16, 32, .58); }
-.app-shell aside > div:first-child { border-bottom: 1px solid rgba(255,255,255,.06); }
-.app-shell aside button:hover { background-color: rgba(255,255,255,.055); }
 .app-shell aside input { min-height: 2.5rem; }

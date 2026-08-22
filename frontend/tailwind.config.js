@@ -18,7 +18,9 @@ export default {
         "danger-tx": "rgb(var(--danger-tx) / <alpha-value>)",
       },
       backgroundImage: {
-        "brand-gradient": "linear-gradient(135deg, #2dd4bf 0%, #38bdf8 100%)",
+        // Indigo, and the end stop is #5b52e8 rather than #6366f1 so a white
+        // label still clears AA (5.45:1 vs 4.47:1) at the light end.
+        "brand-gradient": "linear-gradient(135deg, #4f46e5 0%, #5b52e8 100%)",
       },
       boxShadow: {
         glow: "0 0 40px -12px var(--glow)",

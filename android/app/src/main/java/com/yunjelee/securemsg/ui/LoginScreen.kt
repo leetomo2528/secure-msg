@@ -120,7 +120,7 @@ fun LoginScreen(
             Text(
                 "SecureMsg",
                 style = TextStyle(
-                    brush = Sm.gradient,
+                    brush = Sm.brandGradient,
                     fontSize = 32.sp,
                     fontWeight = FontWeight.ExtraBold,
                     letterSpacing = (-0.5).sp,

@@ -102,7 +102,7 @@ fun UpdateBanner(
                 progress = { state.pct / 100f },
                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
                 color = Sm.teal,
-                trackColor = Sm.surfaceAlt,
+                trackColor = Sm.progressTrack,
             )
         }
         is UpdateUiState.Ready -> SmGradientButton(
@@ -212,7 +212,7 @@ private fun InstallProgressBanner(message: String) {
         LinearProgressIndicator(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
             color = Sm.teal,
-            trackColor = Sm.surfaceAlt,
+            trackColor = Sm.progressTrack,
         )
     }
 }

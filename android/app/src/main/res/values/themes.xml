@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Theme.DeviceDefault is dark-only (it resolves to Theme.Material, not a
+      DayNight variant), so the launch window flashed near-black before Compose
+      painted the light palette, and the status bar icons stayed white on a
+      light background. Pin the window background and ask for dark status-bar
+      icons; MainActivity re-asserts the same thing at runtime for API 35+.
+    -->
+    <style name="Theme.SecureMsg" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

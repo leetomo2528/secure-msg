@@ -318,7 +318,7 @@ export default function ChatView({ cid }: { cid: string }) {
             disabled={sending || (!text.trim() && attachments.length === 0 && !subject.trim())}
             aria-label={sending ? "전송 중" : "전송"}
             title={sending ? "전송 중…" : "전송"}
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-brand-gradient text-slate-950 shadow-glow transition hover:brightness-110 active:scale-95 disabled:opacity-40 disabled:shadow-none"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-brand-gradient text-white shadow-glow transition hover:brightness-110 active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
             {sending ? (
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" className="animate-spin" aria-hidden>

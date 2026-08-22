@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -29,31 +30,53 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * SecureMsg design tokens — the same brand as the web app (v0.4.4 redesign):
- * deep night-navy surfaces, teal→sky gradient accents, 4-step text hierarchy.
+ * SecureMsg design tokens — light palette, mirroring the web app shell so the
+ * phone and the browser are the same product (v0.11.1).
+ *
+ * Accent roles are deliberately split: `accent` is the blue used for text,
+ * focus and progress, while `brandGradient`/`avatarGradient` are the indigo
+ * FILLS (wordmark, avatar, own bubble). Every pair below was checked against
+ * WCAG AA on the surface it actually sits on — a light background is far less
+ * forgiving than the dark one this replaced, where near-anything read.
  */
 object Sm {
-    val bg = Color(0xFF0A0F16)
-    val surface = Color(0xFF101827)
-    val surfaceAlt = Color(0xFF182234)
-    val border = Color(0xFF1E293B)
-    val borderSoft = Color(0x551E293B)
+    val bg = Color(0xFFF6F7FB)
+    val surface = Color(0xFFFFFFFF)
+    val surfaceAlt = Color(0xFFF0F1F5)
+    /** Hairlines and decorative separators only — too faint to bound a control. */
+    val border = Color(0xFFE2E8F0)
+    /** Interactive boundaries (inputs, ghost buttons): WCAG 1.4.11 needs 3:1. */
+    val borderStrong = Color(0xFF767E8C)
+    val borderSoft = Color(0xFFEEF0F4)
 
-    val text1 = Color(0xFFF1F5F9)
-    val text2 = Color(0xFFCBD5E1)
-    val text3 = Color(0xFF94A3B8)
-    val text4 = Color(0xFF64748B)
+    val text1 = Color(0xFF111827)
+    val text2 = Color(0xFF374151)
+    val text3 = Color(0xFF475569)
+    val text4 = Color(0xFF6B7280)
 
-    val teal = Color(0xFF2DD4BF)
-    val sky = Color(0xFF38BDF8)
-    val cyan = Color(0xFF22D3EE)
-    val accentDeep = Color(0xFF0E7490)
-    val danger = Color(0xFFF87171)
-    val warning = Color(0xFFFBBF24)
+    /** Primary accent (blue-600). Named `teal` for source compatibility. */
+    val teal = Color(0xFF2563EB)
+    val sky = Color(0xFF4F46E5)
+    val cyan = Color(0xFF2563EB)
+    val accentDeep = Color(0xFF1D4ED8)
+    val success = Color(0xFF046B4E)
+    val danger = Color(0xFFB91C1C)
+    val warning = Color(0xFF92400E)
+    /** Label on any accent-filled surface. */
+    val onAccent = Color(0xFFFFFFFF)
+    val progressTrack = Color(0xFFDBEAFE)
 
-    val gradient = Brush.linearGradient(listOf(teal, sky))
-    val gradientSoft = Brush.linearGradient(listOf(Color(0x2E2DD4BF), Color(0x2E38BDF8)))
-    val avatarGradient = Brush.linearGradient(listOf(Color(0xFF0D9488), Color(0xFF0284C7)))
+    val gradient = Brush.linearGradient(listOf(teal, teal))
+    val gradientSoft = Brush.linearGradient(
+        listOf(Color(0xFFEFF6FF), Color(0xFFEFF6FF)),
+    )
+    val avatarGradient = Brush.linearGradient(
+        listOf(Color(0xFF5B4BE7), Color(0xFF4338CA)),
+    )
+    /** Wordmark only — the one place a visible gradient survives. */
+    val brandGradient = Brush.linearGradient(
+        listOf(Color(0xFF4F46E5), Color(0xFF5B52E8)),
+    )
 }
 
 /** Rounded card used for every settings/composer section. */
@@ -63,12 +86,22 @@ fun SmCard(
     verticalArrangement: Arrangement.Vertical = Arrangement.spacedBy(10.dp),
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val cardShape = RoundedCornerShape(16.dp)
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            // Shadow BEFORE clip, or it gets clipped away. The dark theme
+            // separated the card by being lighter than the page; white on
+            // #F6F7FB is a 5% luminance step, so it needs the lift instead.
+            .shadow(
+                elevation = 2.dp,
+                shape = cardShape,
+                ambientColor = Color(0x1A0F172A),
+                spotColor = Color(0x1A0F172A),
+            )
+            .clip(cardShape)
             .background(Sm.surface)
-            .border(1.dp, Sm.border, RoundedCornerShape(16.dp))
+            .border(1.dp, Sm.border, cardShape)
             .padding(16.dp),
         verticalArrangement = verticalArrangement,
         content = content,
@@ -99,7 +132,12 @@ fun SmGradientButton(
             .clip(shape)
             .background(
                 if (enabled) Sm.gradient
-                else Brush.linearGradient(listOf(Sm.border, Sm.border)),
+                else Brush.linearGradient(listOf(Sm.surfaceAlt, Sm.surfaceAlt)),
+            )
+            .border(
+                1.dp,
+                if (enabled) Color.Transparent else Color(0xFFCBD5E1),
+                shape,
             )
             .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 12.dp),
@@ -107,7 +145,9 @@ fun SmGradientButton(
     ) {
         Text(
             text,
-            color = if (enabled) Color(0xFF052530) else Sm.text4,
+            // White on blue-600 is 5.17:1; the old near-black was tuned for
+            // the teal fill and drops to 3.09:1 here.
+            color = if (enabled) Sm.onAccent else Sm.text4,
             fontWeight = FontWeight.Bold,
             fontSize = 14.sp,
         )
@@ -127,7 +167,9 @@ fun SmGhostButton(
         modifier = modifier
             .clip(shape)
             .background(Sm.surfaceAlt)
-            .border(1.dp, Sm.border, shape)
+            // borderStrong, not border: on a light ground the hairline is
+            // 1.15:1 and the whole button disappears.
+            .border(1.dp, Sm.borderStrong, shape)
             .clickable(onClick = onClick)
             .padding(vertical = 12.dp),
         contentAlignment = Alignment.Center,
@@ -158,7 +200,7 @@ fun SmTextField(
         shape = RoundedCornerShape(12.dp),
         colors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = Sm.cyan,
-            unfocusedBorderColor = Sm.border,
+            unfocusedBorderColor = Sm.borderStrong,
             focusedLabelColor = Sm.cyan,
             unfocusedLabelColor = Sm.text4,
             cursorColor = Sm.cyan,
@@ -219,7 +261,7 @@ fun SmTabs(selected: Int, labels: List<String>, onSelect: (Int) -> Unit) {
 
 /** Small status pill with a colored dot. */
 @Composable
-fun SmChip(text: String, color: Color) {
+fun SmChip(text: String, color: Color, label: Color = color) {
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
@@ -229,7 +271,7 @@ fun SmChip(text: String, color: Color) {
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Box(Modifier.size(6.dp).clip(CircleShape).background(color))
-        Text(text, color = color, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+        Text(text, color = label, fontSize = 11.sp, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -252,9 +294,16 @@ fun ChatBubble(mine: Boolean, blocked: Boolean, text: String) {
                 .background(
                     when {
                         blocked -> Sm.surface
-                        mine -> Color(0xFF115E59)
-                        else -> Sm.surfaceAlt
+                        mine -> Color(0xFF4F46E5)
+                        else -> Sm.surface
                     },
+                )
+                // An incoming bubble is white on a near-white ground (1.05:1),
+                // so the outline is what makes it a bubble at all.
+                .border(
+                    1.dp,
+                    if (mine) Color.Transparent else Color(0xFFE9EBF0),
+                    shape,
                 )
                 .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
@@ -262,7 +311,7 @@ fun ChatBubble(mine: Boolean, blocked: Boolean, text: String) {
                 text,
                 color = when {
                     blocked -> Sm.text4
-                    mine -> Color(0xFFCCFBF1)
+                    mine -> Sm.onAccent
                     else -> Sm.text2
                 },
                 fontSize = 13.sp,

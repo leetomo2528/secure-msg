@@ -130,7 +130,7 @@ fun MainScreen(
             Text(
                 "SecureMsg",
                 style = TextStyle(
-                    brush = Sm.gradient,
+                    brush = Sm.brandGradient,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.ExtraBold,
                     letterSpacing = (-0.3).sp,
@@ -140,7 +140,7 @@ fun MainScreen(
         SmChip(
             status,
             when {
-                status.startsWith("브리지 사용 준비됨") -> Sm.teal
+                status.startsWith("브리지 사용 준비됨") -> Sm.success
                 status == "연결 확인 중…" -> Sm.sky
                 else -> Sm.warning
             },
@@ -151,13 +151,13 @@ fun MainScreen(
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(14.dp))
                     .background(Sm.teal.copy(alpha = 0.10f))
-                    .border(1.dp, Sm.teal.copy(alpha = 0.42f), RoundedCornerShape(14.dp))
+                    .border(1.dp, Sm.teal, RoundedCornerShape(14.dp))
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(9.dp),
             ) {
                 Text(
                     "새 기기 승인 요청 ${pendingApprovalCount}건",
-                    color = Sm.teal, fontSize = 14.sp, fontWeight = FontWeight.Bold,
+                    color = Sm.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold,
                 )
                 SmGradientButton(
                     text = "기기 보안 열기",

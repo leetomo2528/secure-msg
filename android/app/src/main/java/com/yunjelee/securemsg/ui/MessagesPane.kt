@@ -363,7 +363,7 @@ fun ColumnScope.MessagesPane(
                 ) {
                     Text(
                         if (sending) "…" else "↑",
-                        color = if (canReply) Color(0xFF052530) else Sm.text4,
+                        color = if (canReply) Sm.onAccent else Sm.text4,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
                     )
