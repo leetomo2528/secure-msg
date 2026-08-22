@@ -311,6 +311,27 @@ interface MessageDao {
      */
     @Query("UPDATE messages SET cid = :newCid WHERE cid = :oldCid")
     suspend fun moveConversation(oldCid: String, newCid: String)
+
+    /**
+     * Newest message of every conversation in one emission — the thread
+     * list's snippet and unread hint. Picks the row [observeForCid] puts at
+     * index 0 (latest createdAt, then highest id) so the list and the open
+     * chat never disagree about what "latest" is. Read-only; no schema change.
+     */
+    @Query(
+        "SELECT * FROM messages WHERE id IN (" +
+            "SELECT MAX(id) FROM messages WHERE (cid, createdAt) IN (" +
+            "SELECT cid, MAX(createdAt) FROM messages GROUP BY cid) GROUP BY cid)",
+    )
+    fun observeLatestPerCid(): Flow<List<MessageRow>>
+
+    /**
+     * Incoming rows newer than [since] in one conversation — the thread list's
+     * unread badge, measured against the on-device last-opened stamp. Blocked
+     * rows count too: the list flags the thread on them as well.
+     */
+    @Query("SELECT COUNT(*) FROM messages WHERE cid = :cid AND mine = 0 AND createdAt > :since")
+    suspend fun countIncomingSince(cid: String, since: Long): Int
 }
 
 @Dao

@@ -5,18 +5,38 @@ import android.content.Context
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -33,10 +53,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -60,11 +87,13 @@ import com.yunjelee.securemsg.RelayTrustedDeviceApi
 import com.yunjelee.securemsg.SavedCredentials
 import com.yunjelee.securemsg.ServerConfig
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 
 /** Add a local/shared block rule as one serialized operation (IO). */
@@ -97,7 +126,17 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
     }
 }
 
-/** "차단·설정 (Block·Settings)" tab: shared block rules, update controls, quarantined SMS, dev tools. */
+/** Rows of the settings row-list card; tapping one expands its detail inline below. */
+private enum class SettingsRow { Quarantine, BlockedSenders, ContactSync, Update }
+
+/** Sender rules are validated the same way the dispatcher validates recipients. */
+private val SenderRulePattern = Regex("^\\+?[0-9*#]{3,24}$")
+
+/**
+ * "설정" tab: device security, block keywords, then a row-list (quarantined
+ * SMS · sender block · contact-name sync · app update) whose rows expand in
+ * place, and dev tools on debug builds. Owns its 16dp horizontal gutter.
+ */
 @Composable
 fun SettingsPane(
     creds: SavedCredentials,
@@ -132,6 +171,8 @@ fun SettingsPane(
     var pendingPairing by remember {
         mutableStateOf<Pair<PendingDeviceApproval, PairingHandshake>?>(null)
     }
+    // Which row-list entry is open; null collapses all of them.
+    var expanded by remember { mutableStateOf<SettingsRow?>(null) }
 
     fun securityController(): DeviceSecurityController {
         val relay = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }
@@ -287,6 +328,34 @@ fun SettingsPane(
         sharedRules = BlocklistSync.load(context)
     }
 
+    fun addKeyword() {
+        val keyword = newKw.trim()
+        if (keyword.isEmpty()) return
+        scope.launch(Dispatchers.IO) {
+            addBlockRule(context, "keyword", keyword)
+            withContext(Dispatchers.Main) {
+                newKw = ""
+                reloadShared()
+            }
+        }
+    }
+
+    fun addBlockedSender() {
+        val number = PhoneNumberNormalizer.normalize(newBlockedPhone)
+        if (!SenderRulePattern.matches(number)) return
+        scope.launch(Dispatchers.IO) {
+            addBlockRule(context, "sender", number)
+            withContext(Dispatchers.Main) {
+                newBlockedPhone = ""
+                reloadShared()
+            }
+        }
+    }
+
+    fun toggleRow(row: SettingsRow) {
+        expanded = if (expanded == row) null else row
+    }
+
     LaunchedEffect(creds.sid) {
         reloadShared()
         // One refresh per settings visit. Pending-device changes arrive via the
@@ -295,13 +364,24 @@ fun SettingsPane(
         refreshDeviceSecurity()
     }
 
+    // This gateway's own fingerprint for the card footer; the keypair is fixed
+    // for the session, so compute it once.
+    val ownFingerprint = remember(creds.keypair.boxPk, creds.keypair.signPk) {
+        runCatching {
+            DeviceTrustCrypto.deviceFingerprint(creds.keypair.boxPk, creds.keypair.signPk)
+        }.getOrNull()
+    }
+
     Column(
         Modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .imePadding(),
+            .imePadding()
+            .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        SettingsHeader(username = creds.username, deviceName = creds.deviceName)
+
         if (!notificationPermissionGranted) {
             SmCard {
                 SectionTitle("알림 권한")
@@ -313,8 +393,16 @@ fun SettingsPane(
                 )
             }
         }
+
         SmCard {
-            SectionTitle("기기 보안")
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SectionTitle("기기 보안")
+                securityChip(deviceSecurity)?.let { (text, color) -> SmChipSmall(text, color) }
+            }
             Caption(
                 "새 기기는 기존 기기의 Ed25519 승인을 받아야 합니다. 키가 바뀌거나 보안 epoch가 " +
                     "되돌아가면 로컬 pin을 덮어쓰지 않고 동기화를 차단합니다.",
@@ -374,6 +462,12 @@ fun SettingsPane(
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
+            if (deviceSecurity.pending.isNotEmpty()) {
+                SmInsetNotice(
+                    title = "새 기기 승인 요청 ${deviceSecurity.pending.size}건",
+                    subtitle = pendingSummary(deviceSecurity.pending.first()),
+                )
+            }
             val confirmation = pendingPairing
             if (confirmation != null) {
                 SectionTitle("두 화면의 숫자가 같습니까?")
@@ -404,6 +498,7 @@ fun SettingsPane(
                     text = "QR 스캔으로 승인",
                     onClick = { scanningPairing = true },
                     modifier = Modifier.fillMaxWidth(),
+                    leadingIcon = SmIconKind.Qr,
                 )
             }
             deviceSecurity.pending.forEach { pending ->
@@ -457,208 +552,237 @@ fun SettingsPane(
                     Text(pin.fingerprint, color = Sm.text4, fontSize = 10.sp)
                 }
             }
+            ThisDeviceRow(
+                fingerprint = ownFingerprint,
+                status = if (deviceSecurity.selfPending) "승인 대기 중" else "승인됨",
+            )
         }
+
         SmCard {
             SectionTitle("차단 키워드")
             Caption("키워드·발신번호는 모든 기기에 동기화됩니다. 문자 내용은 이 기기에서 복호화한 뒤 검사하며 서버에는 평문으로 보내지 않습니다.")
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SmTextField(
-                    value = newKw,
-                    onValueChange = { newKw = it.take(120) },
-                    label = "키워드",
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                SmGradientButton(
-                    text = "추가",
-                    onClick = {
-                        val keyword = newKw.trim()
-                        if (keyword.isNotEmpty()) {
-                            scope.launch(Dispatchers.IO) {
-                                addBlockRule(context, "keyword", keyword)
-                                withContext(Dispatchers.Main) {
-                                    newKw = ""
-                                    reloadShared()
-                                }
-                            }
-                        }
-                    },
-                )
-            }
-            val localKeywords = blocklist.map { it.keyword }.toSet()
-            if (blocklist.isEmpty() && sharedRules.keywords.all { it in localKeywords }) {
-                Caption("추가된 키워드가 없습니다.")
-            }
-            blocklist.forEach { keyword ->
-                RuleRow(
-                    value = keyword.keyword,
-                    onDelete = {
-                        scope.launch(Dispatchers.IO) {
-                            removeBlockRuleOnServer(context, "keyword", keyword.keyword)
-                            withContext(Dispatchers.Main) { reloadShared() }
-                        }
-                    },
-                )
-            }
-            sharedRules.keywords.filter { it !in localKeywords }.forEach { value ->
-                RuleRow(
-                    value = value,
-                    subtitle = "다른 기기에서 추가됨",
-                    onDelete = {
-                        scope.launch(Dispatchers.IO) {
-                            removeBlockRuleOnServer(context, "keyword", value)
-                            withContext(Dispatchers.Main) { reloadShared() }
-                        }
-                    },
-                )
-            }
-        }
-
-        SmCard {
-            SectionTitle("발신번호 차단")
-            Caption("번호 차단은 이 Android 기기에서 수신 단계에 적용됩니다.")
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SmTextField(
-                    value = newBlockedPhone,
-                    onValueChange = { newBlockedPhone = it.take(32) },
-                    label = "전화번호",
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                SmGradientButton(
-                    text = "차단",
-                    onClick = {
-                        val number = PhoneNumberNormalizer.normalize(newBlockedPhone)
-                        if (Regex("^\\+?[0-9*#]{3,24}$").matches(number)) {
-                            scope.launch(Dispatchers.IO) {
-                                addBlockRule(context, "sender", number)
-                                withContext(Dispatchers.Main) {
-                                    newBlockedPhone = ""
-                                    reloadShared()
-                                }
-                            }
-                        }
-                    },
-                )
-            }
-            val localSenders = blockedSenders.map { it.phoneNumber }.toSet()
-            if (blockedSenders.isEmpty() && sharedRules.senders.all { it in localSenders }) {
-                Caption("차단된 번호가 없습니다.")
-            }
-            blockedSenders.forEach { sender ->
-                RuleRow(
-                    value = sender.phoneNumber,
-                    onDelete = {
-                        scope.launch(Dispatchers.IO) {
-                            removeBlockRuleOnServer(context, "sender", sender.phoneNumber)
-                            withContext(Dispatchers.Main) { reloadShared() }
-                        }
-                    },
-                )
-            }
-            sharedRules.senders.filter { it !in localSenders }.forEach { value ->
-                RuleRow(
-                    value = value,
-                    subtitle = "다른 기기에서 추가됨",
-                    onDelete = {
-                        scope.launch(Dispatchers.IO) {
-                            removeBlockRuleOnServer(context, "sender", value)
-                            withContext(Dispatchers.Main) { reloadShared() }
-                        }
-                    },
-                )
-            }
-        }
-
-        SmCard {
-            SectionTitle("연락처 이름")
-            Caption(
-                "폰 연락처와 전화번호를 이 기기에서 대조한 뒤, 일치한 이름(또는 삭제 상태)을 " +
-                    "다른 로그인 기기에도 표시하도록 릴레이 서버에 저장합니다. 전체 연락처 목록은 " +
-                    "업로드하지 않습니다.",
-            )
-            ContactSyncStatusText(contactStatus)
-            SmGhostButton(
-                text = if (contactSyncing) "동기화 중…" else "연락처 이름 동기화",
-                onClick = {
-                    if (contactSyncing) return@SmGhostButton
-                    if (ContactSync.hasPermission(context)) {
-                        syncContacts()
-                    } else {
-                        contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            contactMessage?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
-        }
-
-        SmCard {
-            SectionTitle("앱 업데이트")
-            Caption("현재 버전 v${BuildConfig.VERSION_NAME} · 새 버전을 자동으로 내려받아 게임처럼 바로 설치합니다.")
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    "자동 업데이트 확인 (12시간마다)",
-                    color = Sm.text2,
-                    fontSize = 13.sp,
+                RuleInput(
+                    value = newKw,
+                    onValueChange = { newKw = it.take(120) },
+                    placeholder = "키워드",
+                    onDone = ::addKeyword,
+                    modifier = Modifier.weight(1f),
                 )
-                Switch(
-                    checked = update.autoEnabled,
-                    onCheckedChange = update.onToggleAuto,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = Sm.accentDeep,
-                        uncheckedThumbColor = Sm.text4,
-                        uncheckedTrackColor = Sm.surfaceAlt,
-                    ),
-                )
+                RuleAddButton(text = "추가", enabled = newKw.isNotBlank(), onClick = ::addKeyword)
             }
-            SmGhostButton(
-                text = when (update.state) {
-                    is UpdateUiState.Checking -> "확인 중…"
-                    is UpdateUiState.Downloading -> "다운로드 중…"
-                    else -> "업데이트 확인"
-                },
-                onClick = { update.onCheck(true) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            update.message?.let {
-                Text(it, color = Sm.text3, fontSize = 12.sp)
+            val localKeywords = blocklist.map { it.keyword }.toSet()
+            val sharedOnlyKeywords = sharedRules.keywords.filter { it !in localKeywords }
+            if (blocklist.isEmpty() && sharedOnlyKeywords.isEmpty()) {
+                Caption("추가된 키워드가 없습니다.")
+            } else {
+                KeywordChips {
+                    blocklist.forEach { keyword ->
+                        KeywordChip(
+                            value = keyword.keyword,
+                            shared = false,
+                            onDelete = {
+                                scope.launch(Dispatchers.IO) {
+                                    removeBlockRuleOnServer(context, "keyword", keyword.keyword)
+                                    withContext(Dispatchers.Main) { reloadShared() }
+                                }
+                            },
+                        )
+                    }
+                    sharedOnlyKeywords.forEach { value ->
+                        KeywordChip(
+                            value = value,
+                            shared = true,
+                            onDelete = {
+                                scope.launch(Dispatchers.IO) {
+                                    removeBlockRuleOnServer(context, "keyword", value)
+                                    withContext(Dispatchers.Main) { reloadShared() }
+                                }
+                            },
+                        )
+                    }
+                }
             }
         }
 
-        SmCard {
-            SectionTitle("격리된 스팸 (${blockedSms.size})")
-            if (blockedSms.isEmpty()) {
-                Caption("격리된 문자가 없습니다.")
+        // Row-list and its inline details share one unspaced column so a
+        // collapsed (zero-height) detail does not claim a 12dp gap of its own.
+        val localSenders = blockedSenders.map { it.phoneNumber }.toSet()
+        val sharedOnlySenders = sharedRules.senders.filter { it !in localSenders }
+        val syncLabel = remember(contactStatus?.lastSyncedAt) {
+            syncTimeLabel(contactStatus?.lastSyncedAt)
+        }
+        Column(Modifier.fillMaxWidth()) {
+            SmListRowCard {
+                SmListRow(
+                    label = "격리된 스팸",
+                    value = "${blockedSms.size}건",
+                    onClick = { toggleRow(SettingsRow.Quarantine) },
+                )
+                SmListRow(
+                    label = "발신번호 차단",
+                    value = "${localSenders.size + sharedOnlySenders.size}개",
+                    onClick = { toggleRow(SettingsRow.BlockedSenders) },
+                )
+                SmListRow(
+                    label = "연락처 이름 동기화",
+                    value = syncLabel,
+                    onClick = { toggleRow(SettingsRow.ContactSync) },
+                )
+                SmListRow(
+                    label = "앱 업데이트",
+                    value = updateRowValue(update.state),
+                    onClick = { toggleRow(SettingsRow.Update) },
+                    showDivider = false,
+                )
             }
-            blockedSms.take(20).forEach { item ->
+
+            SettingsDetail(visible = expanded == SettingsRow.Quarantine) {
+                SectionTitle("격리된 스팸 (${blockedSms.size})")
+                if (blockedSms.isEmpty()) {
+                    Caption("격리된 문자가 없습니다.")
+                }
+                blockedSms.take(20).forEach { item ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Sm.surfaceAlt)
+                            .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "${item.phoneNumber}: ${item.reason}\n${item.body.take(120)}",
+                            color = Sm.text3,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                            maxLines = 3,
+                            modifier = Modifier.weight(1f).padding(vertical = 4.dp),
+                        )
+                        TextButton(onClick = {
+                            scope.launch(Dispatchers.IO) {
+                                db.blockedSmsDao().delete(item)
+                            }
+                        }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                    }
+                }
+            }
+
+            SettingsDetail(visible = expanded == SettingsRow.BlockedSenders) {
+                SectionTitle("발신번호 차단")
+                Caption("번호 차단은 이 Android 기기에서 수신 단계에 적용됩니다.")
                 Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Sm.surfaceAlt)
-                        .padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RuleInput(
+                        value = newBlockedPhone,
+                        onValueChange = { newBlockedPhone = it.take(32) },
+                        placeholder = "전화번호",
+                        keyboardType = KeyboardType.Phone,
+                        onDone = ::addBlockedSender,
+                        modifier = Modifier.weight(1f),
+                    )
+                    RuleAddButton(
+                        text = "차단",
+                        enabled = SenderRulePattern.matches(
+                            PhoneNumberNormalizer.normalize(newBlockedPhone),
+                        ),
+                        onClick = ::addBlockedSender,
+                    )
+                }
+                if (blockedSenders.isEmpty() && sharedOnlySenders.isEmpty()) {
+                    Caption("차단된 번호가 없습니다.")
+                }
+                blockedSenders.forEach { sender ->
+                    RuleRow(
+                        value = sender.phoneNumber,
+                        onDelete = {
+                            scope.launch(Dispatchers.IO) {
+                                removeBlockRuleOnServer(context, "sender", sender.phoneNumber)
+                                withContext(Dispatchers.Main) { reloadShared() }
+                            }
+                        },
+                    )
+                }
+                sharedOnlySenders.forEach { value ->
+                    RuleRow(
+                        value = value,
+                        subtitle = "다른 기기에서 추가됨",
+                        onDelete = {
+                            scope.launch(Dispatchers.IO) {
+                                removeBlockRuleOnServer(context, "sender", value)
+                                withContext(Dispatchers.Main) { reloadShared() }
+                            }
+                        },
+                    )
+                }
+            }
+
+            SettingsDetail(visible = expanded == SettingsRow.ContactSync) {
+                SectionTitle("연락처 이름")
+                Caption(
+                    "폰 연락처와 전화번호를 이 기기에서 대조한 뒤, 일치한 이름(또는 삭제 상태)을 " +
+                        "다른 로그인 기기에도 표시하도록 릴레이 서버에 저장합니다. 전체 연락처 목록은 " +
+                        "업로드하지 않습니다.",
+                )
+                ContactSyncStatusText(contactStatus)
+                SmGhostButton(
+                    text = if (contactSyncing) "동기화 중…" else "연락처 이름 동기화",
+                    onClick = {
+                        if (contactSyncing) return@SmGhostButton
+                        if (ContactSync.hasPermission(context)) {
+                            syncContacts()
+                        } else {
+                            contactsPermissionLauncher.launch(Manifest.permission.READ_CONTACTS)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                contactMessage?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
+            }
+
+            SettingsDetail(visible = expanded == SettingsRow.Update) {
+                SectionTitle("앱 업데이트")
+                Caption("현재 버전 v${BuildConfig.VERSION_NAME} · 새 버전을 자동으로 내려받아 게임처럼 바로 설치합니다.")
+                Row(
+                    Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "${item.phoneNumber}: ${item.reason}\n${item.body.take(120)}",
-                        color = Sm.text3,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        maxLines = 3,
-                        modifier = Modifier.weight(1f).padding(vertical = 4.dp),
+                        "자동 업데이트 확인 (12시간마다)",
+                        color = Sm.text2,
+                        fontSize = 13.sp,
                     )
-                    TextButton(onClick = {
-                        scope.launch(Dispatchers.IO) {
-                            db.blockedSmsDao().delete(item)
-                        }
-                    }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                    Switch(
+                        checked = update.autoEnabled,
+                        onCheckedChange = update.onToggleAuto,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Sm.onAccent,
+                            checkedTrackColor = Sm.accentDeep,
+                            uncheckedThumbColor = Sm.text4,
+                            uncheckedTrackColor = Sm.surfaceAlt,
+                        ),
+                    )
+                }
+                SmGhostButton(
+                    text = when (update.state) {
+                        is UpdateUiState.Checking -> "확인 중…"
+                        is UpdateUiState.Downloading -> "다운로드 중…"
+                        else -> "업데이트 확인"
+                    },
+                    onClick = { update.onCheck(true) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                update.message?.let {
+                    Text(it, color = Sm.text3, fontSize = 12.sp)
                 }
             }
         }
@@ -690,6 +814,112 @@ fun SettingsPane(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Header / device security
+// ---------------------------------------------------------------------------
+
+/**
+ * Pane title row. The root column's 16dp gutter plus 4dp here lands on the
+ * 20dp header inset; the 2dp bottom lifts the 12dp card gap to 14dp.
+ */
+@Composable
+private fun SettingsHeader(username: String, deviceName: String) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, bottom = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "설정",
+            color = Sm.text1,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.ExtraBold,
+            letterSpacing = (-0.4).sp,
+        )
+        Text(
+            "$username · $deviceName",
+            color = Sm.text4,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** Card-title chip summarising account trust; null while the state is unknown. */
+private fun securityChip(view: DeviceSecurityView): Pair<String, Color>? = when {
+    view.selfPending -> "승인 대기" to Sm.warning
+    view.securityMode == "legacy_v1" -> "레거시 계정" to Sm.warning
+    view.trustWarning != null -> "검증 차단" to Sm.danger
+    view.securityMode == "verified_v2" -> "검증된 계정" to Sm.success
+    else -> null
+}
+
+/** Inset subtitle for the first pending request: "웹 · device-mf5e · 방금 전". */
+private fun pendingSummary(device: PendingDeviceApproval): String {
+    val kind = when (device.kind) {
+        "web" -> "웹"
+        "android_gateway" -> "Android"
+        else -> device.kind
+    }
+    return listOfNotNull(kind, device.name, device.requestedAt?.let(::relativeLabel))
+        .joinToString(" · ")
+}
+
+/** Coarse age from relay unix seconds (the server stamps `int(time.time())`). */
+private fun relativeLabel(unixSeconds: Long): String {
+    val delta = (System.currentTimeMillis() / 1000 - unixSeconds).coerceAtLeast(0)
+    return when {
+        delta < 60 -> "방금 전"
+        delta < 3_600 -> "${delta / 60}분 전"
+        delta < 86_400 -> "${delta / 3_600}시간 전"
+        else -> "${delta / 86_400}일 전"
+    }
+}
+
+/** Footer of the 기기 보안 card: this gateway's own fingerprint and approval state. */
+@Composable
+private fun ThisDeviceRow(fingerprint: String?, status: String) {
+    Column(Modifier.fillMaxWidth()) {
+        HorizontalDivider(color = Sm.borderSoft, thickness = 1.dp)
+        Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SmIconCircle(
+                kind = SmIconKind.Smartphone,
+                size = 32.dp,
+                tint = Sm.sky,
+                background = Sm.accentTint,
+                iconSize = 16.dp,
+                shape = RoundedCornerShape(10.dp),
+            )
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    "이 기기 · SMS 게이트웨이",
+                    color = Sm.text1, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                )
+                // Fingerprint is "XXXX XXXX …" hex groups; two groups identify it.
+                val lead = fingerprint?.let { "지문 ${it.take(9)} …" } ?: "공개키 확인 불가 ·"
+                Text(
+                    "$lead $status",
+                    color = Sm.text4, fontSize = 11.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * One pending device with its fallback actions. "QR 스캔으로 승인" above is the
+ * card's single primary action; approving from here skips the safety-number
+ * comparison (legacy v1 signature), so it stays a quiet secondary and says
+ * so — never a second gradient button competing with the scan.
+ */
 @Composable
 private fun PendingDeviceRow(
     device: PendingDeviceApproval,
@@ -705,27 +935,117 @@ private fun PendingDeviceRow(
         Text("새 기기 승인 요청: ${device.name}", color = Sm.warning, fontSize = 13.sp)
         Caption("${device.kind} · ${device.sid}\n$fingerprint")
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            SmGradientButton("승인", onApprove, Modifier.weight(1f))
+            SmGhostButton("번호 비교 없이 승인", onApprove, Modifier.weight(1f))
             SmGhostButton("거절", onReject, Modifier.weight(1f), Sm.danger)
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Block rules
+// ---------------------------------------------------------------------------
+
+/** Single-line rule entry: 12dp box, strong hairline, Done submits. */
 @Composable
-private fun ContactSyncStatusText(status: ContactSyncStatus?) {
-    if (status == null) {
-        Caption("아직 동기화하지 않았습니다.")
-        return
-    }
-    val timestamp = remember(status.lastSyncedAt) {
-        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
-            .format(Date(status.lastSyncedAt))
-    }
-    Caption(
-        "마지막 동기화: $timestamp · 연락처 번호 ${status.contactPhoneCount}개 · " +
-            "대화 ${status.matchedThreadCount}개 일치 · 서버 ${status.uploadedCount}건" +
-            if (status.failedUploadCount > 0) " · 실패 ${status.failedUploadCount}건" else "",
+private fun RuleInput(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    modifier: Modifier = Modifier,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    onDone: () -> Unit = {},
+) {
+    val shape = RoundedCornerShape(12.dp)
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier
+            .clip(shape)
+            .background(Sm.surface)
+            // borderStrong for the same reason as SmGhostButton: `border` on
+            // white is a 1.15:1 hairline and the field edge vanishes.
+            .border(1.dp, Sm.borderStrong, shape)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        singleLine = true,
+        textStyle = TextStyle(color = Sm.text1, fontSize = 13.sp),
+        cursorBrush = SolidColor(Sm.teal),
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { onDone() }),
+        decorationBox = { inner ->
+            Box(contentAlignment = Alignment.CenterStart) {
+                if (value.isEmpty()) Text(placeholder, color = Sm.text4, fontSize = 13.sp)
+                inner()
+            }
+        },
     )
+}
+
+/** Compact solid button beside [RuleInput] ("추가" / "차단"); matches its height. */
+@Composable
+private fun RuleAddButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
+        Modifier
+            .clip(shape)
+            .background(if (enabled) Sm.teal else Sm.surfaceAlt)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 11.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            color = if (enabled) Sm.onAccent else Sm.text4,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+/** Wrapping chip container; `FlowRow` is still experimental in foundation-layout 1.6. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun KeywordChips(content: @Composable () -> Unit) {
+    FlowRow(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        content()
+    }
+}
+
+/**
+ * One block keyword as a removable chip. `shared` marks rules added on another
+ * device; deletion always goes through the relay either way.
+ */
+@Composable
+private fun KeywordChip(value: String, shared: Boolean, onDelete: () -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Sm.surfaceAlt)
+            .padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(value, color = Sm.text2, fontSize = 12.sp)
+        if (shared) Text("다른 기기", color = Sm.text4, fontSize = 10.sp)
+        // 20dp hit box around a 12dp glyph so the chip stays at spec height.
+        Box(
+            Modifier
+                .size(20.dp)
+                .clip(CircleShape)
+                .clickable(role = Role.Button, onClick = onDelete),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Outlined.Close,
+                contentDescription = "$value 삭제",
+                tint = Sm.text4,
+                modifier = Modifier.size(12.dp),
+            )
+        }
+    }
 }
 
 /**
@@ -759,4 +1079,68 @@ private fun RuleRow(
             Text("삭제", color = Sm.danger, fontSize = 12.sp)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row-list details
+// ---------------------------------------------------------------------------
+
+/**
+ * Detail card that expands directly under the row-list card. The 12dp top
+ * padding is the inter-card gap the parent column deliberately does not add.
+ */
+@Composable
+private fun SettingsDetail(visible: Boolean, content: @Composable ColumnScope.() -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically() + fadeIn(),
+        exit = shrinkVertically() + fadeOut(),
+    ) {
+        SmCard(modifier = Modifier.padding(top = 12.dp), content = content)
+    }
+}
+
+/** Row value for 연락처 이름 동기화: "오늘 08:12" / "어제 08:12" / "M/d HH:mm". */
+private fun syncTimeLabel(lastSyncedAt: Long?): String {
+    if (lastSyncedAt == null) return "미동기화"
+    val zone = ZoneId.systemDefault()
+    val at = Instant.ofEpochMilli(lastSyncedAt).atZone(zone)
+    val today = LocalDate.now(zone)
+    val time = at.format(DateTimeFormatter.ofPattern("HH:mm"))
+    return when (at.toLocalDate()) {
+        today -> "오늘 $time"
+        today.minusDays(1) -> "어제 $time"
+        else -> "${at.monthValue}/${at.dayOfMonth} $time"
+    }
+}
+
+/**
+ * Row value for 앱 업데이트. Idle reads as 최신: the auto check runs at launch
+ * and every 12h, and a found update moves the state out of Idle.
+ */
+private fun updateRowValue(state: UpdateUiState): String {
+    val suffix = when (state) {
+        is UpdateUiState.Idle -> "최신"
+        is UpdateUiState.Checking -> "확인 중"
+        is UpdateUiState.Failed -> "확인 실패"
+        else -> "업데이트 있음"
+    }
+    return "v${BuildConfig.VERSION_NAME} · $suffix"
+}
+
+@Composable
+private fun ContactSyncStatusText(status: ContactSyncStatus?) {
+    if (status == null) {
+        Caption("아직 동기화하지 않았습니다.")
+        return
+    }
+    val timestamp = remember(status.lastSyncedAt) {
+        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+            .format(Date(status.lastSyncedAt))
+    }
+    Caption(
+        "마지막 동기화: $timestamp · 연락처 번호 ${status.contactPhoneCount}개 · " +
+            "대화 ${status.matchedThreadCount}개 일치 · 서버 ${status.uploadedCount}건" +
+            if (status.failedUploadCount > 0) " · 실패 ${status.failedUploadCount}건" else "",
+    )
 }

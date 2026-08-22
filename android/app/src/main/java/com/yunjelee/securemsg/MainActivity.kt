@@ -27,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.yunjelee.securemsg.ui.LastOpened
 import com.yunjelee.securemsg.ui.LoginScreen
 import com.yunjelee.securemsg.ui.MainScreen
 import com.yunjelee.securemsg.ui.Sm
@@ -520,6 +521,11 @@ class MainActivity : ComponentActivity() {
                         Credentials.clear(this@MainActivity)
                         BlocklistSync.clear(this@MainActivity)
                         ContactSync.clearStatus(this@MainActivity)
+                        // Device-local prefs that are really per-account: a
+                        // different account signing in here must not inherit
+                        // the previous one's stars or read positions.
+                        Favorites.clear(this@MainActivity)
+                        LastOpened.clear(this@MainActivity)
                         AppDatabase.get(this@MainActivity).clearAllTables()
                         withContext(Dispatchers.Main) { localDeviceUsername = null }
                     }
