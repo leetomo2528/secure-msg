@@ -40,12 +40,14 @@ import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Star
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -63,6 +65,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -73,8 +76,11 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 
 /**
  * SecureMsg design tokens — light palette, mirroring the web app shell so the
@@ -946,6 +952,10 @@ fun SmBlockedChip(text: String) {
  * Conversation header: back, avatar, name/subtitle, search, optional overflow.
  * First element of the chat screen: it runs under the status bar and pads
  * that inset inside its surface (the artboard's 58dp = inset + 14dp).
+ *
+ * [moreMenu] is composed inside the ⋮ button's box so an [SmMenu] in it
+ * anchors to that button. The caller owns the open/closed state — the header
+ * has no idea what the menu contains or when an item closes it.
  */
 @Composable
 fun SmChatHeader(
@@ -954,6 +964,7 @@ fun SmChatHeader(
     onBack: () -> Unit,
     onSearch: () -> Unit,
     onMore: (() -> Unit)? = null,
+    moreMenu: @Composable () -> Unit = {},
 ) {
     Column(
         Modifier
@@ -1020,11 +1031,116 @@ fun SmChatHeader(
                         strokeWidth = 2.dp,
                         onClick = onMore,
                     )
+                    moreMenu()
                 }
             }
         }
         Hairline(Sm.ink.copy(alpha = 0.08f))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Overlays (overflow menu, confirmation)
+// ---------------------------------------------------------------------------
+
+/**
+ * Small overflow menu, anchored to the box it is composed in — put it next to
+ * the control that opens it (see [SmChatHeader]'s `moreMenu`).
+ *
+ * Deliberately a raw [Popup] rather than material3's `DropdownMenu`: this app
+ * never wraps its tree in a `MaterialTheme`, and 1.2.1's menu has no container
+ * colour parameter, so it would paint itself in the M3 baseline surface
+ * instead of [Sm.surface]. Popup + [cardSurface] keeps it on the token set and
+ * matches every other lifted surface in the app.
+ *
+ * `focusable` is what makes back and an outside tap dismiss it.
+ */
+@Composable
+fun SmMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    if (!expanded) return
+    // Clear the 36dp icon button the menu hangs off, plus a 6dp breath.
+    val dropBelow = with(LocalDensity.current) { 42.dp.roundToPx() }
+    Popup(
+        alignment = Alignment.TopEnd,
+        offset = IntOffset(0, dropBelow),
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true),
+    ) {
+        Column(
+            Modifier
+                .cardSurface(RoundedCornerShape(14.dp))
+                .widthIn(min = 180.dp)
+                .padding(vertical = 6.dp),
+            content = content,
+        )
+    }
+}
+
+/**
+ * One [SmMenu] row. 44dp minimum height so the target clears the
+ * accessibility floor even though the label is a single 13sp line;
+ * [textColor] carries destructive intent (`Sm.danger`).
+ */
+@Composable
+fun SmMenuItem(
+    text: String,
+    onClick: () -> Unit,
+    textColor: Color = Sm.text1,
+    enabled: Boolean = true,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            color = if (enabled) textColor else Sm.text4,
+            fontSize = 13.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * Destructive-action confirmation. material3's dialog draws itself from the
+ * (absent) `MaterialTheme`, so every colour it exposes is overridden here —
+ * the same overrides the login screen's forget-device dialog carries, kept in
+ * one place now that a second caller exists.
+ */
+@Composable
+fun SmConfirmDialog(
+    title: String,
+    body: String,
+    confirmLabel: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+    confirmColor: Color = Sm.danger,
+    dismissLabel: String = "취소",
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Sm.surface,
+        shape = RoundedCornerShape(16.dp),
+        titleContentColor = Sm.text1,
+        textContentColor = Sm.text3,
+        title = { Text(title) },
+        text = { Text(body, fontSize = 13.sp, lineHeight = 19.sp) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text(confirmLabel, color = confirmColor) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(dismissLabel, color = Sm.text3) }
+        },
+    )
 }
 
 /**

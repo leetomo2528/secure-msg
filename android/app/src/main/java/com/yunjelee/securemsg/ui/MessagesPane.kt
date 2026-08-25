@@ -55,11 +55,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
+import com.yunjelee.securemsg.BlockedSender
+import com.yunjelee.securemsg.BlocklistManager
+import com.yunjelee.securemsg.BlocklistSync
 import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.ConversationTargetResolver
 import com.yunjelee.securemsg.MessageRow
 import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PhoneNumberNormalizer
+import com.yunjelee.securemsg.SmsNotifier
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -159,6 +163,16 @@ fun ColumnScope.MessagesPane(
     // failed row in that thread, and leaving the composer up would only breed
     // duplicate failed rows per retry.
     var openAfterSend by remember { mutableStateOf<String?>(null) }
+    // Sender-block state for the open conversation, from the two sources
+    // BlocklistManager.evaluate reads: the Room rows and the prefs snapshot of
+    // rules this account added on its other devices. The DAO hands out a new
+    // Flow per call and collectAsState keys on the instance, so the remember
+    // is what stops the query re-running on every recomposition.
+    val blockedSenderRows by remember { db.blockedSenderDao().observeAll() }
+        .collectAsState(initial = emptyList())
+    var sharedRules by remember { mutableStateOf(BlocklistSync.load(context)) }
+    var moreMenuOpen by remember { mutableStateOf(false) }
+    var confirmBlockFor by remember { mutableStateOf<SmsThread?>(null) }
     val selectedMessageFlow = remember(selectedThread?.cid) {
         selectedThread?.let { db.messageDao().observeForCid(it.cid) } ?: flowOf(emptyList())
     }
@@ -180,6 +194,14 @@ fun ColumnScope.MessagesPane(
     // Re-read the wall clock whenever the data it labels changes, so "오늘"
     // cannot stay pinned across midnight for long.
     val clock = remember(threads, selectedMessages) { DayClock() }
+    val senderRules = remember(blockedSenderRows, sharedRules) {
+        senderRuleValues(blockedSenderRows, sharedRules)
+    }
+    // Only meaningful for the open conversation: the list and the composer have
+    // no single sender to judge, so this stays false there.
+    val selectedBlocked = remember(selectedThread?.phoneNumber, senderRules) {
+        selectedThread?.let { BlocklistManager.senderBlocked(it.phoneNumber, senderRules) } == true
+    }
 
     fun closeConversation() {
         selectedThread = null
@@ -187,6 +209,40 @@ fun ColumnScope.MessagesPane(
         sendNotice = null
         messageSearchQuery = ""
         messageSearchVisible = false
+        moreMenuOpen = false
+        confirmBlockFor = null
+    }
+
+    /**
+     * Runs a block/unblock through the same helpers 설정 uses, then re-reads
+     * both rule sources and checks what the sender's verdict actually became.
+     *
+     * The helpers swallow their own failures, and an unblock that could not
+     * reach the server leaves the account-wide rule standing — so without this
+     * check the menu would close, the header would still read 차단됨, and
+     * nothing on screen would explain why. Success stays silent: the header and
+     * the composer notice already move on their own.
+     */
+    fun changeSenderRule(phoneNumber: String, unblocking: Boolean, change: suspend () -> Unit) {
+        scope.launch(Dispatchers.IO) {
+            change()
+            val reloaded = BlocklistSync.load(context)
+            val stillBlocked = BlocklistManager.senderBlocked(
+                phoneNumber,
+                senderRuleValues(db.blockedSenderDao().getAll(), reloaded),
+            )
+            withContext(Dispatchers.Main) {
+                sharedRules = reloaded
+                sendNotice = if (stillBlocked == unblocking) {
+                    SendNotice(
+                        if (unblocking) UNBLOCK_FAILED else BLOCK_FAILED,
+                        failed = true,
+                    )
+                } else {
+                    null
+                }
+            }
+        }
     }
 
     // A notification can arrive before Room's thread Flow emits (cold process),
@@ -268,6 +324,33 @@ fun ColumnScope.MessagesPane(
         val at = maxOf(System.currentTimeMillis(), thread.lastActivityAt)
         lastOpened[thread.cid] = at
         LastOpened.set(context, thread.cid, at)
+        // Reading the thread is the read receipt for its notifications, whether
+        // it was reached from the shade or from this list. Left out, they pile
+        // up until the package hits the platform's active-notification cap, past
+        // which notify() drops new ones without a word. Keyed on lastActivityAt
+        // as well, so a message that lands while the thread is open is cleared
+        // too.
+        SmsNotifier.cancelConversation(context, thread.cid, thread.phoneNumber)
+    }
+
+    // Tell the notifier which conversation is on screen so an arrival in it is
+    // not announced over the top of itself; the dispose covers back, thread
+    // switching and this pane leaving the composition.
+    DisposableEffect(selectedThread?.cid, selectedThread?.phoneNumber) {
+        val thread = selectedThread
+        SmsNotifier.setVisibleConversation(thread?.cid, thread?.phoneNumber)
+        onDispose { SmsNotifier.setVisibleConversation(null, null) }
+    }
+
+    // The shared rules are a prefs snapshot, not a Flow, so re-read them when a
+    // conversation opens — otherwise a rule added on the web or another phone
+    // would not show here until this pane is recreated. Also drops an open menu
+    // if the thread underneath it is swapped (offline cid migration).
+    LaunchedEffect(selectedThread?.cid) {
+        moreMenuOpen = false
+        if (selectedThread == null) return@LaunchedEffect
+        val loaded = withContext(Dispatchers.IO) { BlocklistSync.load(context) }
+        sharedRules = loaded
     }
 
     val fullHeightView = state.fullHeightView
@@ -293,7 +376,26 @@ fun ColumnScope.MessagesPane(
         notice != null -> notice.text to (if (notice.failed) Sm.danger else Sm.text4)
         !smsRoleHeld -> "기본 SMS 앱으로 설정해야 보낼 수 있습니다." to Sm.warning
         !smsPermissionsGranted -> "SMS 권한이 필요합니다 — 설정에서 승인하세요." to Sm.warning
+        // Blocking is receive-side only (OutgoingSmsDispatcher never consults
+        // the blocklist). Say so rather than leaving a live send button next to
+        // a header that reads 차단됨.
+        selectedBlocked -> BLOCKED_SENDER_NOTICE to Sm.text4
         else -> null
+    }
+
+    confirmBlockFor?.let { target ->
+        SmConfirmDialog(
+            title = "이 번호 차단",
+            body = blockConfirmBody(target),
+            confirmLabel = "차단",
+            onConfirm = {
+                confirmBlockFor = null
+                changeSenderRule(target.phoneNumber, unblocking = false) {
+                    blockSenderFromChat(context, target.phoneNumber)
+                }
+            },
+            onDismiss = { confirmBlockFor = null },
+        )
     }
 
     Column(Modifier.fillMaxWidth().weight(1f)) {
@@ -349,13 +451,46 @@ fun ColumnScope.MessagesPane(
                     }
                 }
 
+                // An alphanumeric sender id cannot become a rule — 설정 validates
+                // new sender rules with this same pattern — so the ⋮ would open
+                // a menu whose only item does nothing. A thread already covered
+                // by a rule keeps it either way, or the block could not be lifted.
+                val ruleCandidate = remember(thread.phoneNumber) {
+                    SenderRulePattern.matches(PhoneNumberNormalizer.normalize(thread.phoneNumber))
+                }
                 SmChatHeader(
                     name = thread.displayName,
-                    subtitle = "SMS · ${thread.phoneNumber}",
+                    subtitle = "SMS · ${thread.phoneNumber}" + (if (selectedBlocked) " · 차단됨" else ""),
                     onBack = { closeConversation() },
                     onSearch = {
                         messageSearchVisible = !messageSearchVisible
                         if (!messageSearchVisible) messageSearchQuery = ""
+                    },
+                    onMore = if (selectedBlocked || ruleCandidate) ({ moreMenuOpen = true }) else null,
+                    moreMenu = {
+                        SmMenu(expanded = moreMenuOpen, onDismiss = { moreMenuOpen = false }) {
+                            if (selectedBlocked) {
+                                // Reversible and non-destructive: no confirmation.
+                                SmMenuItem(
+                                    text = "차단 해제",
+                                    onClick = {
+                                        moreMenuOpen = false
+                                        changeSenderRule(thread.phoneNumber, unblocking = true) {
+                                            unblockSenderFromChat(context, thread.phoneNumber, senderRules)
+                                        }
+                                    },
+                                )
+                            } else {
+                                SmMenuItem(
+                                    text = "이 번호 차단",
+                                    onClick = {
+                                        moreMenuOpen = false
+                                        confirmBlockFor = thread
+                                    },
+                                    textColor = Sm.danger,
+                                )
+                            }
+                        }
                     },
                 )
                 if (messageSearchVisible) {
@@ -666,6 +801,12 @@ private fun EmptyNote(text: String) {
 
 private const val SEND_FAILED = "SMS 발송 실패 — 번호·권한·메시지 길이를 확인하세요."
 private const val SEND_QUEUED = "SMS를 발송했고 동기화 대기열에 저장했습니다."
+private const val BLOCKED_SENDER_NOTICE =
+    "차단한 번호입니다 — 받는 문자는 격리되고, 보내기는 계속 가능합니다."
+private const val UNBLOCK_FAILED =
+    "차단 해제 실패 — 서버에 반영되지 않아 계속 차단됩니다. 연결 후 다시 시도하세요."
+private const val BLOCK_FAILED =
+    "차단 실패 — 규칙이 저장되지 않았습니다. 연결 후 다시 시도하세요."
 
 /** One line directly above [SmComposer]: a send result, or why sending is off. */
 @Composable
@@ -687,6 +828,69 @@ private fun Hairline(color: Color) {
 
 private fun samePhone(a: String, b: String): Boolean =
     PhoneNumberNormalizer.normalize(a) == PhoneNumberNormalizer.normalize(b)
+
+// ---------------------------------------------------------------------------
+// Sender block (chat overflow menu)
+// ---------------------------------------------------------------------------
+
+/** Every sender rule in force on this device — the two sources BlocklistManager.evaluate reads. */
+private fun senderRuleValues(
+    local: List<BlockedSender>,
+    shared: BlocklistSync.SharedRules,
+): List<String> = (local.map { it.phoneNumber } + shared.senders).distinct()
+
+/**
+ * Adds a sender rule exactly the way 설정 does, normalization included, so a
+ * number blocked from a chat and the same number blocked from 설정 produce one
+ * rule rather than two shapes of it.
+ */
+private suspend fun blockSenderFromChat(context: Context, phoneNumber: String) {
+    addBlockRule(context, "sender", PhoneNumberNormalizer.normalize(phoneNumber))
+}
+
+/**
+ * Removes every stored rule covering [phoneNumber].
+ *
+ * Removal is an exact-value comparison on both sides (the Room row is matched
+ * by `phoneNumber ==`, the server id is looked up under `"sender|$value"`), so
+ * handing it the normalized number would silently leave a legacy `010…` rule —
+ * which [BlocklistManager.senderMatches] still honours — behind, and the sender
+ * would stay blocked with the UI claiming otherwise.
+ */
+private suspend fun unblockSenderFromChat(
+    context: Context,
+    phoneNumber: String,
+    ruleValues: List<String>,
+) {
+    BlocklistManager.matchingSenderRules(phoneNumber, ruleValues)
+        .forEach { removeBlockRuleOnServer(context, "sender", it) }
+}
+
+/**
+ * Body of the block confirmation.
+ *
+ * It promises only what the code does. The web client re-applies sender rules
+ * to existing history on `blocklist_updated`, and its verdict is
+ * "sender-blocked conversation AND the message came through an android_gateway
+ * device" (useStore.ts) — which is every message this phone relayed, the user's
+ * own outgoing SMS included. So the copy says the conversation stays and its
+ * messages are masked, not that the conversation disappears, and it names the
+ * outgoing half explicitly: that asymmetry is invisible otherwise, and this
+ * dialog is the only place the user is told any of it.
+ */
+private fun blockConfirmBody(thread: SmsThread): String {
+    val who = if (thread.showsPhoneSubtitle) {
+        "${thread.displayName}(${thread.phoneNumber})"
+    } else {
+        thread.phoneNumber
+    }
+    return "$who 을(를) 차단합니다.\n\n" +
+        "앞으로 이 번호에서 오는 문자는 대화에 표시되지 않고 설정 › 격리된 스팸에 보관됩니다. " +
+        "보내기는 계속 가능합니다.\n\n" +
+        "차단 규칙은 이 계정의 모든 기기에 동기화됩니다. 웹에서는 이 대화가 목록에 그대로 남지만 " +
+        "기존 메시지가 '차단된 메시지'로 가려지며, 이 폰이 중계한 메시지가 대상이라 내가 폰에서 보낸 " +
+        "문자도 함께 가려집니다(웹에서 보낸 문자는 그대로 보입니다). 차단을 해제하면 다시 표시됩니다."
+}
 
 /** Row subtitle: the newest message on one line, or the number / "SMS" until one exists. */
 private fun snippet(thread: SmsThread, latest: MessageRow?): String = when {

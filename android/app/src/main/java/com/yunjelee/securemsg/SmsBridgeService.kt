@@ -20,6 +20,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -47,6 +48,13 @@ class SmsBridgeService : Service() {
     private var outboxLoop: Job? = null
     private val outboxLoopStarted = AtomicBoolean(false)
     private val sessionInvalidated = AtomicBoolean(false)
+    /**
+     * MMS id -> deferred retries already spent on it. Entries are never removed:
+     * the count *is* the "how often has this row been nudged" marker, and
+     * clearing an id would let a permanently malformed row reschedule itself
+     * forever.
+     */
+    private val mmsRetryAttempts = ConcurrentHashMap<Long, Int>()
 
     companion object {
         const val ACTION_INCOMING_SMS = "com.yunjelee.securemsg.INCOMING_SMS"
@@ -61,6 +69,14 @@ class SmsBridgeService : Service() {
         const val EXTRA_RECEIVED_AT = "received_at"
         private const val TAG = "SmsBridgeService"
         private const val CLAIM_RETRY_GRACE_MS = 30_000L
+        /**
+         * Backoff for a downloaded-but-not-ready MMS. Three tries spanning ~5
+         * minutes: long enough to outlast a slow part download on a weak data
+         * link, short enough that a row nobody can parse stops costing wakeups.
+         */
+        private val MMS_DEFER_RETRY_DELAYS_MS = longArrayOf(15_000L, 60_000L, 240_000L)
+        /** Ids tracked for deferred retry; a bound the provider cannot exceed in practice. */
+        private const val MMS_DEFER_TRACKED_MAX = 512
     }
 
     override fun onCreate() {
@@ -68,6 +84,12 @@ class SmsBridgeService : Service() {
         db = AppDatabase.get(this)
         incomingRepository = IncomingMessageRepository(db)
         BridgeNotifications.createChannel(this)
+        // Create the message channel up front so it is configurable in system
+        // settings before the first SMS, not only after one has arrived. The
+        // legacy-channel cleanup is a one-shot migration and belongs here rather
+        // than on the per-message path.
+        SmsNotifier.ensureChannel(this)
+        SmsNotifier.retireLegacyChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -99,7 +121,12 @@ class SmsBridgeService : Service() {
                 scope.launch {
                     try {
                         incomingMutex.withLock {
-                            handleIncomingSms(phone, body, providerId, receivedAt, providerEpoch)
+                            handleIncomingSms(
+                                phone, body, providerId, receivedAt, providerEpoch,
+                                // A broadcast delivered this one: live, whatever
+                                // timestamp the SMSC put on it.
+                                rescan = false,
+                            )
                         }
                         ensureBridgeReady()
                         flushOutbox()
@@ -151,7 +178,14 @@ class SmsBridgeService : Service() {
                 scope.launch {
                     try {
                         incomingMutex.withLock {
-                            if (id != null) processIncomingMms(id) else processRecentMms()
+                            // Both branches are live: MmsReceiver also routes a
+                            // WAP push with no content-location, and a failed
+                            // download, through the id-less sweep.
+                            if (id != null) {
+                                processIncomingMms(id, rescan = false)
+                            } else {
+                                processRecentMms(rescan = false)
+                            }
                         }
                         ensureBridgeReady()
                         flushOutbox()
@@ -167,7 +201,7 @@ class SmsBridgeService : Service() {
                         ensureBridgeReady()
                         incomingMutex.withLock {
                             importRecentInbox()
-                            processRecentMms()
+                            processRecentMms(rescan = true)
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Bridge startup sync failed", e)
@@ -271,7 +305,7 @@ class SmsBridgeService : Service() {
                         syncFromServer()
                         incomingMutex.withLock {
                             importRecentInbox()
-                            processRecentMms()
+                            processRecentMms(rescan = true)
                         }
                         flushOutbox()
                         flushReceiptStatuses()
@@ -353,13 +387,19 @@ class SmsBridgeService : Service() {
         return ServerConfig.url(this)
     }
 
-    /** Carrier SMS -> encrypted multi-device relay. */
+    /**
+     * Carrier SMS -> encrypted multi-device relay.
+     *
+     * @param rescan true when the row came from sweeping the provider rather than
+     *   from an SMS_DELIVER broadcast; see [IncomingNotificationPolicy.shouldNotify].
+     */
     private suspend fun handleIncomingSms(
         phone: String,
         body: String,
         providerId: Long? = null,
         receivedAt: Long = System.currentTimeMillis(),
         providerEpoch: Long = 0,
+        rescan: Boolean = true,
     ) {
         val content = RelayContentCodec.text(body)
         val identity = ProviderIdentity.snapshot(
@@ -397,7 +437,7 @@ class SmsBridgeService : Service() {
             return
         }
 
-        incomingRepository.persistCarrier(
+        val persisted = incomingRepository.persistCarrier(
             kind = ProviderIdentity.SMS,
             direction = "incoming_sms",
             phoneNumber = phone,
@@ -405,22 +445,54 @@ class SmsBridgeService : Service() {
             providerId = providerId,
             receivedAt = receivedAt,
         )
+        // Recovery notification. SmsReceiver normally notifies first and this call
+        // then sees newlyCreated = false, but when the broadcast coroutine dies
+        // before its Room transaction commits, this import is the only chance the
+        // message ever gets to reach the shade — and on that live path the age
+        // gate must not apply, or an SMS the carrier queued overnight lands in
+        // the thread with nothing announcing it.
+        persisted?.takeIf {
+            IncomingNotificationPolicy.shouldNotify(
+                rescan, it.newlyCreated, receivedAt, System.currentTimeMillis(),
+            )
+        }?.let { fresh ->
+            SmsNotifier.notifyIncoming(
+                context = this,
+                phoneNumber = fresh.conversation.normalizedPhone,
+                body = body,
+                date = receivedAt,
+                cid = fresh.conversation.cid,
+                messageIdentity = fresh.outbox.mid,
+                displayName = fresh.conversation.displayName,
+            )
+        }
         flushOutbox()
     }
 
-    private suspend fun processRecentMms() {
-        MmsRowProcessor.process(MmsProvider.recentInbox(this), ::processIncomingMms) { id, error ->
+    private suspend fun processRecentMms(rescan: Boolean) {
+        MmsRowProcessor.process(
+            MmsProvider.recentInbox(this),
+            { id -> processIncomingMms(id, rescan) },
+        ) { id, error ->
             Log.e(TAG, "failed to process recent MMS id=$id; continuing", error)
         }
     }
 
-    private suspend fun processIncomingMms(id: Long) {
+    /**
+     * @param rescan true when the row was found by a startup/reconnect sweep
+     *   rather than by a receiver broadcast, which makes the message eligible for
+     *   the age gate in [IncomingNotificationPolicy.shouldNotifyRescan]. A
+     *   deferred retry keeps the flag of the call that scheduled it, so an MMS
+     *   whose parts take minutes to land still notifies as the live message it is.
+     */
+    private suspend fun processIncomingMms(id: Long, rescan: Boolean) {
         val mms = MmsProvider.read(this, id)
         if (!IncomingMmsPolicy.isReady(mms)) {
             // The platform may expose the inbox row before its address and
             // parts finish downloading. Leave it unprocessed so a later
             // receiver event or startup scan can retry without losing it.
             Log.i(TAG, "MMS not ready; deferring id=$id")
+            scheduleDeferredMmsRetry(id, rescan)
             return
         }
         checkNotNull(mms)
@@ -471,17 +543,57 @@ class SmsBridgeService : Service() {
             providerId = id,
             receivedAt = mms.date,
         )
-        if (persisted?.newlyCreated == true) {
+        // A logout clears the processed-MMS ledger, so without the age gate the
+        // next startup sweep would re-notify every inbox row it can still see.
+        persisted?.takeIf {
+            IncomingNotificationPolicy.shouldNotify(
+                rescan, it.newlyCreated, mms.date, System.currentTimeMillis(),
+            )
+        }?.let { fresh ->
             SmsNotifier.notifyIncoming(
                 context = this,
-                phoneNumber = persisted.conversation.normalizedPhone,
+                phoneNumber = fresh.conversation.normalizedPhone,
                 body = IncomingNotificationPolicy.preview(content),
                 date = mms.date,
-                cid = persisted.conversation.cid,
-                messageIdentity = persisted.outbox.mid,
+                cid = fresh.conversation.cid,
+                messageIdentity = fresh.outbox.mid,
+                displayName = fresh.conversation.displayName,
             )
         }
         flushOutbox()
+    }
+
+    /**
+     * Nudges a deferred MMS a few times with backoff.
+     *
+     * A row that is not ready yet otherwise waits for the next receiver event or
+     * app start — potentially forever, and the sweep that finally finds it is a
+     * rescan, so an MMS deferred at 23:30 and rediscovered at 09:00 would be
+     * filed into the thread with no notification at all. Retrying keeps it on the
+     * live path until the parts land, while the attempt cap keeps a permanently
+     * malformed row from spinning the service. [processRecentMms] remains the
+     * backstop for anything this misses.
+     */
+    private fun scheduleDeferredMmsRetry(id: Long, rescan: Boolean) {
+        // Callers hold incomingMutex, so read-modify-write here needs no CAS.
+        val spent = mmsRetryAttempts[id] ?: 0
+        if (spent >= MMS_DEFER_RETRY_DELAYS_MS.size) return
+        if (spent == 0 && mmsRetryAttempts.size >= MMS_DEFER_TRACKED_MAX) {
+            Log.w(TAG, "deferred MMS retry table full; leaving id=$id to the next sweep")
+            return
+        }
+        mmsRetryAttempts[id] = spent + 1
+        scope.launch {
+            delay(MMS_DEFER_RETRY_DELAYS_MS[spent])
+            try {
+                // processIncomingMms flushes the outbox itself on success.
+                incomingMutex.withLock { processIncomingMms(id, rescan) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "deferred MMS retry failed id=$id", e)
+            }
+        }
     }
 
     private suspend fun flushOutbox() {
@@ -1309,7 +1421,10 @@ class SmsBridgeService : Service() {
                 RelayContentCodec.encode(content),
             )
             if (!db.processedSmsDao().contains(identity.epoch, sms.id)) {
-                handleIncomingSms(sms.address, sms.body, sms.id, sms.date, identity.epoch)
+                handleIncomingSms(
+                    sms.address, sms.body, sms.id, sms.date, identity.epoch,
+                    rescan = true,
+                )
             }
         }
     }

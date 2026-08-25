@@ -68,6 +68,8 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         smsPermissionsGranted = hasSmsPerms()
+        // Safe to ask now: the SMS permission dialog has already closed.
+        requestNotificationPermission()
         if (isDefaultSmsApp() && smsPermissionsGranted) startBridgeService()
     }
 
@@ -83,8 +85,15 @@ class MainActivity : ComponentActivity() {
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
         if (smsRoleHeld && !smsPermissionsGranted) {
+            // The SMS permission dialog goes first; the notification prompt is
+            // chained off its result because the framework rejects a second
+            // permission request while one is still in flight.
             requestPerms()
         } else if (smsRoleHeld) {
+            // Becoming the default SMS app is the moment notifications start
+            // mattering, so a user who dismissed the startup prompt gets a
+            // second, contextual chance here.
+            requestNotificationPermission()
             startBridgeService()
         }
     }
@@ -125,6 +134,19 @@ class MainActivity : ComponentActivity() {
 
     private fun isDefaultSmsApp(): Boolean {
         return getSystemService(RoleManager::class.java).isRoleHeld(RoleManager.ROLE_SMS)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // An open conversation only suppresses its own notifications while it is
+        // actually on screen; a message arriving after the app is backgrounded
+        // must alert as usual.
+        SmsNotifier.setAppForeground(true)
+    }
+
+    override fun onStop() {
+        SmsNotifier.setAppForeground(false)
+        super.onStop()
     }
 
     override fun onResume() {
@@ -415,6 +437,10 @@ class MainActivity : ComponentActivity() {
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
         notificationPermissionGranted = hasNotificationPermission()
+        // A messaging app that never asks is a messaging app that never notifies:
+        // until now this was only reachable from a settings card the user had to
+        // find on their own.
+        requestNotificationPermission()
 
         lifecycleScope.launch(Dispatchers.IO) { updater.cleanupDownloads() }
 
@@ -653,6 +679,10 @@ class MainActivity : ComponentActivity() {
             ?.takeIf { it.isNotBlank() }
             ?: intent.data?.lastPathSegment.orEmpty()
         if (cid == null && phone.isBlank()) return
+        // Opening the conversation is the read receipt for its notifications.
+        // Without this they accumulate until the package hits the platform's
+        // active-notification cap, past which notify() silently drops new ones.
+        SmsNotifier.cancelConversation(this, cid, phone)
         conversationTarget = ConversationTarget(cid, phone, requestId)
         // Importing the provider and flushing an already-persisted outbox are safe
         // to repeat on a cold start and on every singleTask onNewIntent delivery.

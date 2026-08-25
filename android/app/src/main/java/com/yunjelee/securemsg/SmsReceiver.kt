@@ -32,9 +32,18 @@ class SmsReceiver : BroadcastReceiver() {
 
                 val sender = msgs[0].displayOriginatingAddress
                     ?: msgs[0].originatingAddress
-                    ?: return@launch
+                if (sender == null) {
+                    Log.w("SmsReceiver", "SMS_DELIVER carried no originating address; dropped")
+                    return@launch
+                }
                 val body = msgs.joinToString("") { it.displayMessageBody ?: it.messageBody ?: "" }
-                if (body.isBlank()) return@launch
+                if (body.isBlank()) {
+                    Log.w(
+                        "SmsReceiver",
+                        "SMS_DELIVER body was blank from ${PhoneNumberNormalizer.redact(sender)}; dropped",
+                    )
+                    return@launch
+                }
                 val receivedAt = msgs.maxOfOrNull { it.timestampMillis }
                     ?.takeIf { it > 0 } ?: System.currentTimeMillis()
                 val db = try {
@@ -100,6 +109,16 @@ class SmsReceiver : BroadcastReceiver() {
                         date = receivedAt,
                         cid = persisted.conversation.cid,
                         messageIdentity = persisted.outbox.mid,
+                        displayName = persisted.conversation.displayName,
+                    )
+                } else {
+                    // The message is stored either way; only the notification is
+                    // skipped. Logged because a silent skip here is the signature
+                    // of a bridge-import race or a same-second duplicate event.
+                    Log.i(
+                        "SmsReceiver",
+                        "SMS not notified (already claimed) from " +
+                            "${PhoneNumberNormalizer.redact(sender)}; persisted=${persisted != null}",
                     )
                 }
                 Log.i(

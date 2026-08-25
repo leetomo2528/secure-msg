@@ -226,12 +226,40 @@ object BlocklistSync {
             }
         }
 
-    /** Remove local/server copies and refresh as one serialized operation. */
-    suspend fun removeShared(context: Context, api: RelayApi, type: String, value: String) =
+    /**
+     * Remove local/server copies and refresh as one serialized operation.
+     *
+     * The server copy goes first and the local row only follows once the server
+     * accepted the deletion. Deleting locally first meant an offline unblock
+     * dropped the Room row while the account-wide rule stayed on the server, so
+     * the next sync pulled it straight back — a sender the user had "unblocked"
+     * stayed blocked, now attributed to another device, with nothing on screen
+     * saying the attempt had failed.
+     *
+     * @return true when the rule is gone, false when the server still holds it.
+     */
+    suspend fun removeShared(context: Context, api: RelayApi, type: String, value: String): Boolean =
         operationMutex.withLock {
+            val serverId = load(context).ids["$type|$value"]
+            if (serverId != null) {
+                val resp = try {
+                    api.removeBlockRule(serverId)
+                } catch (e: Exception) {
+                    Log.w(TAG, "shared block rule removal failed", e)
+                    return@withLock false
+                }
+                if (!resp.optBoolean("ok")) {
+                    Log.w(TAG, "shared block rule removal rejected: ${resp.optString("error")}")
+                    return@withLock false
+                }
+            }
             deleteLocal(context, type, value)
-            load(context).ids["$type|$value"]?.let { api.removeBlockRule(it) }
+            // The cache is the other half of what BlocklistManager reads, and a
+            // failed re-sync (offline right after the delete landed) must not
+            // leave the rule in force behind the UI's back.
+            forgetCachedRule(context, type, value)
             syncLocked(context, api)
+            true
         }
 
     /** Serialize an offline-only deletion against any sync already in flight. */

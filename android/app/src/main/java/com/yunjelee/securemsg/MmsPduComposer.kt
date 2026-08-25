@@ -35,11 +35,18 @@ object MmsPduComposer {
     private const val AUDIO_AMR = 0x23
     private const val VIDEO_3GPP = 0x24
 
+    private const val P_CHARSET = 0x81
     private const val P_DEP_NAME = 0x85
     private const val P_DEP_START = 0x8A
     private const val P_CT_MR_TYPE = 0x89
     private const val P_CONTENT_ID = 0xC0
     private const val P_CONTENT_LOCATION = 0x8E
+
+    /** IANA MIBenum for UTF-8 — the charset every string here is encoded with. */
+    private const val CHARSET_UTF_8 = 106
+
+    /** WSP 8.4.2.1 Quote; prefixes a Text-string whose first octet is >= 128. */
+    private const val QUOTE = 0x7F
 
     fun compose(
         from: String,
@@ -49,7 +56,15 @@ object MmsPduComposer {
         attachments: List<RelayAttachment>,
     ): ByteArray {
         val parts = mutableListOf<Pair<ByteArray, ByteArray>>()
-        parts += part("text/plain", "text.txt", text.toByteArray(StandardCharsets.UTF_8), "text")
+        parts += part(
+            "text/plain",
+            "text.txt",
+            text.toByteArray(StandardCharsets.UTF_8),
+            "text",
+            // The only part whose bytes this class encodes, so the only part
+            // whose charset it can honestly declare.
+            charset = CHARSET_UTF_8,
+        )
         attachments.forEachIndexed { index, attachment ->
             parts += part(
                 attachment.contentType,
@@ -100,11 +115,19 @@ object MmsPduComposer {
         return out.toByteArray()
     }
 
+    /**
+     * @param charset MIBenum to declare in the Content-Type, or null for none.
+     *   Only ever set for a part composed here: an attachment arrives as opaque
+     *   bytes (a forwarded EUC-KR .csv still has a text media type), and UTF-8
+     *   declared over bytes that are not UTF-8 is worse than declaring nothing,
+     *   which at least leaves the receiver free to guess.
+     */
     private fun part(
         contentType: String,
         name: String,
         data: ByteArray,
         contentId: String,
+        charset: Int? = null,
     ): Pair<ByteArray, ByteArray> {
         val safeName = sanitizeName(name)
         val safeContentId = contentId.replace(Regex("[^A-Za-z0-9._-]"), "_").take(80)
@@ -115,6 +138,13 @@ object MmsPduComposer {
         val token = contentTypeToken(safeContentType)
         if (token != null) appendShortInteger(contentTypeValue, token) else {
             appendText(contentTypeValue, safeContentType.take(120))
+        }
+        // A text/* part with no charset parameter is us-ascii per WAP-230-WSP,
+        // so a receiving stack that follows the spec renders the UTF-8 bytes
+        // compose() writes as mojibake. Binary parts carry no charset.
+        if (charset != null && safeContentType.startsWith("text/", ignoreCase = true)) {
+            contentTypeValue.write(P_CHARSET)
+            appendShortInteger(contentTypeValue, charset)
         }
         contentTypeValue.write(P_DEP_NAME)
         appendText(contentTypeValue, safeName)
@@ -178,18 +208,21 @@ object MmsPduComposer {
 
     private fun appendText(out: ByteArrayOutputStream, value: String) {
         val bytes = value.toByteArray(StandardCharsets.UTF_8)
-        // WSP 8.4.2.1: a Text-value whose first character is in the range
-        // 128-255 must be prefixed with the escape character 0x1B. This is
-        // the common case for Korean subjects and file names.
-        if (bytes.isNotEmpty() && (bytes[0].toInt() and 0xff) > 127) out.write(0x1B)
+        // WSP 8.4.2.1: a Text-string whose first octet is in the range 128-255
+        // must be prefixed with Quote so the parser does not mistake it for a
+        // well-known value. This is the common case for Korean subjects and
+        // file names. AOSP's PduParser consumes only Quote here, so any other
+        // escape octet survives decoding as a stray control character glued to
+        // the front of the text.
+        if (bytes.isNotEmpty() && (bytes[0].toInt() and 0xff) > 127) out.write(QUOTE)
         out.write(bytes)
         out.write(0)
     }
 
     private fun appendEncodedString(out: ByteArrayOutputStream, value: String) {
         val encoded = ByteArrayOutputStream()
-        // UTF-8 is MIBenum 106, encoded as a WSP short-integer.
-        appendShortInteger(encoded, 106)
+        // The charset is encoded as a WSP short-integer.
+        appendShortInteger(encoded, CHARSET_UTF_8)
         appendText(encoded, value)
         appendValueLength(out, encoded.size())
         out.write(encoded.toByteArray())

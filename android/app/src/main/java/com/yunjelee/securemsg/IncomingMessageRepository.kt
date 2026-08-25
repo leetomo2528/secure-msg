@@ -93,7 +93,13 @@ class IncomingMessageRepository(
             )
             val outbox = db.relayOutboxDao().getByMid(mid)
                 ?: error("missing incoming outbox row id=$outboxId")
-            Persisted(outbox, ConversationTarget(thread.cid, phone), newlyCreated = true)
+            Persisted(
+                outbox,
+                // The thread is already in hand here, so the notification title can
+                // be the contact name instead of the raw E.164 address.
+                ConversationTarget(thread.cid, phone, displayName = thread.displayName),
+                newlyCreated = true,
+            )
         }
     }
 
@@ -194,6 +200,13 @@ data class ConversationTarget(
     val normalizedPhone: String,
     /** Distinguishes repeated taps/messages that target the same conversation. */
     val requestId: String = "",
+    /**
+     * Resolved contact name for the notification title, when the caller already
+     * held the thread. Optional on purpose: the paths that reuse an existing
+     * conversation report `newlyCreated = false` and never notify, so making them
+     * pay for a name lookup would only lengthen the broadcast transaction.
+     */
+    val displayName: String? = null,
 )
 
 object ConversationTargetResolver {

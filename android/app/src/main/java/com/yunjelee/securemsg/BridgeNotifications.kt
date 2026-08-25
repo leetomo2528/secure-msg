@@ -33,7 +33,7 @@ object BridgeNotifications {
         return Notification.Builder(context, CHANNEL_ID)
             .setContentTitle("SecureMsg SMS Bridge")
             .setContentText("다기기 SMS 동기화 활성")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_stat_message)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()

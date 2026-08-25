@@ -111,18 +111,25 @@ internal suspend fun addBlockRule(context: Context, type: String, value: String)
     }
 }
 
-/** Remove a local/shared block rule as one serialized operation (IO). */
-internal suspend fun removeBlockRuleOnServer(context: Context, type: String, value: String) {
-    try {
+/**
+ * Remove a local/shared block rule as one serialized operation (IO).
+ *
+ * @return true when the rule is gone; false when the account-wide copy survived
+ *   (offline, or the server refused), so a caller can say so instead of showing
+ *   an unblock that did not happen.
+ */
+internal suspend fun removeBlockRuleOnServer(context: Context, type: String, value: String): Boolean {
+    return try {
         val saved = Credentials.load(context)
         if (saved == null) {
             BlocklistSync.removeLocal(context, type, value)
-            return
+            return true
         }
         val api = RelayApi(ServerConfig.url(context)).also { it.token = saved.token }
         BlocklistSync.removeShared(context, api, type, value)
     } catch (e: Exception) {
         Log.w("SettingsPane", "block rule remove failed", e)
+        false
     }
 }
 
@@ -130,7 +137,7 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
 private enum class SettingsRow { Quarantine, BlockedSenders, ContactSync, Update }
 
 /** Sender rules are validated the same way the dispatcher validates recipients. */
-private val SenderRulePattern = Regex("^\\+?[0-9*#]{3,24}$")
+internal val SenderRulePattern = Regex("^\\+?[0-9*#]{3,24}$")
 
 /**
  * "설정" tab: device security, block keywords, then a row-list (quarantined

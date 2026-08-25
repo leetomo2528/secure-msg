@@ -55,6 +55,27 @@ object BlocklistManager {
     fun senderMatches(incoming: String, blocked: String): Boolean =
         SenderMatcher.matches(incoming, blocked)
 
+    /**
+     * The stored rule values that cover [phoneNumber], as they are stored.
+     *
+     * Removal compares rule values exactly — BlocklistSync deletes the Room row
+     * whose `phoneNumber ==` the value and looks the server id up under
+     * `"sender|$value"` — so an unblock must be driven by these originals. A
+     * normalized `+8210…` would leave a legacy `010…` rule (still matched by
+     * [senderMatches]) in place and the sender would stay blocked.
+     *
+     * Pure: no Android dependency, so the UI can call it on any thread.
+     */
+    fun matchingSenderRules(phoneNumber: String, ruleValues: List<String>): List<String> {
+        val normalized = PhoneNumberNormalizer.normalize(phoneNumber)
+        if (normalized.isBlank()) return emptyList()
+        return ruleValues.filter { senderMatches(normalized, it) }.distinct()
+    }
+
+    /** UI-side sender verdict. Same matcher as [evaluate], so the two cannot drift. */
+    fun senderBlocked(phoneNumber: String, ruleValues: List<String>): Boolean =
+        matchingSenderRules(phoneNumber, ruleValues).isNotEmpty()
+
     suspend fun shouldBlock(plaintext: String, db: AppDatabase): Boolean {
         return evaluate("", plaintext, db).blocked
     }
