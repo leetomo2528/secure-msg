@@ -464,6 +464,9 @@ class SmsBridgeService : Service() {
                 cid = fresh.conversation.cid,
                 messageIdentity = fresh.outbox.mid,
                 displayName = fresh.conversation.displayName,
+                // A sweep import must not banner: dozens at once is what gets
+                // the HIGH channel demoted to silent by adaptive notifications.
+                liveAlert = !rescan,
             )
         }
         flushOutbox()
@@ -558,6 +561,9 @@ class SmsBridgeService : Service() {
                 cid = fresh.conversation.cid,
                 messageIdentity = fresh.outbox.mid,
                 displayName = fresh.conversation.displayName,
+                // A sweep import must not banner: dozens at once is what gets
+                // the HIGH channel demoted to silent by adaptive notifications.
+                liveAlert = !rescan,
             )
         }
         flushOutbox()

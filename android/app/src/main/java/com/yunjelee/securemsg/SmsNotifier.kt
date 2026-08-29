@@ -35,9 +35,30 @@ object SmsNotifier {
      * therefore stuck on IMPORTANCE_DEFAULT (no heads-up banner) and a new channel
      * id is the only way to lift it off. Keep this id stable from now on.
      */
-    private const val CHANNEL_ID = "securemsg_sms_v2"
-    private const val LEGACY_CHANNEL_ID = "securemsg_sms"
+    private const val CHANNEL_ID = "securemsg_sms_v3"
+
+    /**
+     * Catch-up channel for startup/reconnect sweeps. IMPORTANCE_LOW on purpose:
+     * a sweep can legitimately post dozens of notifications at once, and doing
+     * that on the HIGH channel is exactly the burst that makes One UI's
+     * adaptive notifications demote the channel to silent — a demotion the app
+     * can never undo. Swept messages appear in the shade; only live arrivals
+     * may banner.
+     */
+    private const val CATCHUP_CHANNEL_ID = "securemsg_sms_catchup"
+
+    /**
+     * v1 shipped IMPORTANCE_DEFAULT; v2 was HIGH but its first-login sweep
+     * burst plausibly got it demoted to silent on real devices (user-locked,
+     * irrecoverable in code). With sweeps moved to the catch-up channel the
+     * burst input is gone, so v3 starts clean. Keep this id stable from now on.
+     */
+    private val RETIRED_CHANNEL_IDS = listOf("securemsg_sms", "securemsg_sms_v2")
     private const val TAG = "SmsNotifier"
+
+    /** ensureChannel is called on the hot receive path; skip the binder round trip after the first. */
+    @Volatile
+    private var channelsEnsured = false
 
     /** Conversation notifications are distinguished by tag; ids only separate roles. */
     private const val MESSAGE_ID = 1
@@ -87,6 +108,7 @@ object SmsNotifier {
      * importance, sound or bubble behaviour.
      */
     fun ensureChannel(context: Context) {
+        if (channelsEnsured) return
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         manager.createNotificationChannel(
             NotificationChannel(
@@ -100,7 +122,24 @@ object SmsNotifier {
                 setAllowBubbles(true)
             },
         )
+        manager.createNotificationChannel(
+            NotificationChannel(
+                CATCHUP_CHANNEL_ID,
+                "놓친 메시지",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "재시작·재연결 시 가져온 지난 메시지"
+                setShowBadge(true)
+            },
+        )
+        channelsEnsured = true
     }
+
+    /** System notification settings for the live-message channel. */
+    fun channelSettingsIntent(context: Context): Intent =
+        Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+            .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, CHANNEL_ID)
 
     /**
      * Retires the pre-v2 channel; leaving it behind puts a dead entry in the
@@ -113,7 +152,7 @@ object SmsNotifier {
      */
     fun retireLegacyChannel(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        manager.deleteNotificationChannel(LEGACY_CHANNEL_ID)
+        RETIRED_CHANNEL_IDS.forEach { manager.deleteNotificationChannel(it) }
     }
 
     /**
@@ -131,7 +170,8 @@ object SmsNotifier {
         }
     }
 
-    /** Activity onStart/onStop: an open conversation only counts while visible. */
+    /** Activity onResume/onPause: an open conversation only counts while it is
+     * actually in front — split-screen/paused must not swallow its alerts. */
     fun setAppForeground(foreground: Boolean) {
         appForeground = foreground
     }
@@ -144,6 +184,7 @@ object SmsNotifier {
         cid: String? = null,
         messageIdentity: String = "$phoneNumber:$date",
         displayName: String? = null,
+        liveAlert: Boolean = true,
     ) {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
                 context, Manifest.permission.POST_NOTIFICATIONS,
@@ -159,7 +200,9 @@ object SmsNotifier {
         ensureChannel(context)
 
         val normalizedPhone = PhoneNumberNormalizer.normalize(phoneNumber)
-        val title = displayName?.takeIf { it.isNotBlank() } ?: phoneNumber
+        // MessagingStyle rejects a blank Person name; a cid-only edge case can
+        // reach here with an empty number.
+        val title = (displayName?.takeIf { it.isNotBlank() } ?: phoneNumber).ifBlank { "알 수 없는 발신자" }
         val requestId = messageIdentity.ifBlank { "$normalizedPhone:$date" }
         val group = IncomingNotificationPolicy.conversationGroup(cid, normalizedPhone)
         // The user is already reading this conversation; the message is on screen
@@ -182,8 +225,10 @@ object SmsNotifier {
         val tag = group.ifEmpty { requestId }
         // Read once, before building: the call records that this conversation
         // has alerted, and doing it inside the chain would hide that.
-        val alerting = shouldAlert(tag)
-        val builder = Notification.Builder(context, CHANNEL_ID)
+        // A sweep import never claims an alert slot: it posts on the silent
+        // catch-up channel and leaves the cooldown ledger to live arrivals.
+        val alerting = liveAlert && shouldAlert(tag)
+        val builder = Notification.Builder(context, if (liveAlert) CHANNEL_ID else CATCHUP_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_message)
             .setContentTitle(title)
             .setContentText(body)
@@ -199,7 +244,9 @@ object SmsNotifier {
             .setAutoCancel(true)
             .setOnlyAlertOnce(!alerting)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
-        if (group.isNotEmpty()) builder.setGroup(group)
+        // No setGroup: the tag already keeps one notification per conversation,
+        // so every group would have exactly one child and no summary — dead
+        // weight on AOSP and a bundling wildcard on One UI.
 
         manager.notify(tag, MESSAGE_ID, builder.build())
     }
@@ -226,7 +273,7 @@ object SmsNotifier {
         activeNotifications(manager).forEach { posted ->
             // The foreground notification carries no tag and a different channel.
             val tag = posted.tag ?: return@forEach
-            if (posted.notification.channelId != CHANNEL_ID) return@forEach
+            if (posted.notification.channelId !in setOf(CHANNEL_ID, CATCHUP_CHANNEL_ID)) return@forEach
             if (posted.notification.group != group) return@forEach
             manager.cancel(tag, posted.id)
         }

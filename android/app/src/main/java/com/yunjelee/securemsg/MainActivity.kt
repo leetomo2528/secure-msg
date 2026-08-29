@@ -138,19 +138,21 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        // An open conversation only suppresses its own notifications while it is
-        // actually on screen; a message arriving after the app is backgrounded
-        // must alert as usual.
-        SmsNotifier.setAppForeground(true)
     }
 
-    override fun onStop() {
+    override fun onPause() {
+        // onPause, not onStop: in split-screen the activity is started but not
+        // in front, and treating that as "on screen" swallowed the alerts of
+        // the visible conversation entirely.
         SmsNotifier.setAppForeground(false)
-        super.onStop()
+        super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
+        // An open conversation only suppresses its own notifications while it
+        // is actually in front; see onPause.
+        SmsNotifier.setAppForeground(true)
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
         notificationPermissionGranted = hasNotificationPermission()
@@ -165,6 +167,33 @@ class MainActivity : ComponentActivity() {
         ) {
             pendingInstallFile = pending.file
             startInstall(pending.info, pending.file)
+        }
+        // Returning from the legacy installer (or a confirm dialog) via recents
+        // never recreates this singleTask activity, so onCreate's reconciliation
+        // does not run again. Success is the only verdict allowed here: marking
+        // a failure while the installer might still be up on screen would race
+        // its own callback.
+        if (pending != null &&
+            (pending.state == PendingInstallState.SESSION_SUBMITTED ||
+                pending.state == PendingInstallState.FALLBACK_LAUNCHED)
+        ) {
+            val packageUpdatedAt = try {
+                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+            } catch (_: PackageManager.NameNotFoundException) {
+                0L
+            }
+            if (UpdateValidation.installedTargetSatisfied(
+                    pending.info.versionName,
+                    BuildConfig.VERSION_NAME,
+                    packageUpdatedAt,
+                    pending.file.lastModified(),
+                )
+            ) {
+                pending.file.delete()
+                updater.clearPendingUpdate()
+                pendingInstallFile = null
+                updateState = UpdateUiState.Idle
+            }
         }
     }
 
@@ -328,6 +357,13 @@ class MainActivity : ComponentActivity() {
             InstallResults.FAILURE,
         )
         if (status == InstallResults.PENDING_USER_ACTION) {
+            if (persisted.state != PendingInstallState.SESSION_SUBMITTED) {
+                // Activity recreation redelivers the original result intent; a
+                // confirm intent for a session that is no longer submitted is a
+                // stale replay, and launching it opens a dead installer page.
+                Log.w("MainActivity", "Ignoring stale PENDING_USER_ACTION replay")
+                return
+            }
             val confirmation = installConfirmationIntent(intent)
             if (confirmation != null) {
                 try {
@@ -458,7 +494,9 @@ class MainActivity : ComponentActivity() {
         } catch (_: PackageManager.NameNotFoundException) {
             0L
         }
-        if (pending.state == PendingInstallState.SESSION_SUBMITTED &&
+        val handedOff = pending.state == PendingInstallState.SESSION_SUBMITTED ||
+            pending.state == PendingInstallState.FALLBACK_LAUNCHED
+        if (handedOff &&
             UpdateValidation.installedTargetSatisfied(
                 pending.info.versionName,
                 BuildConfig.VERSION_NAME,
@@ -470,6 +508,21 @@ class MainActivity : ComponentActivity() {
             updater.clearPendingUpdate()
             pendingInstallFile = null
             updateState = UpdateUiState.Idle
+            return
+        }
+        if (pending.state == PendingInstallState.SESSION_SUBMITTED) {
+            // Reaching onCreate means the process that submitted the session is
+            // gone, and a dead process cannot receive its callback — whatever
+            // happened, "waiting" is over. This state used to be restored as a
+            // buttonless banner that also gated every update check: the exact
+            // trap of issue #5. Convert it to a failure the user can act on.
+            updater.setPendingInstallState(PendingInstallState.FAILED)
+            pendingInstallFile = pending.file
+            updateState = UpdateUiState.InstallBlocked(
+                pending.info,
+                pending.file,
+                "시스템 설치가 확인되지 않았습니다. 재시도하거나 닫은 뒤 다시 업데이트할 수 있습니다.",
+            )
             return
         }
         pendingInstallFile = pending.file

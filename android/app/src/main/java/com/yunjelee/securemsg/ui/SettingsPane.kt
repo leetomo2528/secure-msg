@@ -86,6 +86,7 @@ import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.RelayTrustedDeviceApi
 import com.yunjelee.securemsg.SavedCredentials
 import com.yunjelee.securemsg.ServerConfig
+import com.yunjelee.securemsg.SmsNotifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -399,6 +400,23 @@ fun SettingsPane(
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
+        }
+
+        SmCard {
+            SectionTitle("알림 팝업")
+            Caption(
+                "알림이 오는데 배너로 안 뜬다면 시스템이 채널을 무음으로 내렸거나 " +
+                    "One UI의 '알림 팝업 스타일'이 '간단히'로 설정된 경우입니다. " +
+                    "아래에서 '메시지 수신' 채널의 중요도가 '높음'인지 확인하세요.",
+            )
+            SmGhostButton(
+                text = "시스템 알림 설정 열기",
+                onClick = {
+                    runCatching { context.startActivity(SmsNotifier.channelSettingsIntent(context)) }
+                        .onFailure { Log.w("SettingsPane", "channel settings unavailable", it) }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
 
         SmCard {
