@@ -328,6 +328,10 @@ export class Api {
       username, email, challenge_id: challengeId, code, pw_hash: pwHash,
     });
   }
+  /** Sliding session renewal; the store applies the returned token. */
+  tokenRefresh(): Promise<ApiResult & { token?: string }> {
+    return this.post("/token-refresh", {});
+  }
   /** Invalidate the current bearer token without recursively firing onUnauthorized. */
   logout(): Promise<ApiResult> {
     return this.request("/logout", { method: "POST", body: JSON.stringify({}) }, false);

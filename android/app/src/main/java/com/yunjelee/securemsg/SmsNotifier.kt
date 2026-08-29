@@ -252,6 +252,38 @@ object SmsNotifier {
     }
 
     /**
+     * The bridge's auth was rejected (token expired or device revoked) and
+     * message sync has STOPPED. Silence here cost a day of dead sync once;
+     * this is deliberately a plain, loud, tap-to-reopen notification.
+     */
+    fun notifySessionExpired(context: Context) {
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "session expired but POST_NOTIFICATIONS is not granted")
+            return
+        }
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        ensureChannel(context)
+        val intent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pendingIntent = PendingIntent.getActivity(
+            context, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_message)
+            .setContentTitle("문자 동기화가 중단되었습니다")
+            .setContentText("로그인이 만료되었습니다. 앱을 열어 다시 로그인하세요.")
+            .setCategory(Notification.CATEGORY_ERROR)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+        manager.notify("session_expired", MESSAGE_ID, notification)
+    }
+
+    /**
      * Drops the notifications of one conversation, e.g. because the user just
      * opened it — from the shade or from inside the app. Matching is by group
      * key and tag only: the bridge's foreground notification also uses id 1, and

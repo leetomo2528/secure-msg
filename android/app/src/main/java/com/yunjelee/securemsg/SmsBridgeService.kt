@@ -301,6 +301,7 @@ class SmsBridgeService : Service() {
                 startOutboxLoop()
                 scope.launch {
                     try {
+                        refreshAuthToken(relayApi)
                         BlocklistSync.sync(this@SmsBridgeService, relayApi)
                         syncFromServer()
                         incomingMutex.withLock {
@@ -376,10 +377,44 @@ class SmsBridgeService : Service() {
     private fun invalidateSession(reason: String) {
         if (!sessionInvalidated.compareAndSet(false, true)) return
         Log.w(TAG, "Clearing rejected relay session: $reason")
+        // This used to be the ONLY record that sync had stopped: the token hit
+        // its 7-day TTL, the bridge cleared the session and quietly stopped,
+        // and the phone went dark for a day while the web kept working. The
+        // user must be told, or the next symptom is "messages stopped syncing".
+        SmsNotifier.notifySessionExpired(this)
         scope.launch {
             Credentials.clearSession(this@SmsBridgeService)
             relay?.disconnect()
             stopSelf()
+        }
+    }
+
+    /**
+     * Sliding token renewal, at most once per 6 hours. The bridge reconnects
+     * far more often than weekly (every incoming SMS and app open), so any
+     * phone in normal use stays ahead of the 7-day TTL forever. The current
+     * socket keeps its already-accepted auth; the renewed token is what the
+     * NEXT service start loads from Credentials.
+     */
+    private suspend fun refreshAuthToken(relayApi: RelayApi) {
+        val prefs = getSharedPreferences("relay_session", MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        if (now - prefs.getLong("last_token_refresh", 0L) < 6 * 60 * 60 * 1000L) return
+        val response = try {
+            relayApi.refreshToken()
+        } catch (e: Exception) {
+            Log.w(TAG, "Token refresh request failed", e)
+            return
+        }
+        val fresh = response.optString("token")
+        if (!response.optBoolean("ok") || fresh.isEmpty()) {
+            Log.w(TAG, "Token refresh refused: ${response.optString("error", "unknown")}")
+            return
+        }
+        if (Credentials.updateToken(this, fresh)) {
+            relayApi.token = fresh
+            prefs.edit().putLong("last_token_refresh", now).apply()
+            Log.i(TAG, "Relay token renewed")
         }
     }
 

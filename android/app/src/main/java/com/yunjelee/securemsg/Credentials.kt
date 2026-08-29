@@ -111,6 +111,19 @@ object Credentials {
         }
     }
 
+    /**
+     * Persist a renewed relay token without touching the identity or keys.
+     * Goes through [saveUnlocked], NOT [saveSecretsUnlocked] — the latter
+     * always writes an empty token (it exists for [clearSession]).
+     */
+    suspend fun updateToken(ctx: Context, token: String): Boolean {
+        mutex.withLock {
+            val current = fromPreferences(ctx, ctx.dataStore.data.first()) ?: return false
+            saveUnlocked(ctx, current.copy(token = token))
+            return true
+        }
+    }
+
     /** Log out without orphaning the server-side device/public key. */
     suspend fun clearSession(ctx: Context) {
         mutex.withLock {

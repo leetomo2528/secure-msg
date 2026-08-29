@@ -179,6 +179,26 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertIsNone(store.get_conversation_by_cid(cid))
         del conv_id
 
+    def test_token_refresh_slides_the_session_and_respects_revocation(self):
+        refreshed = self.client.post("/api/token-refresh", headers=self.headers)
+        self.assertEqual(refreshed.status_code, 200, refreshed.json)
+        fresh = refreshed.json["token"]
+        self.assertTrue(fresh)
+        # The renewed token authenticates on its own.
+        listed = self.client.get(
+            "/api/devices", headers={"Authorization": f"Bearer {fresh}"}
+        )
+        self.assertEqual(listed.status_code, 200, listed.json)
+        # Rotating the session (logout) kills BOTH tokens' refresh path — the
+        # renewal must never outlive a revocation.
+        out = self.client.post("/api/logout", headers={"Authorization": f"Bearer {fresh}"})
+        self.assertEqual(out.status_code, 200, out.json)
+        for stale in (self.token, fresh):
+            denied = self.client.post(
+                "/api/token-refresh", headers={"Authorization": f"Bearer {stale}"}
+            )
+            self.assertEqual(denied.status_code, 401, denied.json)
+
     def test_unverified_registration_endpoint_is_gone(self):
         """Accounts must go through email verification; the old path is removed."""
         response = self.client.post(

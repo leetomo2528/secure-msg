@@ -1131,6 +1131,14 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     }
   }
   if (!canUseCrypto(context)) return;
+  // Sliding renewal: every signed-in app load trades the token for a fresh
+  // 7-day one, so a session in regular use never hits the TTL cliff. Failure
+  // is ignored — the token that made this call still works for now.
+  void api.tokenRefresh().then((renewed) => {
+    if (renewed.ok && renewed.token && api.token === context.token) {
+      api.setToken(renewed.token);
+    }
+  });
   await me.refreshBlocklist();
   if (!canUseCrypto(context)) return;
   // Pull shared block rules from the server (and push any local-only ones).

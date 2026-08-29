@@ -116,6 +116,9 @@ class RelayApi(
 
     fun pendingDeviceStatus(): JSONObject = get("/api/device-pending-status")
 
+    /** Sliding session renewal; the caller persists the returned token. */
+    fun refreshToken(): JSONObject = post("/api/token-refresh", JSONObject())
+
     fun revokeOwnPendingDevice(): JSONObject = post("/api/device-pending-revoke", JSONObject())
 
     fun upgradeLegacySecurity(parentEpoch: Long, signature: String): JSONObject =

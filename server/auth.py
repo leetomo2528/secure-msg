@@ -552,6 +552,22 @@ def logout():
     return _ok(logged_out=True)
 
 
+@bp.post("/token-refresh")
+@auth_required
+def token_refresh():
+    """Sliding renewal: an approved, unrevoked device trades its still-valid
+    token for a fresh one before the 7-day TTL runs out.
+
+    This grants nothing a valid token cannot already do — it only keeps an
+    ACTIVE device from silently dying at the TTL boundary, which is exactly
+    what took the Android gateway offline for a day (the web client forces a
+    login screen; the background bridge just went dark). Revocation still cuts
+    immediately: auth_required re-checks the per-device session_version, so a
+    rotated session refuses the refresh like any other call.
+    """
+    return _ok(token=issue_jwt(g.auth["uid"], g.auth["sid"], g.auth["session_version"]))
+
+
 @bp.get("/devices")
 @auth_required
 def devices_list():
