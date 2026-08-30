@@ -94,9 +94,15 @@ object SmsNotifier {
     @Volatile
     private var visibleGroup: String = ""
 
-    /** Whether the activity is between onStart and onStop. */
+    /** Whether the activity is between onResume and onPause — actually in
+     * front, which is stricter than visible; see [setAppForeground]. */
     @Volatile
     private var appForeground: Boolean = false
+
+    /** Whether the activity is between onStart and onStop — possibly visible
+     * without being in front (split-screen, multi-window). */
+    @Volatile
+    private var appVisible: Boolean = false
 
     const val ACTION_OPEN_CONVERSATION = "com.yunjelee.securemsg.OPEN_CONVERSATION"
     const val EXTRA_CID = "conversation_cid"
@@ -177,6 +183,18 @@ object SmsNotifier {
     fun setAppForeground(foreground: Boolean) {
         appForeground = foreground
     }
+
+    /** Activity onStart/onStop. Kept separate from [setAppForeground]:
+     * notification suppression must treat a split-screen paused activity as
+     * background, while the updater's kill gate must treat it as on screen. */
+    fun setAppVisible(visible: Boolean) {
+        appVisible = visible
+    }
+
+    /** The unattended updater's silent commit kills the process; it defers
+     * while the UI can be seen at all — resumed or merely started (split-
+     * screen) — and gates on this flag, never on [appForeground], to know. */
+    fun isAppVisible(): Boolean = appVisible
 
     fun notifyIncoming(
         context: Context,

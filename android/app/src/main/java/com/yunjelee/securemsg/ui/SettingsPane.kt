@@ -797,6 +797,31 @@ fun SettingsPane(
                         ),
                     )
                 }
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "자동 설치 (무인 업데이트)",
+                        color = Sm.text2,
+                        fontSize = 13.sp,
+                    )
+                    Switch(
+                        checked = update.autoInstallEnabled,
+                        onCheckedChange = update.onToggleAutoInstall,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Sm.onAccent,
+                            checkedTrackColor = Sm.accentDeep,
+                            uncheckedThumbColor = Sm.text4,
+                            uncheckedTrackColor = Sm.surfaceAlt,
+                        ),
+                    )
+                }
+                Caption(
+                    "Wi-Fi에서 12시간마다 확인해 자동으로 설치합니다. '나중에'로 미룬 버전도 " +
+                        "설치됩니다. 최초 1회만 시스템 확인이 필요할 수 있습니다.",
+                )
                 SmGhostButton(
                     text = when (update.state) {
                         is UpdateUiState.Checking -> "확인 중…"

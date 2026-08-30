@@ -109,6 +109,12 @@ class SmsBridgeService : Service() {
             return START_NOT_STICKY
         }
 
+        // Every started service instance gets the heartbeat, not only one whose
+        // relay connects: a deferred auto-update commit must still happen in a
+        // process whose self-hosted relay is down (reboot during an outage).
+        // The loop itself guards all relay-dependent work.
+        startOutboxLoop()
+
         when (intent?.action) {
             ACTION_INCOMING_SMS -> {
                 val phone = intent.getStringExtra(EXTRA_PHONE) ?: return START_STICKY
@@ -233,6 +239,15 @@ class SmsBridgeService : Service() {
         if (!outboxLoopStarted.compareAndSet(false, true)) return
         outboxLoop = scope.launch {
             while (true) {
+                // Unattended self-update rides the same heartbeat, relay or
+                // not — launched, never awaited: a multi-minute APK download
+                // must not stall the 30s durable retries this loop exists
+                // for, and maybeRun's single-flight guard keeps successive
+                // ticks from stacking downloads. Ticked before the first
+                // delay so a deferred commit gets its chance even in a
+                // process whose bridge start is about to fail and stop the
+                // service.
+                launch { AutoUpdate.maybeRun(applicationContext) }
                 delay(30_000L)
                 if (relay?.isConnected == true) {
                     try {

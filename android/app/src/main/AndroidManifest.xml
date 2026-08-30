@@ -15,6 +15,11 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Normal permission; lets setRequireUserAction(USER_ACTION_NOT_REQUIRED)
+         actually go silent once this app is its own installer of record. -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+    <!-- Auto-update tick reads active-network capabilities (metered/validated). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- QR device pairing only. Requested at the moment the user opens the
          scanner, never at startup, and the camera is released on close. -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -140,6 +145,18 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- MY_PACKAGE_REPLACED is a protected system broadcast: exported with
+             the filter is the standard form, and only the system can send it.
+             Restarts the bridge after a (possibly silent) self-update and
+             reconciles the persisted pending update. -->
+        <receiver
+            android:name=".PackageReplacedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>

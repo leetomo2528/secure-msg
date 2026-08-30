@@ -12,6 +12,7 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -43,6 +44,12 @@ data class PendingUpdate(
     val callbackToken: String,
     /** Why a FAILED entry failed, in user-facing words; null before v0.12.4 entries. */
     val failureDetail: String? = null,
+    /**
+     * When [state] was last (re)persisted. 0 for entries written before the
+     * field existed — deliberately "infinitely old", so the unattended tick's
+     * wedge recovery may reclaim a legacy entry immediately.
+     */
+    val updatedAtMs: Long = 0L,
 )
 
 sealed interface UpdateCheckResult {
@@ -64,6 +71,13 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
 
     fun setAutoCheckEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_CHECK, enabled).apply()
+    }
+
+    /** Gate for the fully unattended background check→download→install tick. */
+    fun autoInstallEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_INSTALL, true)
+
+    fun setAutoInstallEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_INSTALL, enabled).apply()
     }
 
     fun dismissedTag(): String? = prefs.getString(KEY_DISMISSED, null)
@@ -109,7 +123,12 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
     suspend fun download(info: UpdateInfo, onProgress: suspend (Int) -> Unit): File =
         withContext(Dispatchers.IO) {
             val dir = File(ctx.filesDir, "update").apply { mkdirs() }
-            val target = File(dir, "securemsg-${info.versionName}.apk")
+            // Per-attempt file names: the unattended tick and a manual download
+            // can run concurrently for the same version, and a shared path
+            // would let one flow delete or promote the other's half-written
+            // bytes. Losers are unreferenced and reaped by cleanupDownloads.
+            val attempt = UUID.randomUUID().toString().take(8)
+            val target = File(dir, "securemsg-${info.versionName}-$attempt.apk")
             val tmp = File(dir, target.name + ".part")
             tmp.delete()
             var promotionStarted = false
@@ -219,14 +238,17 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             .digest(certificate)
             .joinToString("") { "%02x".format(it) }
 
-    @Synchronized
+    // synchronized(pendingLock), not @Synchronized: the manual flow, the
+    // unattended tick and InstallResultReceiver each construct their own
+    // AppUpdater, so an instance monitor would not exclude them from each
+    // other even though they mutate the same process-wide prefs entry.
     fun persistPendingUpdate(
         info: UpdateInfo,
         file: File,
         state: PendingInstallState = PendingInstallState.READY,
         callbackToken: String = "",
         failureDetail: String? = null,
-    ) {
+    ): Unit = synchronized(pendingLock) {
         val json = JSONObject()
             .put("tag", info.tag)
             .put("versionName", info.versionName)
@@ -236,21 +258,39 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             .put("file", file.absolutePath)
             .put("state", state.name)
             .put("callbackToken", callbackToken)
+            .put("updatedAt", System.currentTimeMillis())
         if (failureDetail != null) json.put("failureDetail", failureDetail)
         // commit() is intentional: PackageInstaller can replace/kill this process immediately.
         prefs.edit().putString(KEY_PENDING_UPDATE, json.toString()).commit()
     }
 
-    @Synchronized
-    fun setPendingInstallState(state: PendingInstallState): Boolean {
+    /**
+     * Persist READY only while no other flow owns an entry. The unattended
+     * tick's gate read happens minutes before its download finishes; in that
+     * window a manual flow may have persisted SESSION_SUBMITTED with its own
+     * token, and overwriting it would orphan the committed session's callbacks
+     * and its confirm dialog. Returns false when the caller lost the race and
+     * must discard its file.
+     */
+    fun persistPendingUpdateIfAbsent(
+        info: UpdateInfo,
+        file: File,
+        state: PendingInstallState,
+        callbackToken: String,
+    ): Boolean = synchronized(pendingLock) {
+        if (pendingUpdate() != null) return false
+        persistPendingUpdate(info, file, state, callbackToken)
+        true
+    }
+
+    fun setPendingInstallState(state: PendingInstallState): Boolean = synchronized(pendingLock) {
         val pending = pendingUpdate() ?: return false
         persistPendingUpdate(pending.info, pending.file, state, pending.callbackToken)
-        return true
+        true
     }
 
     /** Marks the pending update FAILED with the words the banner should show. */
-    @Synchronized
-    fun setPendingInstallFailure(detail: String): Boolean {
+    fun setPendingInstallFailure(detail: String): Boolean = synchronized(pendingLock) {
         val pending = pendingUpdate() ?: return false
         persistPendingUpdate(
             pending.info,
@@ -259,11 +299,10 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             pending.callbackToken,
             detail,
         )
-        return true
+        true
     }
 
-    @Synchronized
-    fun claimFallbackLaunch(): Boolean {
+    fun claimFallbackLaunch(): Boolean = synchronized(pendingLock) {
         val pending = pendingUpdate() ?: return false
         if (!UpdateValidation.shouldLaunchFallback(pending.state)) return false
         persistPendingUpdate(
@@ -272,7 +311,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             PendingInstallState.FALLBACK_LAUNCHED,
             pending.callbackToken,
         )
-        return true
+        true
     }
 
     fun pendingUpdate(): PendingUpdate? {
@@ -294,15 +333,16 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                 file = canonical,
                 state = PendingInstallState.valueOf(obj.optString("state", "READY")),
                 callbackToken = obj.optString("callbackToken", ""),
-                // optString: entries persisted before the field existed stay readable.
+                // optString/optLong: entries persisted before the fields existed stay readable.
                 failureDetail = obj.optString("failureDetail", "").takeIf { it.isNotEmpty() },
+                updatedAtMs = obj.optLong("updatedAt", 0L),
             )
         } catch (_: Exception) {
             null
         }
     }
 
-    fun clearPendingUpdate() {
+    fun clearPendingUpdate(): Unit = synchronized(pendingLock) {
         prefs.edit().remove(KEY_PENDING_UPDATE).commit()
     }
 
@@ -314,8 +354,18 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
      * Returns false when sessions are unavailable and the caller should fall
      * back to [installIntent].
      */
-    suspend fun installViaSession(file: File, callbackToken: String): Boolean =
-        withContext(Dispatchers.IO) {
+    suspend fun installViaSession(
+        file: File,
+        callbackToken: String,
+        userActionNotRequired: Boolean = false,
+    ): Boolean {
+        // Set before the IO hop: the manual flow launches this main-immediate
+        // right after persisting SESSION_SUBMITTED, so an Activity recreation
+        // in that window must already see the flag; a background (bridge)
+        // submission gets the same protection against restore's cold-start
+        // SESSION_SUBMITTED→FAILED conversion.
+        installSubmittedInThisProcess = true
+        return withContext(Dispatchers.IO) {
             val installer = ctx.packageManager.packageInstaller
             // Every retry after a stuck confirm reaches here; without this the
             // half-written sessions of earlier attempts accumulate until the
@@ -332,7 +382,19 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                 verifyApkSigningCertificate(file)
                 val params = PackageInstaller.SessionParams(
                     PackageInstaller.SessionParams.MODE_FULL_INSTALL,
-                ).apply { setSize(file.length()) }
+                ).apply {
+                    setSize(file.length())
+                    if (userActionNotRequired) {
+                        // Honored only when this app is the installer of record
+                        // of itself (true after one confirmed in-app update)
+                        // and holds UPDATE_PACKAGES_WITHOUT_USER_ACTION; when
+                        // ineligible the system still delivers
+                        // PENDING_USER_ACTION, which the receiver handles.
+                        setRequireUserAction(
+                            PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED,
+                        )
+                    }
+                }
                 sessionId = installer.createSession(params)
                 installer.openSession(sessionId).use { session ->
                     session.openWrite("securemsg-update", 0, file.length()).use { out ->
@@ -365,6 +427,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                 false
             }
         }
+    }
 
     fun installIntent(file: File): Intent {
         verifyApkSigningCertificate(file)
@@ -385,6 +448,21 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             "https://api.github.com/repos/leetomo2528/secure-msg/releases/latest"
         const val CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000L
         private const val KEY_AUTO_CHECK = "auto_check"
+        private const val KEY_AUTO_INSTALL = "auto_install"
+
+        /**
+         * Process-static: set when this process submits an install session —
+         * manual activity flow or background auto-update alike. MainActivity's
+         * restore may only treat a persisted SESSION_SUBMITTED as orphaned
+         * when no submission happened in this process: a recreation keeps the
+         * submitting process (receiver, coroutine, watchdog) alive.
+         */
+        @Volatile
+        var installSubmittedInThisProcess = false
+
+        /** Serializes every mutation of the pending-update prefs entry across
+         * the AppUpdater instances the separate flows construct. */
+        private val pendingLock = Any()
         private const val KEY_LAST_CHECK = "last_check_ms"
         private const val KEY_DISMISSED = "dismissed_tag"
         private const val KEY_PENDING_UPDATE = "pending_update"

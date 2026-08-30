@@ -56,16 +56,6 @@ class MainActivity : ComponentActivity() {
          * stall (issue #5) does not read as a hang.
          */
         const val INSTALL_CONFIRM_WATCHDOG_MS = 25_000L
-
-        /**
-         * Process-static: set when this process submits an install session.
-         * Rotation and other configuration changes run onCreate again with the
-         * submitting process — and its receiver, coroutine and watchdog — all
-         * still alive, so restore may only treat SESSION_SUBMITTED as orphaned
-         * when this flag says no submission happened in this process.
-         */
-        @Volatile
-        var installSubmittedInThisProcess = false
     }
 
     private var smsRoleHeld by mutableStateOf(false)
@@ -79,6 +69,7 @@ class MainActivity : ComponentActivity() {
     private var updateState by mutableStateOf<UpdateUiState>(UpdateUiState.Idle)
     private var updateMessage by mutableStateOf<String?>(null)
     private var autoUpdateEnabled by mutableStateOf(true)
+    private var autoInstallEnabled by mutableStateOf(true)
     private var pendingInstallFile: File? = null
 
     private val permsLauncher = registerForActivityResult(
@@ -155,6 +146,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        // Started, not resumed: in split-screen the activity stays visible
+        // while paused, and the updater's silent commit must not kill the app
+        // out from under a pane the user is reading.
+        SmsNotifier.setAppVisible(true)
+    }
+
+    override fun onStop() {
+        SmsNotifier.setAppVisible(false)
+        super.onStop()
     }
 
     override fun onPause() {
@@ -174,6 +174,7 @@ class MainActivity : ComponentActivity() {
         smsPermissionsGranted = hasSmsPerms()
         notificationPermissionGranted = hasNotificationPermission()
         autoUpdateEnabled = updater.autoCheckEnabled()
+        autoInstallEnabled = updater.autoInstallEnabled()
         // Returning through a notification/system surface must also wake durable
         // provider import and relay flushing; service-side work is idempotent.
         if (smsRoleHeld && smsPermissionsGranted) startBridgeService()
@@ -184,6 +185,16 @@ class MainActivity : ComponentActivity() {
         ) {
             pendingInstallFile = pending.file
             startInstall(pending.info, pending.file)
+        }
+        // A READY entry the background tick downloaded while this activity was
+        // already alive: onCreate's restore never re-runs on a warm reopen, so
+        // surface the 지금 설치 banner here — but never over a live flow's state.
+        if (pending?.state == PendingInstallState.READY &&
+            (updateState is UpdateUiState.Idle || updateState is UpdateUiState.Checking ||
+                updateState is UpdateUiState.Available || updateState is UpdateUiState.Failed)
+        ) {
+            pendingInstallFile = pending.file
+            updateState = pendingUiState(pending)
         }
         // Returning from the legacy installer (or a confirm dialog) via recents
         // never recreates this singleTask activity, so onCreate's reconciliation
@@ -313,10 +324,19 @@ class MainActivity : ComponentActivity() {
         updateState = UpdateUiState.Ready(info, file)
         if (updater.canInstallPackages()) {
             updater.setPendingInstallState(PendingInstallState.SESSION_SUBMITTED)
-            installSubmittedInThisProcess = true
             updateState = UpdateUiState.Installing(info, file)
             lifecycleScope.launch {
-                val submitted = updater.installViaSession(file, callbackToken)
+                // userActionNotRequired even for the manual flow: when this
+                // build is eligible (installer of record) the tap installs
+                // without the system dialog; when not, the system delivers
+                // PENDING_USER_ACTION and the confirm flow runs unchanged.
+                // installViaSession sets installSubmittedInThisProcess before
+                // suspending, so restore cannot misread this as orphaned.
+                val submitted = updater.installViaSession(
+                    file,
+                    callbackToken,
+                    userActionNotRequired = true,
+                )
                 withContext(Dispatchers.Main) {
                     if (submitted) {
                         // A terminal callback can arrive before this coroutine resumes.
@@ -487,7 +507,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (pending.state == PendingInstallState.SESSION_SUBMITTED &&
-            !installSubmittedInThisProcess
+            !AppUpdater.installSubmittedInThisProcess
         ) {
             // No submission happened in this process (the flag rules out a mere
             // activity recreation), so the process that submitted is gone. The
@@ -639,6 +659,7 @@ class MainActivity : ComponentActivity() {
                     state = updateState,
                     message = updateMessage,
                     autoEnabled = autoUpdateEnabled,
+                    autoInstallEnabled = autoInstallEnabled,
                     shouldAutoCheck = UpdateValidation.shouldAutoCheck(
                         updater.pendingUpdate() != null,
                     ) && updater.shouldAutoCheck(),
@@ -646,6 +667,10 @@ class MainActivity : ComponentActivity() {
                     onToggleAuto = { enabled ->
                         autoUpdateEnabled = enabled
                         updater.setAutoCheckEnabled(enabled)
+                    },
+                    onToggleAutoInstall = { enabled ->
+                        autoInstallEnabled = enabled
+                        updater.setAutoInstallEnabled(enabled)
                     },
                     onUpdate = { startDownload(it) },
                     onInstall = { info, file -> startInstall(info, file) },
