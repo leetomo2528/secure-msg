@@ -580,7 +580,11 @@ describe("security generation invalidation", () => {
       ok: true, uid: 42, sid: "replacement-sid", token: "replacement-token", trust_state: "pending",
     });
 
-    await expect(useStore.getState().login("recovery_user", "password")).resolves.toBe(true);
+    // The login stops at the new-device warning; confirming it is what runs
+    // the cleanup and the replacement registration.
+    await expect(useStore.getState().login("recovery_user", "password")).resolves.toBe(false);
+    expect(useStore.getState().pendingNewDevice).toMatchObject({ reason: "replaced" });
+    await expect(useStore.getState().confirmNewDevice("password")).resolves.toBe(true);
 
     expect(effects.clearDeviceForReregistration).toHaveBeenCalledOnce();
     expect(effects.setMeta).toHaveBeenCalledWith(expect.objectContaining({

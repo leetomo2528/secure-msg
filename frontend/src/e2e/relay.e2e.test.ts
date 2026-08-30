@@ -7,10 +7,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { io, type Socket } from "socket.io-client";
 import { registerViaEmail } from "./registerViaEmail";
-import { initCrypto, generateKeypair, hashPassword, saltForUser, encryptMessage } from "../crypto/keys";
-import { signDeviceApproval } from "../crypto/deviceTrust";
+import {
+  initCrypto, generateKeypair, hashPassword, saltForUser, encryptMessage,
+  decryptMessageWithSender,
+} from "../crypto/keys";
+import { deviceFingerprint, signDeviceApproval } from "../crypto/deviceTrust";
 import { api, getSocket, setSocketBase } from "../net/api";
+import { pinTrustedDirectory } from "../store/db";
 import { useStore } from "../store/useStore";
+import { shareHistoryWithDevice } from "../store/historyShare";
 
 /**
  * Relay interlock test: proves the phone→server→web chain end to end.
@@ -266,6 +271,103 @@ describe("phone ↔ web relay interlock", () => {
       await new Promise((r) => setTimeout(r, 150));
     }
     expect(useStore.getState().conversations.some((c) => c.name === "+821077770002")).toBe(true);
+  }, 60_000);
+
+  it("shares history with a device registered after the messages were sent", async () => {
+    // A third device joins the account now. Everything above was encrypted
+    // before it existed, so the relay holds no key it can open.
+    const pwHash = await hashPassword(PASSWORD, saltForUser(USERNAME));
+    const lateKeys = generateKeypair();
+    const registered = await fetchJson(`${BASE}/api/device-register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: USERNAME, pw_hash: pwHash, device_name: "late-web-e2e",
+        pub_key: lateKeys.box.pk, sig_pub: lateKeys.sign.pk,
+      }),
+    });
+    expect(registered.ok).toBe(true);
+    const lateSid: string = registered.sid;
+    const lateToken: string = registered.token;
+
+    const devices = await fetchJson(`${BASE}/api/devices`, {
+      headers: { Authorization: `Bearer ${api.token}` },
+    });
+    const pending = (devices.devices as Array<any>).find((d) => d.sid === lateSid);
+    const approver = useStore.getState().keypair!;
+    const uid = useStore.getState().uid!;
+    const approved = await fetchJson(`${BASE}/api/device-approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${api.token}` },
+      body: JSON.stringify({
+        subject_sid: lateSid,
+        parent_epoch: devices.security_epoch,
+        signature: signDeviceApproval({
+          uid, subjectSid: lateSid, pubKey: lateKeys.box.pk, sigPub: lateKeys.sign.pk,
+          kind: "web", challenge: pending.challenge, parentEpoch: devices.security_epoch,
+        }, approver.sign.sk),
+      }),
+    });
+    expect(approved.ok).toBe(true);
+
+    // What DeviceManager does after approving: re-pin the verified directory,
+    // which is the only place shareHistoryWithDevice will take a key from.
+    const directory = await fetchJson(`${BASE}/api/key-directory`, {
+      headers: { Authorization: `Bearer ${api.token}` },
+    });
+    await pinTrustedDirectory({
+      uid,
+      identity_sig_pub: directory.identity_sig_pub,
+      security_epoch: directory.security_epoch,
+      directory_hash: directory.directory_hash,
+      security_mode: directory.security_mode,
+      devices: (directory.devices as Array<any>).map((device) => ({
+        sid: device.sid,
+        pub_key: device.pub_key,
+        sig_pub: device.sig_pub,
+        kind: device.kind,
+        fingerprint: deviceFingerprint(device.pub_key, device.sig_pub).hash,
+      })),
+    });
+
+    const before = await fetchJson(
+      `${BASE}/api/conversation/${smsCid}/missing-keys?sid=${lateSid}`,
+      { headers: { Authorization: `Bearer ${api.token}` } },
+    );
+    expect(before.ok).toBe(true);
+    expect(before.seqs.length).toBeGreaterThan(0);
+
+    const outcome = await shareHistoryWithDevice(lateSid);
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.ok).toBe(true);
+    expect(outcome.shared).toBeGreaterThanOrEqual(before.seqs.length);
+
+    // Idempotent: a second run has nothing left to add.
+    const after = await fetchJson(
+      `${BASE}/api/conversation/${smsCid}/missing-keys?sid=${lateSid}`,
+      { headers: { Authorization: `Bearer ${api.token}` } },
+    );
+    expect(after.seqs).toEqual([]);
+    expect((await shareHistoryWithDevice(lateSid)).shared).toBe(0);
+
+    // The late device now reads the SMS that arrived before it registered,
+    // opening the re-wrapped key with the SHARER's pinned public key.
+    const history = await fetchJson(
+      `${BASE}/api/conversation/${smsCid}/messages?since=0&limit=200`,
+      { headers: { Authorization: `Bearer ${lateToken}` } },
+    );
+    const relayed = (history.messages as Array<any>).find(
+      (message) => message.sender_sid === gwSid,
+    );
+    expect(relayed).toBeTruthy();
+    expect(relayed.payload.keys[lateSid].by).toBe(useStore.getState().sid);
+    const sharerPubKey = (directory.devices as Array<any>)
+      .find((device) => device.sid === useStore.getState().sid).pub_key;
+    const plaintext = decryptMessageWithSender(
+      relayed.payload, lateSid, lateKeys, gwKeys!.box.pk,
+      (sid) => (sid === useStore.getState().sid ? sharerPubKey : null),
+    );
+    expect(plaintext).toContain("휴대폰에서 보낸 문자입니다");
   }, 60_000);
 
   afterAll(() => {

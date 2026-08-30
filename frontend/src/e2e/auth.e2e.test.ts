@@ -122,7 +122,16 @@ describe("auth end-to-end against a real relay server", () => {
     await clearAllData(); // simulate a brand-new browser profile
     expect(await getMeta()).toBeNull();
 
-    const ok = await useStore.getState().login("e2e_alice", PASSWORD);
+    // A browser with no local device must acknowledge that it registers as a
+    // new device with no readable history before any keypair is created.
+    const gated = await useStore.getState().login("e2e_alice", PASSWORD);
+    expect(gated).toBe(false);
+    expect(await getMeta()).toBeNull();
+    expect(useStore.getState().pendingNewDevice).toMatchObject({
+      username: "e2e_alice", reason: "fresh",
+    });
+
+    const ok = await useStore.getState().confirmNewDevice(PASSWORD);
     expect(useStore.getState().error).toBeNull();
     expect(ok).toBe(true);
     expect((await getMeta())?.username).toBe("e2e_alice");

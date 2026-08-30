@@ -54,6 +54,14 @@ export interface TrustedDeviceRow {
   fingerprint: string;
   first_seen_at: number;
   updated_at: number;
+  /**
+   * Set once a verified directory stopped listing this device, i.e. it was
+   * revoked. The row survives revocation because history the device wrapped
+   * while it was still trusted has to stay openable, so presence in this store
+   * answers "did this browser ever verify it", never "is it still authorized".
+   * Absent on rows written before this field existed; treated as active.
+   */
+  revoked_at?: number | null;
 }
 
 export interface TrustedDirectorySnapshot {
@@ -107,6 +115,14 @@ export interface MessageAttachment {
 interface CursorRow {
   cid: string;
   last_seq: number;
+  /**
+   * Lowest sequence this device pulled but could not decrypt. The cursor
+   * deliberately advances past such messages so one bad row cannot starve
+   * newer history, which would otherwise make them unreachable forever — and
+   * history shared by another device (see historyShare.ts) arrives with no
+   * notification at all. Keeping the floor lets a later sync re-read them.
+   */
+  retry_from?: number | null;
 }
 
 export interface BlockRow {
@@ -386,6 +402,19 @@ export async function pinTrustedDirectories(
 
   const now = Date.now();
   for (const snapshot of snapshots) {
+    if (await abortIfInvalidated()) return;
+    // A snapshot always carries the account's COMPLETE set of active devices —
+    // directory proof verification rejects any other list — so a pinned row it
+    // omits has been revoked. Recording that is the only way this store can
+    // distinguish "verified once" from "still authorized"; every grant of new
+    // decryption authority depends on the latter.
+    const active = new Set(snapshot.devices.map((device) => device.sid));
+    const pinnedForAccount = await deviceStore.index("by-account").getAll(snapshot.uid);
+    for (const row of pinnedForAccount) {
+      if (active.has(row.sid) || row.revoked_at != null) continue;
+      if (await abortIfInvalidated()) return;
+      await deviceStore.put({ ...row, revoked_at: now, updated_at: now });
+    }
     for (const candidate of snapshot.devices) {
       if (await abortIfInvalidated()) return;
       const id = trustedDeviceId(snapshot.uid, candidate.sid);
@@ -394,6 +423,10 @@ export async function pinTrustedDirectories(
         uid: snapshot.uid,
         ...candidate,
         first_seen_at: pinnedDevices.get(id)?.first_seen_at ?? now,
+        // Tracks the newest verified directory rather than latching: a
+        // verified_v2 chain can never re-approve a revoked SID, and latching
+        // would let one legacy directory permanently poison a live device.
+        revoked_at: null,
         updated_at: now,
       });
     }
@@ -523,7 +556,26 @@ export async function setCursor(cid: string, last_seq: number): Promise<void> {
   const d = await db();
   const tx = d.transaction("cursors", "readwrite");
   const existing = await tx.store.get(cid);
-  await tx.store.put({ cid, last_seq: Math.max(existing?.last_seq ?? 0, last_seq) });
+  await tx.store.put({
+    cid,
+    last_seq: Math.max(existing?.last_seq ?? 0, last_seq),
+    retry_from: existing?.retry_from ?? null,
+  });
+  await tx.done;
+}
+
+/** Lowest sequence in `cid` this device pulled but could not decrypt. */
+export async function getUndecryptableFloor(cid: string): Promise<number | null> {
+  const row = await (await db()).get("cursors", cid);
+  return row?.retry_from ?? null;
+}
+
+/** Record (or clear, with null) the re-read floor for `cid`. */
+export async function setUndecryptableFloor(cid: string, seq: number | null): Promise<void> {
+  const d = await db();
+  const tx = d.transaction("cursors", "readwrite");
+  const existing = await tx.store.get(cid);
+  await tx.store.put({ cid, last_seq: existing?.last_seq ?? 0, retry_from: seq });
   await tx.done;
 }
 

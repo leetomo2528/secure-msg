@@ -48,6 +48,8 @@ import {
   setCarrierStatus,
   getCursor,
   setCursor,
+  getUndecryptableFloor,
+  setUndecryptableFloor,
   addBlockKeyword,
   removeBlockKeyword,
   listBlockKeywords,
@@ -123,11 +125,23 @@ export interface RelayContent {
  * identity change (login attempt, logout, forget-device) bumps `generation`.
  * Operations carry this snapshot and read the credential live.
  */
-interface SecurityContext {
+export interface SecurityContext {
   generation: number;
   uid: number | null;
   sid: string | null;
   keypair: DeviceKeypair | null;
+}
+
+/**
+ * A login that cannot reuse a stored device. `fresh` is a browser with no
+ * local device for this account; `replaced` is one whose stored device the
+ * relay no longer accepts (revoked elsewhere), so its keypair is discarded and
+ * a new one registered. Both lose access to existing history until another
+ * device shares it, which is what the user is asked to confirm.
+ */
+export interface NewDeviceNotice {
+  username: string;
+  reason: "fresh" | "replaced";
 }
 
 interface State {
@@ -152,12 +166,20 @@ interface State {
   blockedSenders: SenderRow[];
   notifyEnabled: boolean;
   deviceCache: Map<string, ConvMember>; // sid -> member info
+  /**
+   * Set when a login would register this browser as a BRAND-NEW device. The
+   * user must acknowledge that the new device starts with no readable history
+   * before any keypair is registered, so this is a real UI gate, not a hint.
+   */
+  pendingNewDevice: NewDeviceNotice | null;
   error: string | null;
 
   init: () => Promise<void>;
   requestEmailRegistration: (username: string, email: string, password: string) => Promise<string | null>;
   verifyEmailRegistration: (username: string, email: string, password: string, challengeId: string, code: string) => Promise<boolean>;
   login: (username: string, password: string) => Promise<boolean>;
+  confirmNewDevice: (password: string) => Promise<boolean>;
+  cancelNewDevice: () => void;
   addDevice: (username: string, password: string, deviceName: string) => Promise<boolean>;
   loginExistingDevice: (username: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
@@ -200,6 +222,7 @@ export const useStore = create<State>((set, get) => ({
   blockedSenders: [],
   notifyEnabled: readNotifyPref(),
   deviceCache: new Map(),
+  pendingNewDevice: null,
   error: null,
 
   init: async () => {
@@ -284,6 +307,7 @@ export const useStore = create<State>((set, get) => ({
 
   login: async (username, password) => {
     const entryGeneration = get().securityGeneration;
+    set({ pendingNewDevice: null });
     try {
       if (!/^[a-z0-9_]{3,20}$/.test(username) || password.length < 1 || password.length > 1024) {
         set({ error: "아이디 또는 비밀번호 형식을 확인하세요" });
@@ -314,24 +338,49 @@ export const useStore = create<State>((set, get) => ({
           || /^(device not found|device revoked)$/.test(get().error ?? "");
         lastExistingDeviceGone = false;
         if (!deviceGone) return false;
-        const fallbackGeneration = get().securityGeneration;
-        await sessionCoordinator.exclusive(async () => {
-          if (get().securityGeneration !== fallbackGeneration) return;
-          await clearDeviceForReregistration();
-        });
-        if (get().securityGeneration !== fallbackGeneration) return false;
-        return await get().addDevice(
-          username, password, "device-" + Math.random().toString(36).slice(2, 6),
-        );
+        // Registering a replacement keypair is exactly as destructive to
+        // history as a first registration, so it waits for the same consent.
+        set({ pendingNewDevice: { username, reason: "replaced" }, error: null });
+        return false;
       }
-      // No local device for this user → create a new one.
-      return await get().addDevice(
-        username, password, "device-" + Math.random().toString(36).slice(2, 6),
-      );
+      // No local device for this user → registering one makes this browser a
+      // new device that cannot read anything sent before it existed. Stop and
+      // let the user confirm that in the UI; confirmNewDevice() continues.
+      set({ pendingNewDevice: { username, reason: "fresh" }, error: null });
+      return false;
     } catch (error) {
       set({ error: errorText(error) });
       return false;
     }
+  },
+
+  /**
+   * Continue a login the new-device warning stopped. The password is passed
+   * back in rather than held in the store: nothing about this flow needs a
+   * credential to survive between two user gestures.
+   */
+  confirmNewDevice: async (password) => {
+    const pending = get().pendingNewDevice;
+    if (!pending) return false;
+    if (pending.reason === "replaced") {
+      // Trust-preserving cleanup: drops the rejected keypair and this device's
+      // session data while keeping the pinned account/device trust anchors.
+      const fallbackGeneration = get().securityGeneration;
+      await sessionCoordinator.exclusive(async () => {
+        if (get().securityGeneration !== fallbackGeneration) return;
+        await clearDeviceForReregistration();
+      });
+      if (get().securityGeneration !== fallbackGeneration) return false;
+      if (get().pendingNewDevice !== pending) return false;
+    }
+    set({ pendingNewDevice: null });
+    return await get().addDevice(
+      pending.username, password, "device-" + Math.random().toString(36).slice(2, 6),
+    );
+  },
+
+  cancelNewDevice: () => {
+    set({ pendingNewDevice: null, error: null });
   },
 
   addDevice: async (username, password, deviceName) => {
@@ -461,7 +510,8 @@ export const useStore = create<State>((set, get) => ({
       securityGeneration: logoutGeneration,
       authed: false, approvalPending: false, securityLocked: false,
       uid: null, sid: null, deviceName: null, keypair: null, conversations: [],
-      activeCid: null, activeMessages: [], deviceCache: new Map(), error: null,
+      activeCid: null, activeMessages: [], deviceCache: new Map(),
+      pendingNewDevice: null, error: null,
     });
 
     // Queue cleanup immediately after invalidation. Any DB effect which already
@@ -513,7 +563,7 @@ export const useStore = create<State>((set, get) => ({
       securityGeneration: forgetGeneration,
       authed: false, approvalPending: false, securityLocked: false, username: null, uid: null, sid: null,
       deviceName: null, keypair: null, conversations: [], activeCid: null, activeMessages: [],
-      blockKeywords: [], deviceCache: new Map(), error: null,
+      blockKeywords: [], deviceCache: new Map(), pendingNewDevice: null, error: null,
     });
     await sessionCoordinator.exclusive(clearAllData);
     if (get().securityGeneration !== forgetGeneration || get().authed) return;
@@ -611,6 +661,12 @@ export const useStore = create<State>((set, get) => ({
       sid: m.sid, user_id: m.user_id, pub_key: m.pub_key, sig_pub: m.sig_pub,
     }))));
     if (!cached) return;
+    // History shared by another of our own devices is sealed by THAT device, so
+    // it opens with the wrapper's key rather than the sender's. Only a pinned
+    // key is accepted: a relay that could name a wrapper and hand over the
+    // matching public key would be choosing what this device decrypts.
+    const wrapperPubkeys = await ownDeviceWrapperKeys(context);
+    if (!canUseCrypto(context)) return;
 
     // 2. Pull every page since our last cursor. Advance even past an envelope
     // this device cannot decrypt, so one malformed row cannot starve all newer
@@ -629,9 +685,19 @@ export const useStore = create<State>((set, get) => ({
       mr.members.filter((m) => m.kind === "android_gateway").map((m) => m.sid),
     );
     const pageSize = 200;
-    let cursor = await getCursor(cid);
+    const startCursor = await getCursor(cid);
     if (!canUseCrypto(context)) return;
-    const startCursor = cursor;
+    const previousFloor = await getUndecryptableFloor(cid);
+    if (!canUseCrypto(context)) return;
+    // Keys another device shared for old messages arrive with no event of any
+    // kind, and this device's cursor has long since moved past them. Re-read
+    // from the oldest message we failed to open — once per session per
+    // conversation, since every incoming message re-enters this function and a
+    // permanent gap would otherwise re-download the whole thread each time.
+    const rescanKey = `${context.generation}:${cid}`;
+    const rescan = previousFloor != null && !rescannedGaps.has(rescanKey);
+    let cursor = rescan ? Math.min(startCursor, previousFloor! - 1) : startCursor;
+    let lowestUndecryptable: number | null = null;
     let notifyBody: string | null = null;
     let notifyIsIncoming = false;
     while (true) {
@@ -665,8 +731,14 @@ export const useStore = create<State>((set, get) => ({
         if (!canUseCrypto(context)) return;
         const plaintext = decryptMessageWithSender(
           sm.payload, mySid, myKeypair, senderPubKey,
+          (sid) => wrapperPubkeys.get(sid) ?? null,
         );
-        if (plaintext == null) continue;
+        if (plaintext == null) {
+          if (lowestUndecryptable == null || sm.seq < lowestUndecryptable) {
+            lowestUndecryptable = sm.seq;
+          }
+          continue;
+        }
         const content = decodeRelayContent(plaintext);
         let shouldShow = true;
         if (!await runSessionEffect(context, async () => {
@@ -705,6 +777,22 @@ export const useStore = create<State>((set, get) => ({
       }
       if (fr.messages.length < pageSize || maxSeq <= cursor) break;
       cursor = maxSeq;
+    }
+    // Marked only now, and only by a pass that actually re-read: one that
+    // aborted (offline, logout) has not looked, and the pass that FIRST
+    // records a floor has not either — it is the pass that discovers the gap,
+    // so counting it would spend the budget before anything re-read it. Syncs
+    // for one conversation are serialized, so this cannot race a second
+    // re-read.
+    if (rescan) rescannedGaps.add(rescanKey);
+    // A pass that started at the floor covers every gap; one that skipped the
+    // re-read only learned about gaps above the stored cursor, so the older
+    // floor stands.
+    const nextFloor = rescan || previousFloor == null
+      ? lowestUndecryptable
+      : Math.min(previousFloor, lowestUndecryptable ?? Number.MAX_SAFE_INTEGER);
+    if (nextFloor !== previousFloor) {
+      if (!await runSessionEffect(context, () => setUndecryptableFloor(cid, nextFloor))) return;
     }
     // Re-read state: the `me` snapshot predates the pagination loop, and the
     // user may have switched conversations while pages were being pulled.
@@ -1272,6 +1360,8 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
 }
 
 const syncJobs = new Map<string, Promise<void>>();
+/** `${generation}:${cid}` entries whose undecryptable gap was re-read this session. */
+const rescannedGaps = new Set<string>();
 
 function queueConversationSync(cid: string, suppliedContext?: SecurityContext): Promise<void> {
   const context = suppliedContext ?? captureSecurityContext();
@@ -1387,7 +1477,37 @@ export function verifiedSenderPublicKey(
   return sender.pub_key;
 }
 
-function captureSecurityContext(): SecurityContext {
+/**
+ * Public keys of this account's own devices, taken ONLY from the locally
+ * pinned trust store. This is the resolver behind `EnvelopeKey.by` and behind
+ * history sharing; both grant or use decryption authority, so a key that
+ * merely arrived in a relay response must never reach either. An empty map
+ * (nothing pinned yet) therefore means "refuse", not "ask the server".
+ */
+export async function ownDeviceWrapperKeys(context: SecurityContext): Promise<Map<string, string>> {
+  if (context.uid == null) return new Map();
+  const pinned = await listTrustedDevices(context.uid);
+  return new Map(pinned.map((device) => [device.sid, device.pub_key]));
+}
+
+/**
+ * Own devices that the newest verified directory still lists as active.
+ *
+ * `ownDeviceWrapperKeys` deliberately keeps revoked devices — history they
+ * wrapped before revocation must stay readable — so it answers "did this
+ * browser ever verify it", not "may it still be given access". Anything that
+ * GRANTS decryption authority must use this narrower map instead, or a lost
+ * device stays a valid recipient for as long as its pinned row exists.
+ */
+export async function ownActiveDeviceKeys(context: SecurityContext): Promise<Map<string, string>> {
+  if (context.uid == null) return new Map();
+  const pinned = await listTrustedDevices(context.uid);
+  return new Map(
+    pinned.filter((device) => device.revoked_at == null).map((device) => [device.sid, device.pub_key]),
+  );
+}
+
+export function captureSecurityContext(): SecurityContext {
   const state = useStore.getState();
   return {
     generation: state.securityGeneration,
@@ -1432,7 +1552,7 @@ function beginAuthAttempt(): number {
   return generation;
 }
 
-function sameContext(context: SecurityContext): boolean {
+export function sameContext(context: SecurityContext): boolean {
   const state = useStore.getState();
   // Token value is deliberately not compared: it rotates under a live session
   // (sliding renewal), and every identity change bumps the generation.
@@ -1449,7 +1569,7 @@ function contextsEqual(left: SecurityContext, right: SecurityContext): boolean {
     && left.keypair === right.keypair;
 }
 
-function canUseCrypto(context: SecurityContext): boolean {
+export function canUseCrypto(context: SecurityContext): boolean {
   const state = useStore.getState();
   // Presence of the credential is read live: a captured value cannot prove the
   // session still holds one, since logout clears the token without touching
@@ -1481,7 +1601,7 @@ async function runContextEffect(
   });
 }
 
-function lockForTrustViolation(error: unknown, context: SecurityContext): void {
+export function lockForTrustViolation(error: unknown, context: SecurityContext): void {
   if (!sameContext(context)) return;
   const message = error instanceof Error ? error.message : "알 수 없는 키 디렉터리 오류";
   disconnectSocket();
@@ -1499,6 +1619,7 @@ export const __testing = {
   resetSyncJobs: () => {
     syncJobs.clear();
     postLoginJobs.clear();
+    rescannedGaps.clear();
   },
 };
 

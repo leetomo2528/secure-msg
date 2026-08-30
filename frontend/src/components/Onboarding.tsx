@@ -13,6 +13,9 @@ export default function Onboarding() {
   const requestEmailRegistration = useStore((s) => s.requestEmailRegistration);
   const verifyEmailRegistration = useStore((s) => s.verifyEmailRegistration);
   const forgetLocalDevice = useStore((s) => s.forgetLocalDevice);
+  const pendingNewDevice = useStore((s) => s.pendingNewDevice);
+  const confirmNewDevice = useStore((s) => s.confirmNewDevice);
+  const cancelNewDevice = useStore((s) => s.cancelNewDevice);
   const error = useStore((s) => s.error);
   const rememberedUsername = useStore((s) => s.username);
   const [mode, setMode] = useState<Mode>("login");
@@ -50,6 +53,16 @@ export default function Onboarding() {
               return challenge;
             }));
       void ok; // a false result already put the error text in the store
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const registerNewDevice = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await confirmNewDevice(password);
     } finally {
       setBusy(false);
     }
@@ -101,14 +114,53 @@ export default function Onboarding() {
     });
   };
 
-  return (
-    <div className="onboarding-shell grid min-h-full place-items-center overflow-y-auto px-5 py-10">
-      <div className="flex w-full max-w-[400px] flex-col items-center gap-6 animate-rise">
-        <div className="flex items-center gap-2.5">
-          <BrandMark className="h-8 w-8 rounded-[11px]" />
-          <p className="text-base font-bold tracking-tight text-tx-1">SecureMsg</p>
+  if (pendingNewDevice) {
+    return (
+      <OnboardingShell>
+        <div className="onboarding-card w-full space-y-4">
+          <div className="space-y-2">
+            <h2 className="text-sm font-bold text-tx-1">이 브라우저는 새 기기로 등록됩니다</h2>
+            <p className="text-[11px] leading-relaxed text-tx-3">
+              {pendingNewDevice.reason === "replaced"
+                ? `이 브라우저에 저장돼 있던 ${pendingNewDevice.username} 기기 키는 서버에서 더 이상 인정되지 않습니다(다른 기기에서 폐기됨). 계속하면 새 키를 만들어 별도의 기기로 다시 등록합니다.`
+                : `${pendingNewDevice.username} 계정에 이 브라우저의 기기 키가 없습니다. 계속하면 새 키를 만들어 새 기기로 등록합니다.`}
+            </p>
+            <p className="rounded-xl bg-amber-500/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200 ring-1 ring-amber-400/30">
+              지금까지의 대화는 기존 기기의 키로만 암호화돼 있습니다. <b>새 기기는 과거 메시지를 읽을 수 없습니다.</b>
+              기존 기기에서 이 기기를 승인한 뒤 ‘이전 대화 공유’를 실행해야 과거 메시지를 볼 수 있습니다.
+            </p>
+            <p className="text-[11px] leading-relaxed text-tx-4">
+              등록 후에는 기존 기기의 승인을 받아야 메시지를 주고받을 수 있습니다.
+            </p>
+          </div>
+          {error && (
+            <div className="rounded-xl bg-danger-tx/10 px-3.5 py-2.5 text-xs text-danger-tx ring-1 ring-danger-tx/25">
+              {error}
+            </div>
+          )}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void registerNewDevice()}
+            className="btn-primary w-full !py-3.5"
+          >
+            {busy ? "등록 중…" : "이해했습니다 · 새 기기로 등록"}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => { cancelNewDevice(); setPassword(""); }}
+            className="btn-ghost w-full !py-2.5 text-xs disabled:opacity-40"
+          >
+            취소
+          </button>
         </div>
+      </OnboardingShell>
+    );
+  }
 
+  return (
+    <OnboardingShell>
         <form onSubmit={submit} className="onboarding-card w-full space-y-4">
           <Segmented
             tone="surface"
@@ -251,6 +303,24 @@ export default function Onboarding() {
             이 브라우저의 로컬 기기 초기화
           </button>
         )}
+    </OnboardingShell>
+  );
+}
+
+/**
+ * The centered card layout shared by the credential form and by the new-device
+ * warning that replaces it — the warning must not render alongside a live
+ * password form, since submitting that form is what registers the key.
+ */
+function OnboardingShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="onboarding-shell grid min-h-full place-items-center overflow-y-auto px-5 py-10">
+      <div className="flex w-full max-w-[400px] flex-col items-center gap-6 animate-rise">
+        <div className="flex items-center gap-2.5">
+          <BrandMark className="h-8 w-8 rounded-[11px]" />
+          <p className="text-base font-bold tracking-tight text-tx-1">SecureMsg</p>
+        </div>
+        {children}
       </div>
     </div>
   );

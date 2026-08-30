@@ -315,6 +315,24 @@ describe("trusted key directory", () => {
     expect((await getAccountTrust(801))?.security_epoch).toBe(5);
   });
 
+  it("marks a device the next verified directory drops as revoked, keeping its key", async () => {
+    const kept = snapshot(807, "kept", 1);
+    const devices = [...kept.devices, {
+      sid: "lost", pub_key: "box-lost", sig_pub: "sign-lost", kind: "web", fingerprint: "fp-lost",
+    }];
+    await pinTrustedDirectory({ ...kept, devices, directory_hash: serverDirectoryHash(devices) });
+
+    await pinTrustedDirectory({ ...kept, security_epoch: 2 });
+
+    const rows = await listTrustedDevices(807);
+    // The row itself stays: history "lost" wrapped while it was trusted has to
+    // remain openable. Only the mark separates "was verified" from "may still
+    // be given access".
+    expect(rows.map((row) => row.sid).sort()).toEqual(["kept", "lost"]);
+    expect(rows.find((row) => row.sid === "kept")?.revoked_at).toBeNull();
+    expect(rows.find((row) => row.sid === "lost")?.revoked_at).toEqual(expect.any(Number));
+  });
+
   it("rejects an unsigned legacy directory after verified_v2 was pinned", async () => {
     const verified = snapshot(805, "verified-root", 3);
     await pinTrustedDirectory(verified);

@@ -208,6 +208,27 @@ export interface BlocklistResult {
   error?: string;
 }
 
+/** One re-wrapped message key offered to a later-registered device. */
+export interface ShareKeyEntry {
+  seq: number;
+  ek: string;
+  n: string;
+}
+
+export interface MissingKeysResult extends ApiResult {
+  cid?: string;
+  sid?: string;
+  seqs?: number[];
+}
+
+export interface ShareKeysResult extends ApiResult {
+  added?: number;
+  skipped?: number;
+}
+
+/** Server-enforced per-request cap on /share-keys entries. */
+export const SHARE_KEYS_BATCH_MAX = 200;
+
 export interface ServerMessage {
   id: number;
   seq: number;
@@ -396,6 +417,35 @@ export class Api {
   }
   fetchMessages(cid: string, since: number, limit = 200): Promise<{ ok: boolean; messages?: ServerMessage[]; error?: string }> {
     return this.get(`/conversation/${encodeURIComponent(cid)}/messages?since=${since}&limit=${limit}`);
+  }
+  /** Sequences in `cid` that `sid` holds no envelope key for. */
+  missingKeys(cid: string, sid: string): Promise<MissingKeysResult> {
+    return this.get(
+      `/conversation/${encodeURIComponent(cid)}/missing-keys?sid=${encodeURIComponent(sid)}`,
+    );
+  }
+  /**
+   * Grant `sid` re-wrapped keys for past messages. The server caps one request
+   * at SHARE_KEYS_BATCH_MAX entries and rejects a larger body outright, so the
+   * split happens here rather than in every caller. Counts are summed across
+   * the requests; the first failure stops the run and is returned as-is,
+   * because the entries already accepted are committed and re-offering them is
+   * harmless (the server never overwrites an existing key).
+   */
+  async shareKeys(cid: string, sid: string, entries: ShareKeyEntry[]): Promise<ShareKeysResult> {
+    let added = 0;
+    let skipped = 0;
+    for (let start = 0; start < entries.length; start += SHARE_KEYS_BATCH_MAX) {
+      const batch = entries.slice(start, start + SHARE_KEYS_BATCH_MAX);
+      const result = await this.post<ShareKeysResult>(
+        `/conversation/${encodeURIComponent(cid)}/share-keys`,
+        { sid, entries: batch },
+      );
+      if (!result.ok) return { ...result, added, skipped };
+      added += result.added ?? 0;
+      skipped += result.skipped ?? 0;
+    }
+    return { ok: true, added, skipped };
   }
 }
 

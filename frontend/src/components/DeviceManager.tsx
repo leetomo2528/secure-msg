@@ -17,6 +17,7 @@ import { parsePairingQr, pairingSafetyNumber } from "../crypto/pairing";
 import PairingScanner from "./PairingScanner";
 import { pinTrustedDirectory, TrustViolationError } from "../store/db";
 import { useStore } from "../store/useStore";
+import { shareHistoryWithDevice, type HistoryShareProgress } from "../store/historyShare";
 import { CollapsibleCard } from "./ui";
 
 /** A scanned pairing session awaiting the human safety-number comparison. */
@@ -26,6 +27,16 @@ interface PairingConfirmation {
   nonceNew: string;
   nonceApprover: string;
   safety: string;
+}
+
+/**
+ * /devices lists every row the account ever had, tombstones included, so a
+ * device that lost access is still rendered. Only these two states mean "no
+ * longer a member"; a missing state comes from a relay predating trust
+ * metadata and is left to the pinned directory to judge.
+ */
+function hasLostAccess(device: AccountDevice): boolean {
+  return device.trust_state === "revoked" || device.trust_state === "rejected";
 }
 
 function securityError(error: unknown): string {
@@ -43,6 +54,9 @@ export default function DeviceManager() {
   const [securityWarning, setSecurityWarning] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [pairing, setPairing] = useState<PairingConfirmation | null>(null);
+  const [shareTarget, setShareTarget] = useState<{ sid: string; name: string } | null>(null);
+  const [shareProgress, setShareProgress] = useState<HistoryShareProgress | null>(null);
+  const [shareSummary, setShareSummary] = useState<string | null>(null);
 
   const devices = directory?.devices ?? [];
   const pending = devices.filter((device) => device.trust_state === "pending");
@@ -180,7 +194,10 @@ export default function DeviceManager() {
         useStore.setState({ error: result.error ?? "새 기기를 승인하지 못했습니다." });
         return;
       }
+      // load() re-pins the directory, so the freshly approved device has a
+      // locally pinned key before history sharing is even offered.
       await load();
+      offerHistoryShare(device);
     } catch (error) {
       useStore.setState({ error: securityError(error) });
     } finally {
@@ -280,9 +297,46 @@ export default function DeviceManager() {
       }
       setPairing(null);
       await load();
+      offerHistoryShare(subject);
     } catch (error) {
       useStore.setState({ error: securityError(error) });
     } finally {
+      setBusySid(null);
+    }
+  };
+
+  /**
+   * Approving a device only lets it read messages sent from now on. Offer the
+   * backfill immediately, but as an offer: it is a separate decision, and the
+   * confirm below spells out what the other device gains.
+   */
+  const offerHistoryShare = (device: AccountDevice) => {
+    // Offering a backfill to a revoked row would hand every past key to the
+    // device the user just took access away from.
+    if (device.sid === mySid || hasLostAccess(device)) return;
+    setShareSummary(null);
+    setShareTarget({ sid: device.sid, name: device.name });
+  };
+
+  const runHistoryShare = async () => {
+    const target = shareTarget;
+    if (!target) return;
+    setShareTarget(null);
+    setShareSummary(null);
+    setShareProgress({ conversationsTotal: 0, conversationsDone: 0, shared: 0, skipped: 0 });
+    setBusySid(target.sid);
+    try {
+      const outcome = await shareHistoryWithDevice(target.sid, setShareProgress);
+      const skippedNote = outcome.skipped > 0
+        ? ` (이 기기가 열 수 없거나 이미 공유된 ${outcome.skipped}건 제외)`
+        : "";
+      setShareSummary(outcome.ok
+        ? `${target.name}에 이전 메시지 ${outcome.shared}건을 공유했습니다.${skippedNote}`
+        : `${outcome.shared}건까지 공유한 뒤 중단됐습니다: ${outcome.error ?? "알 수 없는 오류"}`);
+    } catch (error) {
+      setShareSummary(securityError(error));
+    } finally {
+      setShareProgress(null);
       setBusySid(null);
     }
   };
@@ -345,6 +399,50 @@ export default function DeviceManager() {
       {pending.length > 0 && (
         <div role="alert" className="rounded-lg border border-amber-400/40 bg-amber-500/10 p-2.5 text-[11px] text-amber-200">
           새 기기 {pending.length}대가 승인을 기다립니다. 본인이 추가한 기기가 아니라면 거부하고 비밀번호를 변경하세요.
+        </div>
+      )}
+
+      {shareTarget && (
+        <div className="space-y-3 rounded-lg border border-amber-400/40 bg-amber-500/10 p-3">
+          <div>
+            <p className="text-xs font-semibold text-tx-1">‘{shareTarget.name}’에 이전 대화를 공유할까요?</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-tx-3">
+              공유하면 그 기기가 <b>지금까지 주고받은 과거 메시지를 모두 읽을 수 있게</b> 됩니다.
+              이 기기가 열 수 있는 메시지의 키만 그 기기의 공개키로 다시 감싸 서버에 올리며,
+              서버는 여전히 내용을 볼 수 없습니다. 공유하지 않으면 그 기기는 앞으로 오는 메시지만 봅니다.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => void runHistoryShare()}
+              className="btn-primary flex-1 !py-2 text-xs"
+            >
+              이전 대화 공유
+            </button>
+            <button type="button" onClick={() => setShareTarget(null)} className="btn-ghost !py-2 text-xs">
+              공유 안 함
+            </button>
+          </div>
+        </div>
+      )}
+
+      {shareProgress && (
+        <div role="status" className="rounded-lg bg-fg/[0.04] p-2.5 text-[11px] leading-relaxed text-tx-3">
+          이전 대화 공유 중… 대화 {shareProgress.conversationsDone}/{shareProgress.conversationsTotal},
+          메시지 {shareProgress.shared}건 공유됨
+        </div>
+      )}
+
+      {shareSummary && (
+        <div role="status" className="flex items-start justify-between gap-2 rounded-lg bg-fg/[0.04] p-2.5 text-[11px] leading-relaxed text-tx-2">
+          <span>{shareSummary}</span>
+          <button
+            type="button"
+            onClick={() => setShareSummary(null)}
+            className="shrink-0 text-tx-4"
+            aria-label="공유 결과 닫기"
+          >×</button>
         </div>
       )}
 
@@ -426,6 +524,7 @@ export default function DeviceManager() {
           let fingerprint: string | null = null;
           try { fingerprint = deviceFingerprint(device.pub_key, device.sig_pub).display; } catch { /* malformed server key */ }
           const isPending = device.trust_state === "pending";
+          const lostAccess = hasLostAccess(device);
           return (
             <li key={device.sid} className={`rounded-lg px-2.5 py-2 text-xs ${isPending ? "bg-amber-500/10 ring-1 ring-amber-400/30" : "bg-fg/[0.04]"}`}>
               <div className="flex items-center justify-between gap-2">
@@ -434,6 +533,11 @@ export default function DeviceManager() {
                     {device.kind === "android_gateway" ? "📱 " : "🌐 "}{device.name}{" "}
                     {device.sid === mySid && <span className="text-accent-tx">(현재 기기)</span>}
                     {isPending && <span className="ml-1 text-amber-300">승인 대기</span>}
+                    {lostAccess && (
+                      <span className="ml-1 text-danger-tx/80">
+                        {device.trust_state === "revoked" ? "폐기됨" : "거부됨"}
+                      </span>
+                    )}
                   </div>
                   <div className="text-[9px] text-tx-4">{new Date(device.last_seen * 1000).toLocaleString("ko-KR")}</div>
                 </div>
@@ -444,7 +548,18 @@ export default function DeviceManager() {
                       <button onClick={() => void reject(device)} disabled={busySid != null} className="rounded-md bg-red-500/10 px-2 py-1 text-[10px] text-danger-tx disabled:opacity-40">거부</button>
                     </>
                   ) : (
-                    <button onClick={() => void revoke(device)} disabled={busySid != null} className="rounded-md px-2 py-1 text-[10px] text-danger-tx/80 ring-1 ring-red-400/30 disabled:opacity-40">폐기</button>
+                    <>
+                      {device.sid !== mySid && !lostAccess && (
+                        <button
+                          onClick={() => offerHistoryShare(device)}
+                          disabled={busySid != null}
+                          className="rounded-md px-2 py-1 text-[10px] text-accent-tx ring-1 ring-fg/10 disabled:opacity-40"
+                        >이전 대화 공유</button>
+                      )}
+                      {!lostAccess && (
+                        <button onClick={() => void revoke(device)} disabled={busySid != null} className="rounded-md px-2 py-1 text-[10px] text-danger-tx/80 ring-1 ring-red-400/30 disabled:opacity-40">폐기</button>
+                      )}
+                    </>
                   )}
                 </div>
               </div>

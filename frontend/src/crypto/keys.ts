@@ -97,6 +97,13 @@ export interface EnvelopeKey {
   ek: string;
   /** Box nonce, base64. */
   n: string;
+  /**
+   * SID of the device that re-wrapped this key so a later-registered device of
+   * the same account can read history it was not addressed in. When present the
+   * crypto_box was sealed by THAT device, so opening it needs the wrapper's
+   * public key, not the message sender's. Absent on originally-addressed keys.
+   */
+  by?: string;
 }
 
 export interface Envelope {
@@ -136,18 +143,32 @@ export async function encryptMessage(
 /**
  * Decrypt with known sender pubkey. The caller resolves sender device pubkey
  * from the conversation's member list (cached in store).
+ *
+ * `resolveWrapperPubkey` opens keys re-wrapped by another device of the same
+ * account (`EnvelopeKey.by`). It MUST return a locally pinned key and nothing
+ * else: a relay that could name an arbitrary wrapper and supply its public key
+ * would be naming a key it holds the secret half of, which is exactly the
+ * impersonation the pinned directory exists to prevent. An unresolvable
+ * wrapper is a refusal, never a fallback to the sender key.
  */
 export function decryptMessageWithSender(
   env: Envelope,
   myDeviceSid: string,
   myKeypair: DeviceKeypair,
   senderDevicePubkeyB64: string,
+  resolveWrapperPubkey?: (sid: string) => string | null | undefined,
 ): string | null {
   try {
     const myKey = env?.keys?.[myDeviceSid];
     if (!myKey) return null;
+    let openerPubkeyB64 = senderDevicePubkeyB64;
+    if (myKey.by) {
+      const wrapperPubkey = resolveWrapperPubkey?.(myKey.by);
+      if (!wrapperPubkey) return null;
+      openerPubkeyB64 = wrapperPubkey;
+    }
     const mySk = unb64u(myKeypair.box.sk);
-    const senderPk = unb64u(senderDevicePubkeyB64);
+    const senderPk = unb64u(openerPubkeyB64);
     const messageKey = sodium.crypto_box_open_easy(
       unb64u(myKey.ek),
       unb64u(myKey.n),
@@ -162,5 +183,49 @@ export function decryptMessageWithSender(
     return sodium.to_string(plain);
   } catch {
     return null; // malformed, tampered, or encrypted by another sender/device
+  }
+}
+
+/**
+ * Re-wrap this device's copy of a message key for another device of the same
+ * account, so a device registered after the message was sent can read it.
+ *
+ * `openerPubkeyB64` is whichever public key opens OUR entry: the message
+ * sender's, or — when our own entry carries `by` — that wrapper's. Both must
+ * come from the locally pinned directory, and so must `targetPubkeyB64`: this
+ * function grants read access, so a relay-supplied target key would hand
+ * history to whoever the relay names.
+ *
+ * The result is sealed under THIS device's secret key, which is why it is
+ * stamped `by` with our own SID. Returns null when our entry is missing or
+ * cannot be opened with the supplied key.
+ */
+export function rewrapMessageKey(
+  env: Envelope,
+  myDeviceSid: string,
+  myKeypair: DeviceKeypair,
+  openerPubkeyB64: string,
+  targetPubkeyB64: string,
+): EnvelopeKey | null {
+  try {
+    const myKey = env?.keys?.[myDeviceSid];
+    if (!myKey) return null;
+    const mySk = unb64u(myKeypair.box.sk);
+    const messageKey = sodium.crypto_box_open_easy(
+      unb64u(myKey.ek),
+      unb64u(myKey.n),
+      unb64u(openerPubkeyB64),
+      mySk,
+    );
+    const boxNonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
+    const ek = sodium.crypto_box_easy(
+      messageKey,
+      boxNonce,
+      unb64u(targetPubkeyB64),
+      mySk,
+    );
+    return { ek: b64u(ek), n: b64u(boxNonce), by: myDeviceSid };
+  } catch {
+    return null; // not addressed to us, tampered, or a key we cannot open
   }
 }
