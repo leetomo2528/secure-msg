@@ -1130,13 +1130,35 @@ class SmsBridgeService : Service() {
             return false
         }
 
-        val plaintext = try {
-            CryptoUtil.decryptMessage(
-                CryptoUtil.envelopeFromJson(env.getJSONObject("payload")),
-                c.sid,
-                c.keypair,
-                senderPubKey,
+        val carrierStatus = env.optString("carrier_status", "none")
+        if (!RelaySyncPolicy.isCarrierSendRequest(trustedSender?.kind, carrierStatus)) {
+            // History, not a send request. It is not rendered locally either:
+            // the envelope does not say which direction a gateway uploaded it
+            // in, and guessing would show an incoming SMS as one this account
+            // sent.
+            Log.i(
+                TAG,
+                "Consuming history row $cid/$seq without carrier dispatch " +
+                    "(senderKind=${trustedSender?.kind}, carrierStatus=$carrierStatus)",
             )
+            db.threadDao().advanceLastSeq(cid, seq)
+            relay?.emitDelivered(cid, seq)
+            return true
+        }
+
+        val plaintext = try {
+            val payload = CryptoUtil.envelopeFromJson(env.getJSONObject("payload"))
+            // A key re-wrapped by another device of this account (history
+            // sharing) was sealed by that device, so it opens with that
+            // device's key. Resolve it here — a suspend DAO read cannot happen
+            // inside the resolver — and only from the pinned trust store: a
+            // pub_key echoed by the relay would let a hostile server name
+            // itself as the wrapper and hand over a key it controls.
+            val wrapperSid = payload.keys[c.sid]?.by
+            val wrapperPubKey = wrapperSid?.let { db.deviceTrustDao().getPin(it)?.pubKey }
+            CryptoUtil.decryptMessage(payload, c.sid, c.keypair, senderPubKey) { sid ->
+                wrapperPubKey.takeIf { sid == wrapperSid }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Malformed envelope for seq=$seq", e)
             null

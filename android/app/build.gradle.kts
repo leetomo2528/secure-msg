@@ -13,8 +13,8 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.13.0"
+        versionCode = 29
+        versionName = "0.14.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -89,6 +89,12 @@ dependencies {
     // OkHttp (REST calls)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Unit tests run on the host JVM, where the JNA *AAR* ships no desktop
+    // dispatcher. The plain jar does; HostSodium then points JNA at a host
+    // libsodium so envelope tests exercise real crypto. lazysodium-java is
+    // deliberately NOT used here: it redefines com.goterl.lazysodium.Sodium
+    // and shadows the Android class CryptoUtil binds to.
+    testImplementation("net.java.dev.jna:jna:5.17.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

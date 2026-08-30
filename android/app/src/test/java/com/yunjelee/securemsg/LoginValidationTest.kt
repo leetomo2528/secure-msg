@@ -18,7 +18,7 @@ class LoginValidationTest {
     @Test
     fun onboardingWarnsAboutNewDeviceHistoryCutoff() {
         assertTrue(NEW_DEVICE_HISTORY_WARNING.contains("기기 등록 이전 메시지를 복호화할 수 없습니다"))
-        assertTrue(NEW_DEVICE_HISTORY_WARNING.contains("기존 기기 전송이나 암호화 백업 기능을 제공하지 않습니다"))
+        assertTrue(NEW_DEVICE_HISTORY_WARNING.contains("'이전 대화 공유'를 실행해야"))
     }
 
     @Test

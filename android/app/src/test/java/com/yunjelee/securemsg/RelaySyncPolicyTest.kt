@@ -39,4 +39,25 @@ class RelaySyncPolicyTest {
         assertTrue(RelaySyncPolicy.canConsumeSelfEcho(true, false))
         assertTrue(RelaySyncPolicy.canConsumeSelfEcho(false, true))
     }
+
+    @Test
+    fun `an undispatched row from another device kind is a send request`() {
+        assertTrue(RelaySyncPolicy.isCarrierSendRequest("web", "none"))
+        assertTrue(RelaySyncPolicy.isCarrierSendRequest("web", ""))
+    }
+
+    @Test
+    fun `a row a gateway uploaded is never resent to the carrier`() {
+        // Incoming SMS and this phone's own outbound copies both arrive with a
+        // gateway as sender; a replacement gateway must not send them again.
+        assertFalse(RelaySyncPolicy.isCarrierSendRequest("android_gateway", "none"))
+        assertFalse(RelaySyncPolicy.isCarrierSendRequest("android_gateway", ""))
+    }
+
+    @Test
+    fun `a row a gateway already dispatched is never resent`() {
+        for (status in listOf("queued", "dispatched", "sent", "delivered", "failed", "unknown")) {
+            assertFalse(status, RelaySyncPolicy.isCarrierSendRequest("web", status))
+        }
+    }
 }

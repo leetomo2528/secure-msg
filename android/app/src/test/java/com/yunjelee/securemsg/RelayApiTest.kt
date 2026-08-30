@@ -141,6 +141,54 @@ class RelayApiTest {
         assertTrue(body.getJSONArray("entries").getJSONObject(1).isNull("contact_name"))
     }
 
+    @Test
+    fun missingKeysQueriesTheTargetDevice() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"seqs\":[1,2,5]}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient()).also {
+            it.token = "android-token"
+        }
+
+        val result = api.missingKeys("cid one", "device-b")
+        val request = server.takeRequest()
+
+        assertEquals(3, result.getJSONArray("seqs").length())
+        assertEquals("GET", request.method)
+        // Both segments come from server responses and must stay escaped.
+        assertEquals("/api/conversation/cid+one/missing-keys?sid=device-b", request.path)
+        assertEquals("Bearer android-token", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun shareKeysPostsSeqEkAndNonce() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"added\":2,\"skipped\":0}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient()).also {
+            it.token = "android-token"
+        }
+
+        val result = api.shareKeys(
+            "cid-1", "device-b",
+            listOf(SharedKeyEntry(4, "ek-4", "n-4"), SharedKeyEntry(9, "ek-9", "n-9")),
+        )
+        val request = server.takeRequest()
+        val body = JSONObject(request.body.readUtf8())
+
+        assertEquals(2, result.getInt("added"))
+        assertEquals("POST", request.method)
+        assertEquals("/api/conversation/cid-1/share-keys", request.path)
+        assertEquals("device-b", body.getString("sid"))
+        assertEquals(4, body.getJSONArray("entries").getJSONObject(0).getInt("seq"))
+        assertEquals("ek-9", body.getJSONArray("entries").getJSONObject(1).getString("ek"))
+        assertEquals("n-9", body.getJSONArray("entries").getJSONObject(1).getString("n"))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun shareKeysRefusesMoreThanTheServerCap() {
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+        val entries = (1..RelayApi.MAX_SHARE_ENTRIES + 1).map { SharedKeyEntry(it, "ek", "n") }
+
+        api.shareKeys("cid-1", "device-b", entries)
+    }
+
     private fun jsonResponse(status: Int, body: String) = MockResponse()
         .setResponseCode(status)
         .setHeader("Content-Type", "application/json")

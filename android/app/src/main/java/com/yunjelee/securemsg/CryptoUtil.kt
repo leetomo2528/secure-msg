@@ -110,7 +110,18 @@ object CryptoUtil {
         return b64u(out)
     }
 
-    data class EnvelopeKey(val ek: String, val n: String)
+    /** Symmetric message key length; crypto_secretbox_KEYBYTES. */
+    private const val MESSAGE_KEY_BYTES = 32
+
+    /**
+     * One wrapped copy of the message key.
+     *
+     * [by] is the sid of a device that re-wrapped the key for history sharing.
+     * That device sealed the box with ITS secret key, so the entry opens with
+     * that device's public key — not the message sender's. Entries written by
+     * the original sender have no [by] and open with the sender's key.
+     */
+    data class EnvelopeKey(val ek: String, val n: String, val by: String? = null)
 
     data class Envelope(
         val ct: String,
@@ -150,27 +161,63 @@ object CryptoUtil {
         return Envelope(b64u(ct), b64u(nonce), keys)
     }
 
+    /**
+     * Open one key entry into the raw message key.
+     *
+     * [openerPubKeyB64] must be the public key of the device that SEALED this
+     * entry: the message sender, or the re-wrapper named by [EnvelopeKey.by].
+     *
+     * Every length is checked before the call: cryptoBoxOpenEasy writes
+     * `ek.size - MACBYTES` bytes into the output buffer and reads NONCEBYTES /
+     * key lengths from its inputs without validating them, so a relay that
+     * returns an over-long `ek` (or a short nonce/key) would corrupt memory
+     * inside the native library rather than fail.
+     */
+    private fun openMessageKey(
+        entry: EnvelopeKey,
+        myKeypair: DeviceKeypair,
+        openerPubKeyB64: String,
+    ): ByteArray? {
+        val ekBytes = unb64u(entry.ek)
+        if (ekBytes.size != MESSAGE_KEY_BYTES + Box.MACBYTES) return null
+        val ekNonce = unb64u(entry.n)
+        if (ekNonce.size != Box.NONCEBYTES) return null
+        val openerPk = unb64u(openerPubKeyB64)
+        if (openerPk.size != Box.PUBLICKEYBYTES) return null
+        val mySk = unb64u(myKeypair.boxSk)
+        if (mySk.size != Box.SECRETKEYBYTES) return null
+        val messageKey = ByteArray(MESSAGE_KEY_BYTES)
+        if (!sodium.cryptoBoxOpenEasy(
+                messageKey, ekBytes, ekBytes.size.toLong(), ekNonce, openerPk, mySk,
+            )
+        ) return null
+        return messageKey
+    }
+
+    /**
+     * @param resolveWrapperPubKey public key of a device that re-wrapped this
+     *   entry ([EnvelopeKey.by]). It MUST come from the caller's pinned trust
+     *   store: a key taken from a server response would let a hostile relay
+     *   name itself as the wrapper and hand over a key it controls. Entries
+     *   without `by` never reach it and keep using [senderPubKeyB64].
+     */
     fun decryptMessage(
         env: Envelope,
         mySid: String,
         myKeypair: DeviceKeypair,
         senderPubKeyB64: String,
+        resolveWrapperPubKey: (String) -> String? = { null },
     ): String? {
         return try {
             val myKey = env.keys[mySid] ?: return null
-            val mySk = unb64u(myKeypair.boxSk)
-            val senderPk = unb64u(senderPubKeyB64)
-            val ekBytes = unb64u(myKey.ek)
-            val ekNonce = unb64u(myKey.n)
-            val messageKey = ByteArray(32)
-            if (!sodium.cryptoBoxOpenEasy(
-                    messageKey, ekBytes, ekBytes.size.toLong(), ekNonce, senderPk, mySk,
-                )
-            ) return null
+            val openerPubKey = myKey.by?.let { resolveWrapperPubKey(it) ?: return null }
+                ?: senderPubKeyB64
+            val messageKey = openMessageKey(myKey, myKeypair, openerPubKey) ?: return null
 
             val ctBytes = unb64u(env.ct)
             if (ctBytes.size < SecretBox.MACBYTES) return null
             val ctNonce = unb64u(env.nonce)
+            if (ctNonce.size != SecretBox.NONCEBYTES) return null
             val ptBytes = ByteArray(ctBytes.size - SecretBox.MACBYTES)
             if (!sodium.cryptoSecretBoxOpenEasy(
                     ptBytes, ctBytes, ctBytes.size.toLong(), ctNonce, messageKey,
@@ -182,10 +229,52 @@ object CryptoUtil {
         }
     }
 
+    /**
+     * Re-wrap this device's copy of a message key for [targetPubKeyB64], so a
+     * device that was not an original recipient can read existing history.
+     *
+     * [openerPubKeyB64] is whichever key opens THIS device's entry — the
+     * message sender's, or the re-wrapper's when the entry carries a `by`.
+     * The caller resolves it (from its pinned trust store) because only the
+     * caller can say which sid is trusted for that role.
+     *
+     * The result is sealed with this device's secret key, so it is stamped
+     * `by = mySid`: the target must open it with THIS device's public key.
+     */
+    fun rewrapMessageKey(
+        env: Envelope,
+        mySid: String,
+        myKeypair: DeviceKeypair,
+        openerPubKeyB64: String,
+        targetPubKeyB64: String,
+    ): EnvelopeKey? {
+        return try {
+            val myKey = env.keys[mySid] ?: return null
+            val messageKey = openMessageKey(myKey, myKeypair, openerPubKeyB64) ?: return null
+            val targetPk = unb64u(targetPubKeyB64)
+            if (targetPk.size != Box.PUBLICKEYBYTES) return null
+            val mySk = unb64u(myKeypair.boxSk)
+            if (mySk.size != Box.SECRETKEYBYTES) return null
+            val boxNonce = sodium.randomBytesBuf(Box.NONCEBYTES)
+            val ek = ByteArray(messageKey.size + Box.MACBYTES)
+            if (!sodium.cryptoBoxEasy(
+                    ek, messageKey, messageKey.size.toLong(), boxNonce, targetPk, mySk,
+                )
+            ) return null
+            EnvelopeKey(b64u(ek), b64u(boxNonce), by = mySid)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun envelopeToJson(env: Envelope): JSONObject {
         val keysObj = JSONObject()
         for ((sid, ek) in env.keys) {
-            keysObj.put(sid, JSONObject().put("ek", ek.ek).put("n", ek.n))
+            val entry = JSONObject().put("ek", ek.ek).put("n", ek.n)
+            // Absent, not null: an entry without `by` is an original-sender key
+            // and every existing client reads it that way.
+            ek.by?.let { entry.put("by", it) }
+            keysObj.put(sid, entry)
         }
         return JSONObject()
             .put("ct", env.ct)
@@ -200,7 +289,11 @@ object CryptoUtil {
         while (it.hasNext()) {
             val sid = it.next()
             val k = keysObj.getJSONObject(sid)
-            keys[sid] = EnvelopeKey(k.getString("ek"), k.getString("n"))
+            keys[sid] = EnvelopeKey(
+                k.getString("ek"),
+                k.getString("n"),
+                k.optString("by").takeIf { it.isNotBlank() },
+            )
         }
         return Envelope(obj.getString("ct"), obj.getString("nonce"), keys)
     }

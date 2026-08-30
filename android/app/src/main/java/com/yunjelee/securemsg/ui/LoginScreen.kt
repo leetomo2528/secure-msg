@@ -54,9 +54,17 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 internal const val ACCOUNT_RECOVERY_WARNING =
     "이메일 인증코드로 비밀번호를 재설정할 수 있습니다. 가입 또는 재설정에 사용한 이메일 주소를 안전하게 보관하세요."
 internal const val NEW_DEVICE_HISTORY_WARNING =
-    "새 휴대폰·새 설치는 기기 등록 이전 메시지를 복호화할 수 없습니다. 현재는 기존 기기 전송이나 암호화 백업 기능을 제공하지 않습니다."
+    "새 휴대폰·새 설치는 기기 등록 이전 메시지를 복호화할 수 없습니다. " +
+        "이미 승인된 기존 기기의 설정에서 '이전 대화 공유'를 실행해야 지난 메시지를 읽을 수 있습니다."
 
 private class EmailRegistrationRequired(val challengeId: String) : Exception()
+
+/**
+ * Raised instead of registering a brand-new device for an existing account, so
+ * the user sees what registering costs before a key pair is on the server.
+ * Never raised on the device-login path (a stored sid keeps its history).
+ */
+internal class NewDeviceConfirmationRequired : Exception()
 
 /** Login / auto-register screen (self-hosted relay, arbitrary username). */
 @Composable
@@ -82,6 +90,71 @@ fun LoginScreen(
     var recoveryChallenge by remember { mutableStateOf<String?>(null) }
     var recoveryNewPassword by remember { mutableStateOf("") }
     var recoveryMessage by remember { mutableStateOf<String?>(null) }
+    // True once the server says this login would create a brand-new device.
+    var confirmNewDevice by remember { mutableStateOf(false) }
+
+    fun submitLogin(newDeviceConfirmed: Boolean) {
+        if (busy) return
+        busy = true
+        error = null
+        scope.launch(Dispatchers.IO) {
+            try {
+                val saved = doLogin(
+                    context, serverUrl.trim(), username.trim(), password,
+                    registrationEmail.trim(), registrationChallenge, registrationCode,
+                    newDeviceConfirmed,
+                )
+                withContext(Dispatchers.Main) {
+                    ServerConfig.save(context, serverUrl.trim())
+                    onLogin(saved)
+                }
+            } catch (e: LinkageError) {
+                Log.e("LoginScreen", "Crypto native library initialization failed", e)
+                withContext(Dispatchers.Main) {
+                    error = "암호화 모듈을 불러오지 못했습니다. 앱을 최신 버전으로 다시 설치해 주세요."
+                }
+            } catch (e: NewDeviceConfirmationRequired) {
+                withContext(Dispatchers.Main) { confirmNewDevice = true }
+            } catch (e: EmailRegistrationRequired) {
+                withContext(Dispatchers.Main) {
+                    registrationChallenge = e.challengeId
+                    registrationCode = ""
+                    error = "가입 이메일로 인증코드를 보냈습니다. 코드를 입력한 뒤 다시 눌러 주세요."
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { error = e.message ?: "로그인에 실패했습니다." }
+            } finally {
+                withContext(Dispatchers.Main) { busy = false }
+            }
+        }
+    }
+
+    if (confirmNewDevice) {
+        AlertDialog(
+            onDismissRequest = { confirmNewDevice = false },
+            containerColor = Sm.surface,
+            shape = RoundedCornerShape(16.dp),
+            titleContentColor = Sm.text1,
+            textContentColor = Sm.text3,
+            title = { Text("새 기기로 등록") },
+            text = {
+                Text(
+                    "이 휴대폰은 계정의 새 기기로 등록됩니다. 새 기기는 등록 이전 대화를 읽을 수 없고, " +
+                        "이미 승인된 기존 기기에서 '이전 대화 공유'를 실행해야 지난 메시지를 볼 수 있습니다. " +
+                        "또 등록 요청은 기존 기기의 승인을 받아야 사용할 수 있습니다.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmNewDevice = false
+                    submitLogin(true)
+                }) { Text("새 기기로 등록", color = Sm.teal) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmNewDevice = false }) { Text("취소", color = Sm.text3) }
+            },
+        )
+    }
 
     if (confirmForget) {
         AlertDialog(
@@ -191,37 +264,7 @@ fun LoginScreen(
                     text = if (busy) "처리 중…" else "로그인 / 회원가입",
                     enabled = !busy && username.isNotBlank() && password.isNotBlank(),
                     modifier = Modifier.fillMaxWidth(),
-                    onClick = {
-                        if (busy) return@SmGradientButton
-                        busy = true; error = null
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                val saved = doLogin(
-                                    context, serverUrl.trim(), username.trim(), password,
-                                    registrationEmail.trim(), registrationChallenge, registrationCode,
-                                )
-                                withContext(Dispatchers.Main) {
-                                    ServerConfig.save(context, serverUrl.trim())
-                                    onLogin(saved)
-                                }
-                            } catch (e: LinkageError) {
-                                Log.e("LoginScreen", "Crypto native library initialization failed", e)
-                                withContext(Dispatchers.Main) {
-                                    error = "암호화 모듈을 불러오지 못했습니다. 앱을 최신 버전으로 다시 설치해 주세요."
-                                }
-                            } catch (e: EmailRegistrationRequired) {
-                                withContext(Dispatchers.Main) {
-                                    registrationChallenge = e.challengeId
-                                    registrationCode = ""
-                                    error = "가입 이메일로 인증코드를 보냈습니다. 코드를 입력한 뒤 다시 눌러 주세요."
-                                }
-                            } catch (e: Exception) {
-                                withContext(Dispatchers.Main) { error = e.message ?: "로그인에 실패했습니다." }
-                            } finally {
-                                withContext(Dispatchers.Main) { busy = false }
-                            }
-                        }
-                    },
+                    onClick = { submitLogin(false) },
                 )
                 if (rememberedUsername != null) {
                     Text(
@@ -407,6 +450,7 @@ internal suspend fun doLogin(
     registrationEmail: String = "",
     registrationChallenge: String? = null,
     registrationCode: String = "",
+    confirmNewDevice: Boolean = false,
 ): SavedCredentials {
     if (!Regex("^[a-z0-9_]{3,20}$").matches(username)) {
         throw IllegalArgumentException("아이디는 영소문자·숫자·_ 3~20자로 입력하세요.")
@@ -466,7 +510,11 @@ internal suspend fun doLogin(
     val deviceName = "android-${Build.MODEL.take(10)}"
 
     if (loginResp.optBoolean("ok")) {
-        // User exists → register new device.
+        // User exists → register new device. This account already has history
+        // that a brand-new key pair cannot read, so the user confirms first.
+        // The new-account branch below needs no such prompt: there is nothing
+        // to have missed, and no existing device that could share it.
+        if (!confirmNewDevice) throw NewDeviceConfirmationRequired()
         val dr = api.deviceRegister(username, pwHash, deviceName, kp.boxPk, kp.signPk)
         if (!dr.optBoolean("ok")) throw Exception(dr.optString("error", "device register failed"))
         api.token = dr.getString("token")

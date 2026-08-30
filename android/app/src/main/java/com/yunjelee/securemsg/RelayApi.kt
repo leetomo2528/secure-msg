@@ -8,6 +8,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+/** One re-wrapped message key: sequence in the conversation, sealed for the target. */
+data class SharedKeyEntry(val seq: Int, val ek: String, val n: String)
+
 class RelayApi(
     val baseUrl: String,
     private val http: OkHttpClient = HTTP,
@@ -178,8 +181,36 @@ class RelayApi(
     fun convMembers(cid: String): JSONObject =
         get("/api/conversation/${encodeSegment(cid)}/members")
 
-    fun fetchMessages(cid: String, since: Int): JSONObject =
-        get("/api/conversation/${encodeSegment(cid)}/messages?since=$since&limit=500")
+    fun fetchMessages(cid: String, since: Int, limit: Int = 500): JSONObject =
+        get("/api/conversation/${encodeSegment(cid)}/messages?since=$since&limit=$limit")
+
+    /** Sequences in [cid] that [targetSid] has no envelope key for yet. */
+    fun missingKeys(cid: String, targetSid: String): JSONObject =
+        get("/api/conversation/${encodeSegment(cid)}/missing-keys?sid=${encodeSegment(targetSid)}")
+
+    /**
+     * Hand [targetSid] re-wrapped keys for history it could not read.
+     *
+     * The relay refuses anything but another approved device of the same
+     * account, never overwrites a key the target already has, and stamps the
+     * stored entry with this device's sid as `by`.
+     */
+    fun shareKeys(cid: String, targetSid: String, entries: List<SharedKeyEntry>): JSONObject {
+        require(entries.isNotEmpty()) { "at least one entry is required" }
+        require(entries.size <= MAX_SHARE_ENTRIES) {
+            "at most $MAX_SHARE_ENTRIES entries per share-keys call"
+        }
+        val array = JSONArray()
+        for (entry in entries) {
+            array.put(
+                JSONObject().put("seq", entry.seq).put("ek", entry.ek).put("n", entry.n),
+            )
+        }
+        return post(
+            "/api/conversation/${encodeSegment(cid)}/share-keys",
+            JSONObject().put("sid", targetSid).put("entries", array),
+        )
+    }
 
     fun listBlockRules(): JSONObject = get("/api/blocklist")
 
@@ -190,6 +221,9 @@ class RelayApi(
         post("/api/blocklist/remove", JSONObject().put("id", id))
 
     companion object {
+        /** Server cap for one share-keys call (server/conversations.py). */
+        const val MAX_SHARE_ENTRIES = 200
+
         /** cids come from server responses; keep them from escaping the path/query. */
         private fun encodeSegment(value: String): String =
             java.net.URLEncoder.encode(value, "UTF-8")

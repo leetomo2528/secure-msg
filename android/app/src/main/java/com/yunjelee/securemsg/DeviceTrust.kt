@@ -348,6 +348,15 @@ data class DeviceSecurityView(
     /** This device's own registration challenge while it awaits approval. */
     val selfPendingChallenge: String? = null,
     val securityMode: String? = null,
+    /**
+     * Sids the accepted key directory currently lists as approved.
+     *
+     * Revocation never deletes a pin — the trust store has to keep the key of
+     * a device that once sealed messages — so pins alone cannot say which
+     * devices are still part of the account. Empty unless this view came from
+     * a directory that verified, so a caller that gates on it fails closed.
+     */
+    val activeSids: Set<String> = emptySet(),
 )
 
 class DeviceSecurityController(
@@ -433,6 +442,7 @@ class DeviceSecurityController(
             is TrustDecision.Accept -> DeviceSecurityView(
                 pending = pending,
                 securityMode = directoryResponse.optString("security_mode"),
+                activeSids = approved.mapTo(mutableSetOf()) { it.sid },
                 trustWarning = if (directoryResponse.optString("security_mode") == "legacy_v1") {
                     "레거시 TOFU 계정입니다. identity 기기에서 보안 업그레이드가 필요합니다."
                 } else null,

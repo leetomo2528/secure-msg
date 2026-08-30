@@ -35,6 +35,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -77,6 +78,7 @@ import com.yunjelee.securemsg.DeviceSecurityController
 import com.yunjelee.securemsg.DeviceSecurityView
 import com.yunjelee.securemsg.DeviceTrustCrypto
 import com.yunjelee.securemsg.DeviceTrustRepository
+import com.yunjelee.securemsg.HistoryShareRunner
 import com.yunjelee.securemsg.PairingHandshake
 import com.yunjelee.securemsg.PairingQrFields
 import com.yunjelee.securemsg.PendingDeviceApproval
@@ -137,6 +139,9 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
 /** Rows of the settings row-list card; tapping one expands its detail inline below. */
 private enum class SettingsRow { Quarantine, BlockedSenders, ContactSync, Update }
 
+/** Device awaiting a history-share confirmation; [label] is what the user sees. */
+private data class HistoryShareTarget(val sid: String, val label: String)
+
 /** Sender rules are validated the same way the dispatcher validates recipients. */
 internal val SenderRulePattern = Regex("^\\+?[0-9*#]{3,24}$")
 
@@ -179,6 +184,13 @@ fun SettingsPane(
     var pendingPairing by remember {
         mutableStateOf<Pair<PendingDeviceApproval, PairingHandshake>?>(null)
     }
+    // Non-null while the history-share confirmation is on screen; sharing never
+    // starts from an approval alone, only from that explicit confirmation.
+    var historyShareTarget by remember { mutableStateOf<HistoryShareTarget?>(null) }
+    // A backfill outlives this composition, so its progress and result are read
+    // from the process-scoped runner rather than held here.
+    val historyShare by HistoryShareRunner.state.collectAsState()
+    val historyShareBusy = historyShare.runningLabel != null
     // Which row-list entry is open; null collapses all of them.
     var expanded by remember { mutableStateOf<SettingsRow?>(null) }
 
@@ -201,6 +213,20 @@ fun SettingsPane(
         }
     }
 
+    /**
+     * Hand [target] the keys to every past message this device can decrypt.
+     * Only reached from the confirmation dialog, and never queued: the runner
+     * takes one backfill at a time and the user is told when it refuses.
+     */
+    fun shareHistory(target: HistoryShareTarget) {
+        deviceActionMessage = null
+        if (!HistoryShareRunner.start(context, creds, target.sid, target.label)) {
+            val running = HistoryShareRunner.state.value.runningLabel ?: "다른 기기"
+            deviceActionMessage = "이미 '$running'에 이전 대화를 공유하는 중입니다. " +
+                "끝난 뒤 '${target.label}'에 다시 시도하세요."
+        }
+    }
+
     fun actOnPending(device: PendingDeviceApproval, approve: Boolean) {
         deviceActionMessage = null
         scope.launch(Dispatchers.IO) {
@@ -216,6 +242,9 @@ fun SettingsPane(
                     if (approve) "기기를 승인했습니다." else "기기 요청을 거절했습니다."
                 } else {
                     "기기 요청 처리에 실패했습니다. 서버 상태를 확인해 주세요."
+                }
+                if (ok && approve) {
+                    historyShareTarget = HistoryShareTarget(device.sid, device.name)
                 }
                 refreshDeviceSecurity()
             }
@@ -266,6 +295,7 @@ fun SettingsPane(
                 pendingPairing = null
                 deviceActionMessage = if (ok) "기기를 승인했습니다."
                     else "승인에 실패했습니다. 페어링이 만료됐을 수 있습니다."
+                if (ok) historyShareTarget = HistoryShareTarget(device.sid, device.name)
                 refreshDeviceSecurity()
             }
         }
@@ -372,12 +402,53 @@ fun SettingsPane(
         refreshDeviceSecurity()
     }
 
+    // A backfill that finished while this pane was gone still has to report;
+    // the runner holds the result until a composition takes it.
+    LaunchedEffect(historyShare.result) {
+        historyShare.result?.let {
+            deviceActionMessage = it
+            HistoryShareRunner.consumeResult()
+            // The run verified the directory itself; adopt that view so the card
+            // and the share buttons agree with what it just decided on.
+            refreshDeviceSecurity()
+        }
+    }
+
     // This gateway's own fingerprint for the card footer; the keypair is fixed
     // for the session, so compute it once.
     val ownFingerprint = remember(creds.keypair.boxPk, creds.keypair.signPk) {
         runCatching {
             DeviceTrustCrypto.deviceFingerprint(creds.keypair.boxPk, creds.keypair.signPk)
         }.getOrNull()
+    }
+
+    historyShareTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { historyShareTarget = null },
+            containerColor = Sm.surface,
+            shape = RoundedCornerShape(16.dp),
+            titleContentColor = Sm.text1,
+            textContentColor = Sm.text3,
+            title = { Text("이전 대화 공유") },
+            text = {
+                Text(
+                    "'${target.label}' 기기가 이 기기에 있는 지난 메시지를 모두 읽을 수 있게 됩니다. " +
+                        "메시지 키를 그 기기의 공개키로 다시 암호화해 전달하며 서버는 평문을 볼 수 없지만, " +
+                        "한 번 공유하면 되돌릴 수 없습니다.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    historyShareTarget = null
+                    shareHistory(target)
+                }) { Text("공유", color = Sm.teal) }
+            },
+            dismissButton = {
+                TextButton(onClick = { historyShareTarget = null }) {
+                    Text("공유하지 않음", color = Sm.text3)
+                }
+            },
+        )
     }
 
     Column(
@@ -568,13 +639,28 @@ fun SettingsPane(
                     )
                 }
             }
+            historyShare.progress?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
             trustPins.forEach { pin ->
                 Column(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
                         .background(Sm.surfaceAlt).padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Text("${pin.name} · ${pin.kind}", color = Sm.text2, fontSize = 12.sp)
                     Text(pin.fingerprint, color = Sm.text4, fontSize = 10.sp)
+                    // A pin outlives revocation, so the pinned row alone would
+                    // still offer to hand a revoked device the whole history.
+                    // Only what the last verified directory listed as approved
+                    // may be offered, and sharing to self is a no-op.
+                    if (pin.sid != creds.sid && pin.sid in deviceSecurity.activeSids) {
+                        SmGhostButton(
+                            text = if (historyShareBusy) "공유 중…" else "이전 대화 공유",
+                            onClick = {
+                                historyShareTarget = HistoryShareTarget(pin.sid, pin.name)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
             ThisDeviceRow(
