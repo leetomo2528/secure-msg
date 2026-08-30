@@ -1,5 +1,6 @@
 import hashlib
 import base64
+import json
 import os
 import sqlite3
 import sys
@@ -2218,6 +2219,139 @@ class ServerSmokeTest(unittest.TestCase):
             json={"cid": created["cid"], "name": "hack"},
         )
         self.assertEqual(renamed.status_code, 403)
+
+    # ----- history key sharing (new-device backfill) --------------------
+
+    def _shared_history(self, count=3):
+        """A conversation whose envelopes only name the bootstrap device."""
+        conv = self.create_conversation()
+        conv_row = store.get_conversation_by_cid(conv["cid"])
+        user = store.get_user_by_name(self.username)
+        seqs = []
+        for _ in range(count):
+            payload = json.dumps({
+                "ct": "Y3Q",
+                "nonce": "bm9uY2U",
+                "keys": {self.sid: {"ek": "ZWs", "n": "bg"}},
+            })
+            _, seq, _ = store.insert_message(conv_row["id"], user["id"], self.sid, payload)
+            seqs.append(seq)
+        return conv["cid"], conv_row["id"], seqs
+
+    def _approved_second_device(self, name="laptop"):
+        return self.register_and_approve_device({
+            "username": self.username,
+            "pw_hash": self.pw_hash,
+            "device_name": name,
+            "pub_key": "B" * 43,
+        })
+
+    def test_missing_keys_lists_exactly_the_history_a_new_device_cannot_read(self):
+        cid, _, seqs = self._shared_history()
+        other = self._approved_second_device()
+        listed = self.client.get(
+            f"/api/conversation/{cid}/missing-keys?sid={other.json['sid']}",
+            headers=self.headers,
+        )
+        self.assertEqual(listed.status_code, 200, listed.json)
+        self.assertEqual(listed.json["seqs"], seqs)
+
+    def test_sharing_backfills_keys_and_records_who_wrapped_them(self):
+        cid, conv_id, seqs = self._shared_history()
+        other = self._approved_second_device()
+        target_sid = other.json["sid"]
+        shared = self.client.post(
+            f"/api/conversation/{cid}/share-keys",
+            headers=self.headers,
+            json={"sid": target_sid,
+                  "entries": [{"seq": s, "ek": "c2hhcmVk", "n": "bm9uYzI"} for s in seqs]},
+        )
+        self.assertEqual(shared.status_code, 200, shared.json)
+        self.assertEqual(shared.json["added"], len(seqs))
+        for message in store.fetch_messages_since(conv_id, 0):
+            entry = message["payload"]["keys"][target_sid]
+            self.assertEqual(entry["ek"], "c2hhcmVk")
+            # The box was sealed by the sharer, not by the original sender, so
+            # the recipient has to be told whose public key opens it.
+            self.assertEqual(entry[store.SHARE_WRAPPER_FIELD], self.sid)
+        listed = self.client.get(
+            f"/api/conversation/{cid}/missing-keys?sid={target_sid}",
+            headers=self.headers,
+        )
+        self.assertEqual(listed.json["seqs"], [])
+
+    def test_sharing_never_overwrites_an_existing_envelope_key(self):
+        """Otherwise any approved device could silently brick another one."""
+        cid, conv_id, seqs = self._shared_history(count=1)
+        target_sid = self._approved_second_device().json["sid"]
+        first = self.client.post(
+            f"/api/conversation/{cid}/share-keys", headers=self.headers,
+            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": "Zmlyc3Q", "n": "bg"}]},
+        )
+        self.assertEqual(first.json["added"], 1)
+        second = self.client.post(
+            f"/api/conversation/{cid}/share-keys", headers=self.headers,
+            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": "c2Vjb25k", "n": "bg"}]},
+        )
+        self.assertEqual((second.json["added"], second.json["skipped"]), (0, 1))
+        stored = store.fetch_messages_since(conv_id, 0)
+        self.assertEqual(stored[0]["payload"]["keys"][target_sid]["ek"], "Zmlyc3Q")
+
+    def test_history_cannot_be_shared_to_another_account(self):
+        cid, _, seqs = self._shared_history(count=1)
+        stranger = "mallory_" + self.username[-6:]
+        self.assertEqual(
+            register_account(self.client, stranger, self.pw_hash).status_code, 200
+        )
+        seed = hashlib.sha256(f"{self._testMethodName}:mallory".encode()).digest()[:32]
+        sig_pub = base64.urlsafe_b64encode(
+            bytes(SigningKey(seed).verify_key)
+        ).decode("ascii").rstrip("=")
+        foreign = self.client.post("/api/device-register", json={
+            "username": stranger, "pw_hash": self.pw_hash,
+            "device_name": "mallory", "pub_key": "C" * 43, "sig_pub": sig_pub,
+        })
+        self.assertEqual(foreign.status_code, 200, foreign.json)
+        refused = self.client.post(
+            f"/api/conversation/{cid}/share-keys", headers=self.headers,
+            json={"sid": foreign.json["sid"],
+                  "entries": [{"seq": seqs[0], "ek": "ZWs", "n": "bg"}]},
+        )
+        self.assertEqual(refused.status_code, 404, refused.json)
+
+    def test_history_cannot_be_shared_to_a_device_awaiting_approval(self):
+        """Approval is where the target's key is verified; sharing follows it."""
+        cid, _, seqs = self._shared_history(count=1)
+        seed = hashlib.sha256(f"{self._testMethodName}:pending".encode()).digest()[:32]
+        sig_pub = base64.urlsafe_b64encode(
+            bytes(SigningKey(seed).verify_key)
+        ).decode("ascii").rstrip("=")
+        pending = self.client.post("/api/device-register", json={
+            "username": self.username, "pw_hash": self.pw_hash,
+            "device_name": "pending-laptop", "pub_key": "D" * 43, "sig_pub": sig_pub,
+        })
+        self.assertEqual(pending.json.get("trust_state"), "pending", pending.json)
+        refused = self.client.post(
+            f"/api/conversation/{cid}/share-keys", headers=self.headers,
+            json={"sid": pending.json["sid"],
+                  "entries": [{"seq": seqs[0], "ek": "ZWs", "n": "bg"}]},
+        )
+        self.assertEqual(refused.status_code, 409, refused.json)
+
+    def test_share_key_entries_are_validated(self):
+        cid, _, seqs = self._shared_history(count=1)
+        target_sid = self._approved_second_device().json["sid"]
+        for entries in (
+            [{"seq": 0, "ek": "ZWs", "n": "bg"}],
+            [{"seq": seqs[0], "ek": "not base64!", "n": "bg"}],
+            [{"seq": seqs[0], "ek": "ZWs"}],
+            [],
+        ):
+            response = self.client.post(
+                f"/api/conversation/{cid}/share-keys", headers=self.headers,
+                json={"sid": target_sid, "entries": entries},
+            )
+            self.assertEqual(response.status_code, 400, response.json)
 
 
 if __name__ == "__main__":

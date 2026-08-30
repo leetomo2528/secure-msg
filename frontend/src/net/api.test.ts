@@ -1,5 +1,30 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Api, canonicalDeviceLoginProof, sendMessage } from "./api";
+import { Api, canonicalDeviceLoginProof, disconnectSocket, getSocket, sendMessage } from "./api";
+
+interface FakeSocket {
+  auth: { token: string };
+  handlers: Set<string>;
+  on: (event: string) => void;
+  removeAllListeners: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
+}
+
+const sockets = vi.hoisted(() => [] as FakeSocket[]);
+
+vi.mock("socket.io-client", () => ({
+  io: (...args: unknown[]) => {
+    const options = args[args.length - 1] as { auth: { token: string } };
+    const socket: FakeSocket = {
+      auth: options.auth,
+      handlers: new Set<string>(),
+      on: (event: string) => { socket.handlers.add(event); },
+      removeAllListeners: vi.fn(() => { socket.handlers.clear(); }),
+      disconnect: vi.fn(),
+    };
+    sockets.push(socket);
+    return socket;
+  },
+}));
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -229,5 +254,42 @@ describe("trusted-device API contract", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/device-reject-pending", expect.objectContaining({
       body: JSON.stringify({ sid: "pending", challenge: "challenge", parent_epoch: 9 }),
     }));
+  });
+});
+
+describe("session socket lifetime", () => {
+  afterEach(() => {
+    disconnectSocket();
+    sockets.length = 0;
+  });
+
+  it("survives a sliding token renewal with its handlers intact", () => {
+    const first = getSocket("token-old") as unknown as FakeSocket;
+    first.on("message_new");
+
+    const second = getSocket("token-slid") as unknown as FakeSocket;
+
+    // The server accepted this handshake under the old token and it stays
+    // valid, so replacing the socket here would strip every store handler
+    // (message_new, connect_error, ...) with nothing left to re-wire them.
+    // Only the next handshake needs the renewed credential.
+    expect(second).toBe(first);
+    expect(sockets).toHaveLength(1);
+    expect(first.removeAllListeners).not.toHaveBeenCalled();
+    expect(first.disconnect).not.toHaveBeenCalled();
+    expect([...first.handlers]).toEqual(["message_new"]);
+    expect(first.auth).toEqual({ token: "token-slid" });
+  });
+
+  it("opens a fresh socket only after an explicit session end", () => {
+    const first = getSocket("token-old") as unknown as FakeSocket;
+
+    disconnectSocket();
+
+    expect(first.removeAllListeners).toHaveBeenCalledOnce();
+    expect(first.disconnect).toHaveBeenCalledOnce();
+    const second = getSocket("token-new") as unknown as FakeSocket;
+    expect(second).not.toBe(first);
+    expect(second.auth).toEqual({ token: "token-new" });
   });
 });

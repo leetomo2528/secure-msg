@@ -117,9 +117,14 @@ export interface RelayContent {
   attachments?: MessageAttachment[];
 }
 
+/**
+ * Identity of one auth/trust lifetime. The bearer token is deliberately not a
+ * member: sliding renewal rotates it under a live session, while every real
+ * identity change (login attempt, logout, forget-device) bumps `generation`.
+ * Operations carry this snapshot and read the credential live.
+ */
 interface SecurityContext {
   generation: number;
-  token: string | null;
   uid: number | null;
   sid: string | null;
   keypair: DeviceKeypair | null;
@@ -693,7 +698,7 @@ export const useStore = create<State>((set, get) => ({
       if (!canUseCrypto(context)) return;
       if (!await runSessionEffect(context, () => setCursor(cid, maxSeq))) return;
       if (!canUseCrypto(context)) return;
-      const socket = getSocket(context.token!);
+      const socket = liveSocket();
       if (socket?.connected) {
         if (!canUseCrypto(context)) return;
         socket.emit("message_delivered", { cid, seq: maxSeq });
@@ -778,8 +783,8 @@ export const useStore = create<State>((set, get) => ({
         ...(content.subject ? { subject: content.subject } : {}),
         attachments: content.attachments ?? [],
       });
-      const socket = getSocket(context.token!);
-      if (!await waitForSocketConnected(socket)) {
+      const socket = liveSocket();
+      if (!socket || !await waitForSocketConnected(socket)) {
         if (sameContext(context)) set({ error: "실시간 서버에 연결할 수 없습니다" });
         return false;
       }
@@ -1134,10 +1139,14 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   // Sliding renewal: every signed-in app load trades the token for a fresh
   // 7-day one, so a session in regular use never hits the TTL cliff. Failure
   // is ignored — the token that made this call still works for now.
+  // Rotating the credential must not invalidate this run: identity is
+  // `context`, so every sync step below still passes its guard. Nothing orders
+  // this renewal against the socket wiring below, and it must not matter:
+  // getSocket keeps the live connection under the auth the server already
+  // accepted, and the renewed token only reaches the next handshake
+  // (SmsBridgeService.refreshAuthToken slides the Android bridge the same way).
   void api.tokenRefresh().then((renewed) => {
-    if (renewed.ok && renewed.token && api.token === context.token) {
-      api.setToken(renewed.token);
-    }
+    if (renewed.ok && renewed.token && sameContext(context)) api.setToken(renewed.token);
   });
   await me.refreshBlocklist();
   if (!canUseCrypto(context)) return;
@@ -1149,8 +1158,8 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   await me.refreshConversations();
   if (!canUseCrypto(context)) return;
   // Wire socket.
-  const socket = getSocket(context.token!);
-  if (!canUseCrypto(context)) return;
+  const socket = liveSocket();
+  if (!socket || !canUseCrypto(context)) return;
   socket.off("connect");
   socket.off("connect_error");
   socket.off("message_new");
@@ -1382,11 +1391,23 @@ function captureSecurityContext(): SecurityContext {
   const state = useStore.getState();
   return {
     generation: state.securityGeneration,
-    token: api.token,
     uid: state.uid,
     sid: state.sid,
     keypair: state.keypair,
   };
+}
+
+/**
+ * The session's socket, opened with the credential in force right now. A token
+ * captured before a sliding renewal would be stale here, so it is read live;
+ * getSocket keeps one socket per session, so a call after the slide refreshes
+ * the handshake credential of the already-wired connection rather than
+ * replacing it. Null means the session holds no token (a logout raced this
+ * call) and no socket may be opened.
+ */
+function liveSocket(): ReturnType<typeof getSocket> | null {
+  const token = api.token;
+  return token ? getSocket(token) : null;
 }
 
 function beginAuthAttempt(): number {
@@ -1413,8 +1434,9 @@ function beginAuthAttempt(): number {
 
 function sameContext(context: SecurityContext): boolean {
   const state = useStore.getState();
+  // Token value is deliberately not compared: it rotates under a live session
+  // (sliding renewal), and every identity change bumps the generation.
   return state.securityGeneration === context.generation
-    && api.token === context.token
     && state.uid === context.uid
     && state.sid === context.sid
     && state.keypair === context.keypair;
@@ -1422,7 +1444,6 @@ function sameContext(context: SecurityContext): boolean {
 
 function contextsEqual(left: SecurityContext, right: SecurityContext): boolean {
   return left.generation === right.generation
-    && left.token === right.token
     && left.uid === right.uid
     && left.sid === right.sid
     && left.keypair === right.keypair;
@@ -1430,9 +1451,12 @@ function contextsEqual(left: SecurityContext, right: SecurityContext): boolean {
 
 function canUseCrypto(context: SecurityContext): boolean {
   const state = useStore.getState();
+  // Presence of the credential is read live: a captured value cannot prove the
+  // session still holds one, since logout clears the token without touching
+  // any snapshot.
   return sameContext(context)
     && state.authed && !state.approvalPending && !state.securityLocked
-    && Boolean(context.token && context.sid && context.keypair);
+    && Boolean(api.token && context.sid && context.keypair);
 }
 
 async function runSessionEffect(

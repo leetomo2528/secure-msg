@@ -1846,3 +1846,87 @@ def list_user_device_sids(user_id: int) -> list[str]:
             (user_id,),
         ).fetchall()
         return [str(r["sid"]) for r in rows]
+
+
+# ----- historical key sharing (new-device backfill) ----------------------
+
+#: Envelope key entries added by [share_message_keys] carry the sid of the
+#: device that re-wrapped them. Recipients resolve that sid's public key from
+#: their own pinned directory — never from a server-supplied blob — because
+#: the box was sealed by the sharer, not by the message's original sender.
+SHARE_WRAPPER_FIELD = "by"
+
+
+def share_message_keys(
+    conv_id: int,
+    target_sid: str,
+    wrapper_sid: str,
+    entries: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Add per-device envelope keys so a later-registered device can read history.
+
+    Only ever *adds* a key for `target_sid`: an existing entry is left alone.
+    Overwriting one would let any approved device silently swap another
+    device's key material, which is a denial of service against that device
+    (the ciphertext itself stays sealed under the unchanged message key).
+    """
+    added = skipped = 0
+    with conn_ctx() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            for entry in entries:
+                row = c.execute(
+                    "SELECT id, payload FROM messages WHERE conv_id = ? AND seq = ?",
+                    (conv_id, entry["seq"]),
+                ).fetchone()
+                if not row:
+                    skipped += 1
+                    continue
+                try:
+                    payload = json.loads(row["payload"])
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                keys = payload.get("keys")
+                if not isinstance(keys, dict) or target_sid in keys:
+                    skipped += 1
+                    continue
+                keys[target_sid] = {
+                    "ek": entry["ek"],
+                    "n": entry["n"],
+                    SHARE_WRAPPER_FIELD: wrapper_sid,
+                }
+                c.execute(
+                    "UPDATE messages SET payload = ? WHERE id = ?",
+                    (json.dumps(payload, separators=(",", ":")), row["id"]),
+                )
+                added += 1
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+    return {"added": added, "skipped": skipped}
+
+
+def missing_key_sequences(conv_id: int, target_sid: str, limit: int = 500) -> list[int]:
+    """Sequences in a conversation whose envelope has no key for `target_sid`.
+
+    Lets a sharing device ask for exactly the work that remains instead of
+    re-downloading and re-wrapping history it has already shared.
+    """
+    with read_snapshot() as c:
+        rows = c.execute(
+            "SELECT seq, payload FROM messages WHERE conv_id = ? ORDER BY seq ASC",
+            (conv_id,),
+        ).fetchall()
+    out: list[int] = []
+    for row in rows:
+        try:
+            keys = json.loads(row["payload"]).get("keys")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(keys, dict) and target_sid not in keys:
+            out.append(int(row["seq"]))
+            if len(out) >= limit:
+                break
+    return out

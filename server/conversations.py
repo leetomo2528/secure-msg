@@ -294,3 +294,98 @@ def fetch_messages(cid: str):
         return _err("since must be >= 0 and limit must be 1-1000", 400)
     msgs = store.fetch_messages_since(conv["id"], since, limit)
     return _ok(messages=msgs, conv_id=conv["id"], cid=cid)
+
+
+B64U_RE = re.compile(r"[A-Za-z0-9_-]{1,512}", re.ASCII)
+MAX_SHARE_ENTRIES = 200
+
+
+@bp.get("/conversation/<cid>/missing-keys")
+@auth_required
+def missing_keys(cid: str):
+    """Sequences in `cid` that `?sid=` cannot decrypt yet.
+
+    The sharing device drives history backfill from this list, so it only
+    re-wraps what is actually missing.
+    """
+    target_sid = request.args.get("sid", "")
+    conv, target, error = _share_target(cid, target_sid)
+    if error:
+        return error
+    return _ok(
+        cid=cid,
+        sid=target["sid"],
+        seqs=store.missing_key_sequences(conv["id"], target["sid"]),
+    )
+
+
+@bp.post("/conversation/<cid>/share-keys")
+@auth_required
+def share_keys(cid: str):
+    """Body: { sid, entries: [{ seq, ek, n }] } -> { added, skipped }.
+
+    Grants a later-registered device of the *same account* the ability to read
+    existing history: the caller unwraps each message key with its own device
+    key and re-wraps it for the target's public key. The relay only ever sees
+    the wrapped keys, exactly as it does for a normal send.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _err("JSON object required", 400)
+    retry_after = rate_limit("share-keys", g.auth["sid"], 120, 60)
+    if retry_after:
+        response = jsonify({"ok": False, "error": "too many requests"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+
+    conv, target, error = _share_target(cid, body.get("sid", ""))
+    if error:
+        return error
+
+    entries = body.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return _err("entries must be a non-empty list", 400)
+    if len(entries) > MAX_SHARE_ENTRIES:
+        return _err(f"at most {MAX_SHARE_ENTRIES} entries per request", 400)
+    clean: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return _err("each entry must be an object", 400)
+        seq = entry.get("seq")
+        ek = entry.get("ek")
+        n = entry.get("n")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return _err("seq must be a positive integer", 400)
+        if not isinstance(ek, str) or not B64U_RE.fullmatch(ek):
+            return _err("ek must be base64url", 400)
+        if not isinstance(n, str) or not B64U_RE.fullmatch(n):
+            return _err("n must be base64url", 400)
+        clean.append({"seq": seq, "ek": ek, "n": n})
+
+    result = store.share_message_keys(conv["id"], target["sid"], g.auth["sid"], clean)
+    return _ok(**result)
+
+
+def _share_target(cid: str, target_sid: str):
+    """Resolve (conversation, target device) for a key-sharing call.
+
+    The target must be another approved device of the caller's own account:
+    sharing is a backfill for one's own new device, never a way to hand
+    history to a second account that merely shares the conversation.
+    """
+    if not isinstance(target_sid, str) or not target_sid:
+        return None, None, _err("sid is required", 400)
+    conv = store.get_conversation_by_cid(cid)
+    if not conv:
+        return None, None, _err("conversation not found", 404)
+    members = store.list_members(conv["id"])
+    if not any(d["user_id"] == g.auth["uid"] for d in members):
+        return None, None, _err("forbidden", 403)
+    if target_sid == g.auth["sid"]:
+        return None, None, _err("target must be another device", 400)
+    target = store.get_device_by_sid(target_sid)
+    if not target or target["user_id"] != g.auth["uid"]:
+        return None, None, _err("target device not found", 404)
+    if target["trust_state"] != "approved":
+        return None, None, _err("target device is not approved", 409)
+    return conv, target, None

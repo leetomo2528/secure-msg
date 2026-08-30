@@ -404,7 +404,6 @@ export const api = new Api();
 // ----- socket -----------------------------------------------------------
 
 let _socket: Socket | null = null;
-let _socketToken: string | null = null;
 let _socketBase: string | undefined;
 
 /** Test/deploy override. Browsers derive the origin automatically. */
@@ -412,11 +411,21 @@ export function setSocketBase(base: string | undefined): void {
   _socketBase = base;
 }
 
+/**
+ * The session's one socket, opened on first call.
+ *
+ * A later call carrying a different token is a sliding renewal, not a new
+ * identity: the server already accepted this handshake, so the live connection
+ * and every handler wired onto it survive, and only a future reconnect
+ * handshake picks up the fresh credential. Ending a session is
+ * `disconnectSocket()`'s job — the store calls it on every login attempt,
+ * logout, forget-device and trust lock, so another account's token can never
+ * reach a socket still open under this one.
+ */
 export function getSocket(token: string): Socket {
-  if (_socket && _socketToken === token) return _socket;
   if (_socket) {
-    _socket.removeAllListeners();
-    _socket.disconnect();
+    _socket.auth = { token };
+    return _socket;
   }
   const options = {
     auth: { token },
@@ -428,7 +437,6 @@ export function getSocket(token: string): Socket {
     reconnectionDelayMax: 5000,
   };
   _socket = _socketBase ? io(_socketBase, options) : io(options);
-  _socketToken = token;
   return _socket;
 }
 
@@ -438,7 +446,6 @@ export function disconnectSocket(): void {
     _socket.disconnect();
     _socket = null;
   }
-  _socketToken = null;
 }
 
 export function waitForSocketConnected(socket: Socket, timeoutMs = 5_000): Promise<boolean> {

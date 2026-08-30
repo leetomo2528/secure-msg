@@ -634,4 +634,83 @@ describe("security generation invalidation", () => {
     expect(api.token).toBeNull();
     expect(useStore.getState().authed).toBe(false);
   });
+
+  it("finishes post-login sync across a sliding token renewal", async () => {
+    const keypair = authenticated(70);
+    vi.spyOn(api, "keyDirectory").mockImplementation(async () => validOwnDirectory(70, keypair));
+    vi.spyOn(api, "tokenRefresh").mockResolvedValue({ ok: true, token: "token-slid" });
+    const refreshBlocklist = vi.fn(async () => undefined);
+    const syncBlockRules = vi.fn(async () => undefined);
+    const refreshConversations = vi.fn(async () => undefined);
+    useStore.setState({ refreshBlocklist, syncBlockRules, refreshConversations });
+
+    await expect(__testing.postLogin()).resolves.toBeUndefined();
+
+    // The slide rotates the credential without ending the session, so every
+    // step after it must still run, and the socket must open with the token
+    // now in force rather than the one captured before the renewal.
+    expect(api.token).toBe("token-slid");
+    expect(refreshBlocklist).toHaveBeenCalled();
+    expect(syncBlockRules).toHaveBeenCalled();
+    expect(refreshConversations).toHaveBeenCalled();
+    expect(effects.getSocket).toHaveBeenCalledOnce();
+    expect(effects.getSocket).toHaveBeenCalledWith("token-slid");
+    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+  });
+
+  it("stops post-login sync and drops a late renewal when the identity changes", async () => {
+    const keypair = authenticated(71);
+    vi.spyOn(api, "keyDirectory").mockImplementation(async () => validOwnDirectory(71, keypair));
+    const renewal = deferred<{ ok: boolean; token?: string }>();
+    vi.spyOn(api, "tokenRefresh").mockReturnValue(renewal.promise);
+    const syncBlockRules = vi.fn(async () => undefined);
+    const refreshConversations = vi.fn(async () => undefined);
+    // What logout/forget-device do to the session, landing mid-sync.
+    const refreshBlocklist = vi.fn(async () => {
+      useStore.setState({ securityGeneration: 72, authed: false });
+      api.setToken(null);
+    });
+    useStore.setState({ refreshBlocklist, syncBlockRules, refreshConversations });
+
+    await expect(__testing.postLogin()).resolves.toBeUndefined();
+    renewal.resolve({ ok: true, token: "token-after-invalidation" });
+    await renewal.promise;
+
+    expect(syncBlockRules).not.toHaveBeenCalled();
+    expect(refreshConversations).not.toHaveBeenCalled();
+    expect(effects.getSocket).not.toHaveBeenCalled();
+    expect(api.token).toBeNull();
+  });
+
+  it("stays wired when the sliding renewal lands after the socket is built", async () => {
+    const keypair = authenticated(73);
+    vi.spyOn(api, "keyDirectory").mockImplementation(async () => validOwnDirectory(73, keypair));
+    const renewal = deferred<{ ok: boolean; token?: string }>();
+    vi.spyOn(api, "tokenRefresh").mockReturnValue(renewal.promise);
+    const refreshBlocklist = vi.fn(async () => undefined);
+    const syncBlockRules = vi.fn(async () => undefined);
+    const refreshConversations = vi.fn(async () => undefined);
+    useStore.setState({ refreshBlocklist, syncBlockRules, refreshConversations });
+
+    await expect(__testing.postLogin()).resolves.toBeUndefined();
+
+    // Nothing orders /token-refresh against the sync round-trips before the
+    // socket, so the wiring can happen under the pre-slide credential.
+    expect(effects.getSocket).toHaveBeenCalledOnce();
+    expect(effects.getSocket).toHaveBeenCalledWith("token-73");
+    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+
+    renewal.resolve({ ok: true, token: "token-slid-late" });
+    await renewal.promise;
+    expect(api.token).toBe("token-slid-late");
+
+    // postLogin is the only place handlers are ever wired and it will not run
+    // again for this generation, so a later socket user asking under the
+    // rotated credential must reach that same wired connection — api.ts pins
+    // that reuse; here the session must simply survive the slide unre-wired.
+    vi.spyOn(api, "convMembers").mockResolvedValue({ ok: false, error: "stop" });
+    await expect(useStore.getState().send("cid", "hello")).resolves.toBe(false);
+    expect(effects.getSocket).toHaveBeenLastCalledWith("token-slid-late");
+    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+  });
 });
