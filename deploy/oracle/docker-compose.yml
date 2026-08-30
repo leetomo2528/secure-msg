@@ -8,6 +8,10 @@ services:
     environment:
       SECUREMSG_ENV: production
       SECUREMSG_JWT_SECRET: ${SECUREMSG_JWT_SECRET}
+      # Device tokens slide on every relay connect (Android) / app load (web),
+      # so the TTL only has to outlast a gap in use. Revocation does not depend
+      # on it: session_version is re-checked against the DB on every request.
+      SECUREMSG_JWT_TTL: ${SECUREMSG_JWT_TTL:-604800}
       SECUREMSG_DB: /data/securemsg.db
       SECUREMSG_CORS: https://${SECUREMSG_DOMAIN}
       SECUREMSG_EMAIL_PROVIDER: ${SECUREMSG_EMAIL_PROVIDER:-resend}
