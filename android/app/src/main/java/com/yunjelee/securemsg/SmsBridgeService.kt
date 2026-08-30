@@ -8,6 +8,7 @@ import android.os.IBinder
 import android.provider.Telephony
 import android.util.Log
 import androidx.room.withTransaction
+import com.yunjelee.securemsg.ui.LastOpened
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -753,6 +754,7 @@ class SmsBridgeService : Service() {
                     continue
                 }
                 val isIncoming = row.direction.startsWith("incoming_")
+                var mergedStaleCid: String? = null
                 db.withTransaction {
                     if (row.localMessageId != null) {
                         val local = db.messageDao().getById(row.localMessageId)
@@ -765,6 +767,7 @@ class SmsBridgeService : Service() {
                             db.messageDao().moveConversation(local.cid, row.cid)
                             db.relayOutboxDao().moveConversation(local.cid, row.cid)
                             db.threadDao().deleteByCid(local.cid)
+                            mergedStaleCid = local.cid
                         }
                         // A socket echo can be synchronized before this ACK is
                         // handled. Preserve the locally rendered row and remove
@@ -808,6 +811,9 @@ class SmsBridgeService : Service() {
                         incomingRepository.acknowledgeIncoming(row)
                     }
                 }
+                // Outside the transaction like prepareRelayOutbox's rewrite: a
+                // rollback must not strand the read stamp under a dead cid.
+                mergedStaleCid?.let { LastOpened.move(this, it, row.cid) }
 
                 client.emitDelivered(row.cid, seq)
                 val current = if (isIncoming) null else db.relayOutboxDao().getByMid(row.mid)
@@ -863,6 +869,11 @@ class SmsBridgeService : Service() {
                 db.relayOutboxDao().moveConversation(oldCid, resolvedThread.cid)
                 db.threadDao().deleteByCid(oldCid)
             }
+        }
+        // After the transaction, so a rollback cannot orphan the read stamp
+        // under a cid no thread carries anymore.
+        if (oldCid != resolvedThread.cid) {
+            LastOpened.move(this, oldCid, resolvedThread.cid)
         }
 
         val members = a.convMembers(resolvedThread.cid)

@@ -100,6 +100,33 @@ class UpdateValidationTest {
     }
 
     @Test
+    fun pendingUserActionIsOnlyHonoredWhileSessionIsSubmitted() {
+        assertTrue(
+            UpdateValidation.shouldHonorPendingUserAction(PendingInstallState.SESSION_SUBMITTED),
+        )
+        // A cancelled/abandoned flow must not launch a confirm for a dead session.
+        assertFalse(UpdateValidation.shouldHonorPendingUserAction(PendingInstallState.FAILED))
+        assertFalse(UpdateValidation.shouldHonorPendingUserAction(PendingInstallState.READY))
+        assertFalse(
+            UpdateValidation.shouldHonorPendingUserAction(PendingInstallState.FALLBACK_LAUNCHED),
+        )
+        assertFalse(
+            UpdateValidation.shouldHonorPendingUserAction(PendingInstallState.AWAITING_PERMISSION),
+        )
+        assertFalse(UpdateValidation.shouldHonorPendingUserAction(null))
+    }
+
+    @Test
+    fun installCallbackRequiresTheExactPersistedToken() {
+        assertTrue(UpdateValidation.isAuthorizedInstallCallback("t-1", "t-1"))
+        assertFalse(UpdateValidation.isAuthorizedInstallCallback("t-2", "t-1"))
+        assertFalse(UpdateValidation.isAuthorizedInstallCallback(null, "t-1"))
+        // A pre-token pending entry can never be completed by broadcast.
+        assertFalse(UpdateValidation.isAuthorizedInstallCallback("", ""))
+        assertFalse(UpdateValidation.isAuthorizedInstallCallback(null, ""))
+    }
+
+    @Test
     fun autoCheckIsSkippedWhileAnInstallIsPending() {
         assertFalse(UpdateValidation.shouldAutoCheck(hasPendingInstall = true))
         assertTrue(UpdateValidation.shouldAutoCheck(hasPendingInstall = false))
@@ -113,6 +140,24 @@ class UpdateValidationTest {
         assertTrue(UpdateValidation.shouldStartInstallSession(PendingInstallState.READY))
         assertTrue(UpdateValidation.shouldStartInstallSession(PendingInstallState.FAILED))
         assertTrue(UpdateValidation.shouldStartInstallSession(null))
+    }
+
+    @Test
+    fun retryFromBlockedBannerResubmitsAWedgedSession() {
+        // The watchdog keeps SESSION_SUBMITTED persisted; only the explicit
+        // retry on the blocked banner may push past it and resubmit.
+        assertTrue(
+            UpdateValidation.shouldStartInstallSession(
+                PendingInstallState.SESSION_SUBMITTED,
+                retryingBlockedSession = true,
+            ),
+        )
+        assertTrue(
+            UpdateValidation.shouldStartInstallSession(
+                PendingInstallState.FAILED,
+                retryingBlockedSession = true,
+            ),
+        )
     }
 
     @Test

@@ -280,6 +280,7 @@ fun MainScreen(
                     onUpdate = update.onUpdate,
                     onInstall = update.onInstall,
                     onRetry = update.onRetry,
+                    onCancelInstall = update.onCancelInstall,
                     onCloseInstallBlocked = update.onCloseInstallBlocked,
                     onDismiss = update.onDismiss,
                 )

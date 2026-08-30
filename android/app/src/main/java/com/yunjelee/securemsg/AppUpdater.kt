@@ -41,6 +41,8 @@ data class PendingUpdate(
     val file: File,
     val state: PendingInstallState,
     val callbackToken: String,
+    /** Why a FAILED entry failed, in user-facing words; null before v0.12.4 entries. */
+    val failureDetail: String? = null,
 )
 
 sealed interface UpdateCheckResult {
@@ -223,6 +225,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
         file: File,
         state: PendingInstallState = PendingInstallState.READY,
         callbackToken: String = "",
+        failureDetail: String? = null,
     ) {
         val json = JSONObject()
             .put("tag", info.tag)
@@ -233,6 +236,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             .put("file", file.absolutePath)
             .put("state", state.name)
             .put("callbackToken", callbackToken)
+        if (failureDetail != null) json.put("failureDetail", failureDetail)
         // commit() is intentional: PackageInstaller can replace/kill this process immediately.
         prefs.edit().putString(KEY_PENDING_UPDATE, json.toString()).commit()
     }
@@ -241,6 +245,20 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
     fun setPendingInstallState(state: PendingInstallState): Boolean {
         val pending = pendingUpdate() ?: return false
         persistPendingUpdate(pending.info, pending.file, state, pending.callbackToken)
+        return true
+    }
+
+    /** Marks the pending update FAILED with the words the banner should show. */
+    @Synchronized
+    fun setPendingInstallFailure(detail: String): Boolean {
+        val pending = pendingUpdate() ?: return false
+        persistPendingUpdate(
+            pending.info,
+            pending.file,
+            PendingInstallState.FAILED,
+            pending.callbackToken,
+            detail,
+        )
         return true
     }
 
@@ -276,6 +294,8 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                 file = canonical,
                 state = PendingInstallState.valueOf(obj.optString("state", "READY")),
                 callbackToken = obj.optString("callbackToken", ""),
+                // optString: entries persisted before the field existed stay readable.
+                failureDetail = obj.optString("failureDetail", "").takeIf { it.isNotEmpty() },
             )
         } catch (_: Exception) {
             null
@@ -288,12 +308,25 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
 
     /**
      * Session-based install so the app observes the outcome (Play Protect
-     * block, user cancel, conflict…). Returns false when sessions are
-     * unavailable and the caller should fall back to [installIntent].
+     * block, user cancel, conflict…). Status callbacks are delivered to
+     * [InstallResultReceiver] as a broadcast, never into an activity: One UI
+     * silently dropped the activity delivery of PENDING_USER_ACTION (issue #5).
+     * Returns false when sessions are unavailable and the caller should fall
+     * back to [installIntent].
      */
-    suspend fun installViaSession(file: File, resultIntent: Intent): Boolean =
+    suspend fun installViaSession(file: File, callbackToken: String): Boolean =
         withContext(Dispatchers.IO) {
             val installer = ctx.packageManager.packageInstaller
+            // Every retry after a stuck confirm reaches here; without this the
+            // half-written sessions of earlier attempts accumulate until the
+            // platform's per-app session quota rejects the next createSession.
+            installer.mySessions.forEach { stale ->
+                try {
+                    installer.abandonSession(stale.sessionId)
+                } catch (e: Exception) {
+                    Log.w("AppUpdater", "cannot abandon stale session ${stale.sessionId}", e)
+                }
+            }
             var sessionId = -1
             try {
                 verifyApkSigningCertificate(file)
@@ -306,10 +339,15 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                         file.inputStream().use { input -> input.copyTo(out) }
                         session.fsync(out)
                     }
-                    val pending = PendingIntent.getActivity(
+                    val statusIntent = Intent(ctx, InstallResultReceiver::class.java)
+                        .setAction(InstallResultReceiver.ACTION_INSTALL_STATUS)
+                        .putExtra(InstallResultReceiver.EXTRA_CALLBACK_TOKEN, callbackToken)
+                    // MUTABLE, not IMMUTABLE: PackageInstaller must write the
+                    // status extras into the fired intent.
+                    val pending = PendingIntent.getBroadcast(
                         ctx,
                         sessionId,
-                        resultIntent,
+                        statusIntent,
                         PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
                     )
                     session.commit(pending.intentSender)
@@ -454,10 +492,36 @@ object UpdateValidation {
     fun shouldLaunchFallback(state: PendingInstallState): Boolean =
         state == PendingInstallState.SESSION_SUBMITTED
 
+    /**
+     * A PENDING_USER_ACTION callback is only actionable while the persisted
+     * session is still the submitted one; anything else is a stale replay whose
+     * confirm intent opens a dead installer page.
+     */
+    fun shouldHonorPendingUserAction(state: PendingInstallState?): Boolean =
+        state == PendingInstallState.SESSION_SUBMITTED
+
+    /**
+     * The status receiver is an exported=false but manifest-registered surface;
+     * only a callback carrying the token persisted at commit time may drive the
+     * update state machine. An empty persisted token never matches — an entry
+     * from a build that predates tokens cannot be completed by broadcast.
+     */
+    fun isAuthorizedInstallCallback(receivedToken: String?, persistedToken: String): Boolean =
+        persistedToken.isNotEmpty() && receivedToken == persistedToken
+
     fun shouldAutoCheck(hasPendingInstall: Boolean): Boolean = !hasPendingInstall
 
-    fun shouldStartInstallSession(state: PendingInstallState?): Boolean =
-        state != PendingInstallState.SESSION_SUBMITTED
+    /**
+     * SESSION_SUBMITTED normally means a commit is in flight and starting
+     * another would abandon it under its own confirm dialog. The exception is
+     * a retry pressed on the blocked banner: the watchdog leaves the persisted
+     * state SESSION_SUBMITTED (the confirm may still land), so without the
+     * escape that retry could never resubmit anything.
+     */
+    fun shouldStartInstallSession(
+        state: PendingInstallState?,
+        retryingBlockedSession: Boolean = false,
+    ): Boolean = state != PendingInstallState.SESSION_SUBMITTED || retryingBlockedSession
 
     /**
      * Package replacement can kill the installer process before its terminal

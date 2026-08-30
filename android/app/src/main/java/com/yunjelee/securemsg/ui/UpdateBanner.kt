@@ -51,6 +51,7 @@ data class UpdateFlow(
     val onUpdate: (UpdateInfo) -> Unit,
     val onInstall: (UpdateInfo, File) -> Unit,
     val onRetry: (UpdateInfo?) -> Unit,
+    val onCancelInstall: () -> Unit,
     val onCloseInstallBlocked: () -> Unit,
     val onDismiss: (UpdateInfo) -> Unit,
 )
@@ -62,6 +63,7 @@ fun UpdateBanner(
     onUpdate: (UpdateInfo) -> Unit,
     onInstall: (UpdateInfo, File) -> Unit,
     onRetry: (UpdateInfo?) -> Unit,
+    onCancelInstall: () -> Unit,
     onCloseInstallBlocked: () -> Unit,
     onDismiss: (UpdateInfo) -> Unit,
 ) {
@@ -113,9 +115,27 @@ fun UpdateBanner(
         is UpdateUiState.Installing -> InstallProgressBanner(
             "설치 파일을 시스템 설치 프로그램으로 전달하는 중…",
         )
-        is UpdateUiState.SessionSubmitted -> InstallProgressBanner(
-            "시스템 설치 확인을 기다리는 중…",
-        )
+        // Never buttonless again (issue #5): when the system confirm fails to
+        // surface, 취소 is the user's own way out of the waiting state.
+        is UpdateUiState.SessionSubmitted -> Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Sm.surface)
+                .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("시스템 설치 확인을 기다리는 중…", color = Sm.cyan, fontSize = 12.sp)
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
+                color = Sm.teal,
+                trackColor = Sm.progressTrack,
+            )
+            TextButton(onClick = onCancelInstall) {
+                Text("취소", color = Sm.text3, fontSize = 12.sp)
+            }
+        }
         is UpdateUiState.NeedsPermission -> Column(
             Modifier
                 .fillMaxWidth()

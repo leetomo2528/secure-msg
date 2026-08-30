@@ -6,9 +6,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Person
+import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -244,6 +246,12 @@ object SmsNotifier {
             .setAutoCancel(true)
             .setOnlyAlertOnce(!alerting)
             .setVisibility(Notification.VISIBILITY_PRIVATE)
+            // On both channels: replying to a message a sweep caught up on is
+            // as legitimate as replying to a live one.
+            .setActions(
+                replyAction(context, tag, cid, normalizedPhone, title),
+                markReadAction(context, tag, cid, normalizedPhone, title),
+            )
         // No setGroup: the tag already keeps one notification per conversation,
         // so every group would have exactly one child and no summary — dead
         // weight on AOSP and a bundling wildcard on One UI.
@@ -312,6 +320,54 @@ object SmsNotifier {
     }
 
     /**
+     * Drops the notification posted under a raw tag. Fallback for a shade
+     * action whose conversation has neither cid nor phone — there is no group
+     * key to sweep by, but the notification must still not outlive "읽음".
+     */
+    fun cancelByTag(context: Context, tag: String) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        lastAlertAt.remove(tag)
+        manager.cancel(tag, MESSAGE_ID)
+    }
+
+    /** Replying from the shade ends a burst the same way opening the app does:
+     * the next incoming message in the conversation is news again. */
+    fun clearAlertCooldown(tag: String) {
+        lastAlertAt.remove(tag)
+    }
+
+    /**
+     * Resolves a shade inline reply: the platform pins a spinner on the action
+     * until a notification is posted again under the same tag/id, so this MUST
+     * repost even with nothing to append (`replyText == null`).
+     *
+     * `recoverBuilder` keeps everything the posted notification carried —
+     * channel, content intent, actions, category, visibility — so only the
+     * style changes, and only when a reply exists.
+     */
+    fun notifyReplyPosted(context: Context, tag: String, replyText: String?) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        val posted = activeNotifications(manager)
+            .firstOrNull { it.tag == tag && it.id == MESSAGE_ID }
+            ?.notification
+            // Dismissed or cancelled since the reply began: no spinner is left
+            // to resolve, and reposting would resurrect a read conversation.
+            ?: return
+        val builder = Notification.Builder.recoverBuilder(context, posted)
+            // The conversation already announced itself; appending the user's
+            // own words must not sound or banner.
+            .setOnlyAlertOnce(true)
+        if (!replyText.isNullOrBlank()) {
+            val style = Notification.MessagingStyle(Person.Builder().setName(SELF_NAME).build())
+            postedMessages(posted).takeLast(MAX_STYLE_MESSAGES - 1).forEach { style.addMessage(it) }
+            // A null sender renders as the style's own user ("나").
+            style.addMessage(replyText, System.currentTimeMillis(), null as Person?)
+            builder.setStyle(style)
+        }
+        manager.notify(tag, MESSAGE_ID, builder.build())
+    }
+
+    /**
      * The style for the re-posted conversation notification: the messages the
      * shade already shows, trimmed to [MAX_STYLE_MESSAGES], plus the new one.
      * Falls back to a fresh style when nothing is posted (or the platform
@@ -328,9 +384,17 @@ object SmsNotifier {
         val posted = activeNotifications(manager)
             .firstOrNull { it.tag == tag && it.id == MESSAGE_ID }
             ?.notification
-        // The posted notification is the only place the earlier messages of this
-        // conversation still exist — nothing here keeps a copy, and the process
-        // may well have been restarted since.
+        postedMessages(posted).takeLast(MAX_STYLE_MESSAGES - 1).forEach { style.addMessage(it) }
+        style.addMessage(body, date, sender)
+        return style
+    }
+
+    /**
+     * The messages a posted notification still carries. The posted notification
+     * is the only place the earlier messages of a conversation exist — nothing
+     * here keeps a copy, and the process may well have been restarted since.
+     */
+    private fun postedMessages(posted: Notification?): List<Notification.MessagingStyle.Message> {
         val bundles = posted?.extras?.let { extras ->
             if (Build.VERSION.SDK_INT >= 33) {
                 extras.getParcelableArray(Notification.EXTRA_MESSAGES, Bundle::class.java)
@@ -339,12 +403,9 @@ object SmsNotifier {
                 extras.getParcelableArray(Notification.EXTRA_MESSAGES)
             }
         }
-        val previous = bundles
+        return bundles
             ?.let { Notification.MessagingStyle.Message.getMessagesFromBundleArray(it) }
             .orEmpty()
-        previous.takeLast(MAX_STYLE_MESSAGES - 1).forEach { style.addMessage(it) }
-        style.addMessage(body, date, sender)
-        return style
     }
 
     private fun activeNotifications(manager: NotificationManager): List<StatusBarNotification> =
@@ -396,5 +457,83 @@ object SmsNotifier {
             notificationIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+    }
+
+    private fun replyAction(
+        context: Context,
+        tag: String,
+        cid: String?,
+        normalizedPhone: String,
+        title: String,
+    ): Notification.Action {
+        val remoteInput = RemoteInput.Builder(NotificationActionReceiver.KEY_REPLY)
+            .setLabel("메시지 입력")
+            .build()
+        // MUTABLE, not IMMUTABLE: the shade must write the typed text into the
+        // fired intent. Identity still separates per conversation via the data
+        // URI, exactly like conversationIntent's tap target.
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            tag.hashCode() and Int.MAX_VALUE,
+            actionIntent(
+                context, NotificationActionReceiver.ACTION_REPLY, "reply",
+                tag, cid, normalizedPhone, title,
+            ),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // The small icon does double duty: actions render text-only on modern
+        // Android, so no dedicated action drawable is worth shipping.
+        return Notification.Action.Builder(
+            Icon.createWithResource(context, R.drawable.ic_stat_message),
+            "답장",
+            pendingIntent,
+        ).addRemoteInput(remoteInput).build()
+    }
+
+    private fun markReadAction(
+        context: Context,
+        tag: String,
+        cid: String?,
+        normalizedPhone: String,
+        title: String,
+    ): Notification.Action {
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            tag.hashCode() and Int.MAX_VALUE,
+            actionIntent(
+                context, NotificationActionReceiver.ACTION_MARK_READ, "read",
+                tag, cid, normalizedPhone, title,
+            ),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return Notification.Action.Builder(
+            Icon.createWithResource(context, R.drawable.ic_stat_message),
+            "읽음",
+            pendingIntent,
+        ).build()
+    }
+
+    private fun actionIntent(
+        context: Context,
+        action: String,
+        path: String,
+        tag: String,
+        cid: String?,
+        normalizedPhone: String,
+        title: String,
+    ): Intent = Intent(context, NotificationActionReceiver::class.java).apply {
+        this.action = action
+        // Intent data participates in PendingIntent identity; extras do not.
+        // The action path keeps reply and read distinct even for one tag.
+        data = Uri.Builder()
+            .scheme("securemsg")
+            .authority("notif-action")
+            .appendPath(path)
+            .appendPath(tag)
+            .build()
+        putExtra(NotificationActionReceiver.EXTRA_TAG, tag)
+        putExtra(NotificationActionReceiver.EXTRA_CID, cid)
+        putExtra(NotificationActionReceiver.EXTRA_PHONE, normalizedPhone)
+        putExtra(NotificationActionReceiver.EXTRA_TITLE, title)
     }
 }

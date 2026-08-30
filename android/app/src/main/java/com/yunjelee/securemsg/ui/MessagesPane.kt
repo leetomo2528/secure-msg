@@ -907,7 +907,8 @@ private fun snippet(thread: SmsThread, latest: MessageRow?): String = when {
 /**
  * On-device "last opened" time per thread (prefs `thread_last_opened`, key =
  * cid). The schema has no unread column and the relay no read state, so this
- * is what "unread" is measured against. Not synced, not migrated.
+ * is what "unread" is measured against. Not synced; the bridge carries a stamp
+ * across its provisional→server cid rewrite via [move], nothing else migrates.
  */
 internal object LastOpened {
     private const val PREFS = "thread_last_opened"
@@ -915,6 +916,23 @@ internal object LastOpened {
     /** Forget-device path: stamps belong to the account being removed. */
     fun clear(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+    }
+
+    /**
+     * Re-keys one stamp when the bridge rewrites a conversation's cid. A shade
+     * 읽음/reply on a still-provisional `local_…` thread stamps that cid; once
+     * the relay assigns the real one, the old key would otherwise be orphaned
+     * and the conversation would flip back to unread.
+     */
+    fun move(context: Context, fromCid: String, toCid: String) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val from = prefs.getLong(fromCid, 0L)
+        if (from <= 0L) return
+        // max(): the target thread may already carry its own, later stamp.
+        prefs.edit()
+            .remove(fromCid)
+            .putLong(toCid, maxOf(from, prefs.getLong(toCid, 0L)))
+            .apply()
     }
 
     fun all(context: Context): Map<String, Long> =

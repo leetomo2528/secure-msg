@@ -125,6 +125,17 @@
             android:exported="false" />
 
         <receiver
+            android:name=".NotificationActionReceiver"
+            android:exported="false" />
+
+        <!-- PackageInstaller session status endpoint (updater). Reached only by
+             the explicit PendingIntent committed with the session; the intent's
+             callbackToken must still match the persisted pending update. -->
+        <receiver
+            android:name=".InstallResultReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".BootReceiver"
             android:exported="true">
             <intent-filter>
