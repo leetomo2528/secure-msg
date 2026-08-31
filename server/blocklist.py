@@ -11,8 +11,8 @@ from __future__ import annotations
 import re
 
 import store
-from auth import _err, _ok, auth_required
-from flask import Blueprint, g, jsonify, request
+from auth import _err, _json_body, _ok, _rate_error, auth_required
+from flask import Blueprint, g
 from rate_limit import check as rate_limit
 from sockets import emit_to_user_devices
 
@@ -47,14 +47,12 @@ def list_rules():
 @bp.post("/blocklist")
 @auth_required
 def add_rule():
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
     retry_after = rate_limit("blocklist-add", g.auth["sid"], 120, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
     validated = _validate(body.get("type"), body.get("value"))
     if validated is None:
         return _err("type must be keyword|sender with a valid value", 400)
@@ -75,14 +73,12 @@ def add_rule():
 @bp.post("/blocklist/remove")
 @auth_required
 def remove_rule():
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
     retry_after = rate_limit("blocklist-remove", g.auth["sid"], 120, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
     try:
         rule_id = int(body.get("id"))
     except (TypeError, ValueError):

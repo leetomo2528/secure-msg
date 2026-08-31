@@ -11,6 +11,7 @@ const effects = vi.hoisted(() => ({
   pinTrustedDirectory: vi.fn(),
   clearSessionData: vi.fn(),
   clearDeviceForReregistration: vi.fn(),
+  clearAllData: vi.fn(),
   setMeta: vi.fn(),
   cacheDevice: vi.fn(),
   getMeta: vi.fn(),
@@ -61,6 +62,7 @@ vi.mock("./db", async (importOriginal) => {
     pinTrustedDirectory: effects.pinTrustedDirectory,
     clearSessionData: effects.clearSessionData,
     clearDeviceForReregistration: effects.clearDeviceForReregistration,
+    clearAllData: effects.clearAllData,
     setMeta: effects.setMeta,
     cacheDevice: effects.cacheDevice,
     getMeta: effects.getMeta,
@@ -81,7 +83,7 @@ vi.mock("./blocklist", async (importOriginal) => {
 
 import { b64u, generateKeypair, initCrypto } from "../crypto/keys";
 import { deviceFingerprint, recipientKeysetHash, serverDirectoryHash } from "../crypto/deviceTrust";
-import { api, type ConvMember, type ConversationMembersResult } from "../net/api";
+import { api, DEVICE_REVOKED, type ConvMember, type ConversationMembersResult } from "../net/api";
 import { __testing, useStore } from "./useStore";
 
 const originalSyncConversation = useStore.getState().syncConversation;
@@ -224,6 +226,7 @@ describe("security generation invalidation", () => {
     effects.pinTrustedDirectory.mockResolvedValue(undefined);
     effects.clearSessionData.mockResolvedValue(undefined);
     effects.clearDeviceForReregistration.mockResolvedValue(undefined);
+    effects.clearAllData.mockResolvedValue(undefined);
     effects.setMeta.mockResolvedValue(undefined);
     effects.cacheDevice.mockResolvedValue(undefined);
     effects.getMeta.mockResolvedValue(null);
@@ -566,6 +569,40 @@ describe("security generation invalidation", () => {
       authed: true, username: "new-user", uid: 41, sid: "sid-41",
     });
     expect(api.token).toBe("token-41");
+  });
+
+  it("does not treat an unexplained 401 on the approval poll as a revocation", async () => {
+    // The pending device polls every 2s and the relay answers 401 for an
+    // expired token as well as for a real revocation. Acting on the status
+    // alone let any 401 — including one a hostile relay simply chose to send —
+    // wipe the pinned identity that protects the next registration.
+    authenticated(60);
+    useStore.setState({ approvalPending: true });
+    vi.spyOn(api, "deviceApprovalStatus").mockResolvedValue({
+      ok: false, status: 401, error: "invalid token",
+    });
+
+    await expect(useStore.getState().refreshPendingApproval()).resolves.toBe("error");
+    expect(effects.clearAllData).not.toHaveBeenCalled();
+    expect(effects.clearDeviceForReregistration).not.toHaveBeenCalled();
+    expect(useStore.getState().approvalPending).toBe(true);
+  });
+
+  it("discards a device the relay reports revoked without erasing the trust pins", async () => {
+    authenticated(61);
+    useStore.setState({ approvalPending: true });
+    vi.spyOn(api, "deviceApprovalStatus").mockResolvedValue({
+      ok: false, status: 401, code: DEVICE_REVOKED, error: "device revoked",
+    });
+
+    await expect(useStore.getState().refreshPendingApproval()).resolves.toBe("revoked");
+    await useStore.getState().discardRevokedDevice();
+
+    expect(effects.clearDeviceForReregistration).toHaveBeenCalledOnce();
+    expect(effects.clearAllData).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      authed: false, approvalPending: false, sid: null, keypair: null,
+    });
   });
 
   it("uses trust-preserving cleanup before revoked-device re-registration", async () => {

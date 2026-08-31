@@ -50,3 +50,17 @@ def check(scope: str, identity: str, limit: int, window_seconds: int) -> int | N
         while len(_buckets) > _MAX_KEYS:
             _buckets.popitem(last=False)
     return None
+
+
+def check_ip(scope: str, limit: int, window_seconds: int) -> int | None:
+    """Per-IP budget that no caller-supplied value can widen.
+
+    ``check``'s bucket key includes the caller-chosen identity, so a request
+    that rotates that value — a made-up username, a stranger's email address —
+    opens a brand-new bucket every time and the per-identity limit never
+    bites. Endpoints whose cost is paid BEFORE the identity is known (one
+    constant-work bcrypt verification per attempt, one outbound mail per
+    request) pair their identity bucket with this one, so the total an
+    unauthenticated IP can spend stays bounded.
+    """
+    return check(scope, "", limit, window_seconds)

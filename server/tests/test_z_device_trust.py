@@ -624,6 +624,84 @@ class TrustedDeviceTest(unittest.TestCase):
             self.assertEqual(response.status_code, status, response.json)
             self.assertEqual(response.json["error"], message)
 
+    def test_reapproval_after_upgrade_replaces_the_stale_certificate(self):
+        """A peer with a real approval certificate could never come back.
+
+        device_approvals is UNIQUE(user_id, subject_sid) with no update or
+        delete path, so the second approval raised IntegrityError and the route
+        reported it as an Android-gateway conflict — a web device that the
+        security upgrade had quarantined was then unapprovable forever. The
+        stale certificate is also unverifiable on its own: quarantining clears
+        approved_at, which drops the subject out of device_history.
+        """
+        pending, _box, _key, _sig = self._new_pending()
+        approved = self._approve(pending)
+        certificates = self.client.get(
+            "/api/key-directory", headers=self.first_headers
+        ).json["approval_certificates"]
+        self.assertEqual([c["subject_sid"] for c in certificates], [pending["sid"]])
+
+        # Only a migrated (legacy_v1) account can run the upgrade.
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE users SET security_mode='legacy_v1' WHERE id=?", (self.uid,)
+            )
+        epoch = approved["security_epoch"]
+        statement = legacy_upgrade_statement(
+            self.uid, self.first["sid"], self.first_sig_public, epoch
+        )
+        upgraded = self.client.post(
+            "/api/security-upgrade",
+            headers=self.first_headers,
+            json={
+                "parent_epoch": epoch,
+                "signature": _b64u(
+                    bytes(self.first_signing.sign(statement.encode("utf-8")).signature)
+                ),
+            },
+        )
+        self.assertEqual(upgraded.status_code, 200, upgraded.json)
+        self.assertEqual(
+            store.get_device_by_sid(pending["sid"])["trust_state"], "pending"
+        )
+        # The quarantine took the certificate with it, so the directory the
+        # client verifies never names a subject it cannot resolve.
+        directory = self.client.get(
+            "/api/key-directory", headers=self.first_headers
+        ).json
+        self.assertEqual(directory["approval_certificates"], [])
+        self.assertEqual(
+            [d["sid"] for d in directory["device_history"]], [self.first["sid"]]
+        )
+
+        parent_epoch = upgraded.json["security_epoch"]
+        body, _statement = self._signed_approval(pending, parent_epoch=parent_epoch)
+        reapproved = self.client.post(
+            "/api/device-approve", headers=self.first_headers, json=body
+        )
+        self.assertEqual(reapproved.status_code, 200, reapproved.json)
+        self.assertEqual(
+            store.get_device_by_sid(pending["sid"])["trust_state"], "approved"
+        )
+
+        final = self.client.get("/api/key-directory", headers=self.first_headers).json
+        self.assertEqual(
+            [(c["subject_sid"], c["parent_epoch"], c["resulting_epoch"])
+             for c in final["approval_certificates"]],
+            [(pending["sid"], parent_epoch, parent_epoch + 1)],
+        )
+        # The whole chain still reads as one contiguous run of epochs, which is
+        # what the client's verifyDirectoryProof requires.
+        chain = sorted(
+            final["approval_certificates"]
+            + final["revocation_certificates"]
+            + final["security_upgrade_certificates"],
+            key=lambda c: c["resulting_epoch"],
+        )
+        for previous, following in zip(chain, chain[1:]):
+            self.assertEqual(following["parent_epoch"], previous["resulting_epoch"])
+        self.assertEqual(chain[-1]["resulting_epoch"], final["security_epoch"])
+
     def test_directory_proof_retains_cross_signature_and_revoked_approver(self):
         created = self.client.post(
             "/api/conversation",

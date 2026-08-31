@@ -190,7 +190,9 @@ describe("trusted-device API contract", () => {
     const client = new Api();
     client.setToken("approved-device-token");
 
-    await client.deviceApprove("subject-sid", "covered-challenge", 12, "detached-signature");
+    // The pending device's challenge is deliberately not a parameter: it is
+    // covered by the signature and resolved server-side from the pending row.
+    await client.deviceApprove("subject-sid", 12, "detached-signature");
 
     expect(fetchMock).toHaveBeenCalledWith("/api/device-approve", expect.objectContaining({
       method: "POST",

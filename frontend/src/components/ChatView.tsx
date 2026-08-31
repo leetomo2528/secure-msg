@@ -4,7 +4,11 @@ import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
 import type { MessageRow } from "../store/db";
 import { Avatar } from "./ChatList";
-import { conversationDisplayName } from "../store/helpers";
+import {
+  conversationDisplayName,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_BYTES,
+} from "../store/helpers";
 
 export default function ChatView({ cid }: { cid: string }) {
   const activeMessages = useStore((s) => s.activeMessages);
@@ -120,8 +124,8 @@ export default function ChatView({ cid }: { cid: string }) {
     setAttachmentError(null);
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
-    if (files.length + attachments.length > 8) {
-      setAttachmentError("첨부파일은 최대 8개까지 가능합니다");
+    if (files.length + attachments.length > MAX_ATTACHMENTS) {
+      setAttachmentError(`첨부파일은 최대 ${MAX_ATTACHMENTS}개까지 가능합니다`);
       return;
     }
     const total = attachments.reduce((sum, item) => sum + item.size, 0);
@@ -129,8 +133,8 @@ export default function ChatView({ cid }: { cid: string }) {
     let nextTotal = total;
     for (const file of files) {
       nextTotal += file.size;
-      if (nextTotal > 512 * 1024) {
-        setAttachmentError("첨부파일 전체 크기는 512KB까지 가능합니다");
+      if (nextTotal > MAX_ATTACHMENT_BYTES) {
+        setAttachmentError(`첨부파일 전체 크기는 ${MAX_ATTACHMENT_BYTES / 1024}KB까지 가능합니다`);
         return;
       }
       next.push({

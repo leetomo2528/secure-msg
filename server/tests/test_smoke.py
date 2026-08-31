@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import tracemalloc
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -24,11 +25,18 @@ os.environ["SECUREMSG_JWT_SECRET"] = "test-secret-for-unit-tests-32-bytes-minimu
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app, socketio
+import auth
 from auth import approval_statement, revoke_statement, device_login_statement
 import config
 import store
 
 app.config["TESTING"] = True
+
+# Envelope keys are validated by decoded length on both the socket send path
+# and share-keys: 48 raw bytes of crypto_box output, 24-byte nonce.
+SHARE_EK = "S" * 64
+SHARE_EK_ALT = "T" * 64
+SHARE_NONCE = "N" * 32
 
 
 def tearDownModule():
@@ -2264,13 +2272,13 @@ class ServerSmokeTest(unittest.TestCase):
             f"/api/conversation/{cid}/share-keys",
             headers=self.headers,
             json={"sid": target_sid,
-                  "entries": [{"seq": s, "ek": "c2hhcmVk", "n": "bm9uYzI"} for s in seqs]},
+                  "entries": [{"seq": s, "ek": SHARE_EK, "n": SHARE_NONCE} for s in seqs]},
         )
         self.assertEqual(shared.status_code, 200, shared.json)
         self.assertEqual(shared.json["added"], len(seqs))
         for message in store.fetch_messages_since(conv_id, 0):
             entry = message["payload"]["keys"][target_sid]
-            self.assertEqual(entry["ek"], "c2hhcmVk")
+            self.assertEqual(entry["ek"], SHARE_EK)
             # The box was sealed by the sharer, not by the original sender, so
             # the recipient has to be told whose public key opens it.
             self.assertEqual(entry[store.SHARE_WRAPPER_FIELD], self.sid)
@@ -2286,16 +2294,16 @@ class ServerSmokeTest(unittest.TestCase):
         target_sid = self._approved_second_device().json["sid"]
         first = self.client.post(
             f"/api/conversation/{cid}/share-keys", headers=self.headers,
-            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": "Zmlyc3Q", "n": "bg"}]},
+            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": SHARE_EK, "n": SHARE_NONCE}]},
         )
         self.assertEqual(first.json["added"], 1)
         second = self.client.post(
             f"/api/conversation/{cid}/share-keys", headers=self.headers,
-            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": "c2Vjb25k", "n": "bg"}]},
+            json={"sid": target_sid, "entries": [{"seq": seqs[0], "ek": SHARE_EK_ALT, "n": SHARE_NONCE}]},
         )
         self.assertEqual((second.json["added"], second.json["skipped"]), (0, 1))
         stored = store.fetch_messages_since(conv_id, 0)
-        self.assertEqual(stored[0]["payload"]["keys"][target_sid]["ek"], "Zmlyc3Q")
+        self.assertEqual(stored[0]["payload"]["keys"][target_sid]["ek"], SHARE_EK)
 
     def test_history_cannot_be_shared_to_another_account(self):
         cid, _, seqs = self._shared_history(count=1)
@@ -2315,7 +2323,7 @@ class ServerSmokeTest(unittest.TestCase):
         refused = self.client.post(
             f"/api/conversation/{cid}/share-keys", headers=self.headers,
             json={"sid": foreign.json["sid"],
-                  "entries": [{"seq": seqs[0], "ek": "ZWs", "n": "bg"}]},
+                  "entries": [{"seq": seqs[0], "ek": SHARE_EK, "n": SHARE_NONCE}]},
         )
         self.assertEqual(refused.status_code, 404, refused.json)
 
@@ -2334,7 +2342,7 @@ class ServerSmokeTest(unittest.TestCase):
         refused = self.client.post(
             f"/api/conversation/{cid}/share-keys", headers=self.headers,
             json={"sid": pending.json["sid"],
-                  "entries": [{"seq": seqs[0], "ek": "ZWs", "n": "bg"}]},
+                  "entries": [{"seq": seqs[0], "ek": SHARE_EK, "n": SHARE_NONCE}]},
         )
         self.assertEqual(refused.status_code, 409, refused.json)
 
@@ -2342,9 +2350,14 @@ class ServerSmokeTest(unittest.TestCase):
         cid, _, seqs = self._shared_history(count=1)
         target_sid = self._approved_second_device().json["sid"]
         for entries in (
-            [{"seq": 0, "ek": "ZWs", "n": "bg"}],
-            [{"seq": seqs[0], "ek": "not base64!", "n": "bg"}],
-            [{"seq": seqs[0], "ek": "ZWs"}],
+            [{"seq": 0, "ek": SHARE_EK, "n": SHARE_NONCE}],
+            [{"seq": seqs[0], "ek": "not base64!", "n": SHARE_NONCE}],
+            [{"seq": seqs[0], "ek": SHARE_EK}],
+            # Short/overlong key material: share-keys rewrites a stored
+            # envelope, so it holds the same decoded lengths as a send.
+            [{"seq": seqs[0], "ek": "ZWs", "n": SHARE_NONCE}],
+            [{"seq": seqs[0], "ek": SHARE_EK, "n": "bg"}],
+            [{"seq": seqs[0], "ek": "S" * 512, "n": SHARE_NONCE}],
             [],
         ):
             response = self.client.post(
@@ -2352,6 +2365,205 @@ class ServerSmokeTest(unittest.TestCase):
                 json={"sid": target_sid, "entries": entries},
             )
             self.assertEqual(response.status_code, 400, response.json)
+
+
+    # ----- abuse limits ---------------------------------------------------
+
+    def _with_real_limiter(self):
+        """Enable the limiter for one test and hand back its bucket store."""
+        import rate_limit
+
+        was_testing = app.testing
+        app.testing = False
+        rate_limit._buckets.clear()
+        self.addCleanup(rate_limit._buckets.clear)
+        self.addCleanup(setattr, app, "testing", was_testing)
+        return rate_limit
+
+    def test_password_endpoints_share_one_per_ip_budget_across_usernames(self):
+        """A rotating username used to open a fresh bucket on every request.
+
+        Each of these endpoints runs exactly one bcrypt cost-12 verification
+        whether or not the account exists, so without an identity-independent
+        cap one IP could spend the single worker's CPU without limit.
+        """
+        self._with_real_limiter()
+        # The limiter, not bcrypt, is what this measures.
+        with mock.patch.object(auth, "_check_password", return_value=False):
+            statuses = [
+                self.client.post(
+                    "/api/login",
+                    json={"username": f"drone{index:04d}", "pw_hash": self.pw_hash},
+                ).status_code
+                for index in range(auth.PASSWORD_ATTEMPT_IP_LIMIT + 1)
+            ]
+            self.assertEqual(
+                statuses[: auth.PASSWORD_ATTEMPT_IP_LIMIT],
+                [401] * auth.PASSWORD_ATTEMPT_IP_LIMIT,
+            )
+            self.assertEqual(statuses[-1], 429)
+            # One budget covers every bcrypt-paying endpoint: exhausting it on
+            # /login must not leave the other two free.
+            for endpoint, payload in (
+                ("/api/device-register", {
+                    "username": "drone9999", "pw_hash": self.pw_hash,
+                    "device_name": "x", "pub_key": "A" * 43, "sig_pub": self.sig_pub,
+                }),
+                ("/api/device-login", {
+                    "username": "drone9998", "pw_hash": self.pw_hash, "sid": self.sid,
+                }),
+            ):
+                spilled = self.client.post(endpoint, json=payload)
+                self.assertEqual(spilled.status_code, 429, (endpoint, spilled.json))
+                self.assertTrue(spilled.headers["Retry-After"])
+
+    def test_registration_email_requests_are_capped_per_ip_across_recipients(self):
+        """The per-address bucket cannot bound this: the address IS the key."""
+        self._with_real_limiter()
+        with mock.patch("emailer.send_code") as send_code:
+            statuses = []
+            for index in range(auth.REGISTER_EMAIL_IP_LIMIT + 1):
+                response = self.client.post(
+                    "/api/register/email/request",
+                    json={
+                        "username": f"maildrone{index:03d}",
+                        "email": f"victim{index:03d}@example.test",
+                        "pw_hash": self.pw_hash,
+                    },
+                )
+                statuses.append(response.status_code)
+        self.assertEqual(
+            statuses[: auth.REGISTER_EMAIL_IP_LIMIT],
+            [200] * auth.REGISTER_EMAIL_IP_LIMIT,
+        )
+        self.assertEqual(statuses[-1], 429)
+        self.assertEqual(send_code.call_count, auth.REGISTER_EMAIL_IP_LIMIT)
+
+    def test_missing_keys_is_throttled_and_never_materializes_the_thread(self):
+        """The limit used to be applied in Python AFTER selecting every payload."""
+        cid, conv_id, seqs = self._shared_history(count=0)
+        user = store.get_user_by_name(self.username)
+        bulk = "Y" * 120_000
+        for _ in range(8):
+            payload = json.dumps({
+                "ct": bulk,
+                "nonce": "bm9uY2U",
+                "keys": {self.sid: {"ek": SHARE_EK, "n": SHARE_NONCE}},
+            })
+            _, seq, _ = store.insert_message(conv_id, user["id"], self.sid, payload)
+            seqs.append(seq)
+        target_sid = self._approved_second_device().json["sid"]
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            bounded = store.missing_key_sequences(conv_id, target_sid, limit=1)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(bounded, seqs[:1])
+        # ~960KB of payload is in the conversation; the answer is one integer.
+        self.assertLess(peak, 100_000, peak)
+        self.assertEqual(
+            store.missing_key_sequences(conv_id, target_sid, limit=3), seqs[:3]
+        )
+
+        # And the endpoint is throttled like its share-keys sibling.
+        with mock.patch("conversations.rate_limit", return_value=4) as limiter:
+            limited = self.client.get(
+                f"/api/conversation/{cid}/missing-keys?sid={target_sid}",
+                headers=self.headers,
+            )
+        self.assertEqual(limited.status_code, 429, limited.json)
+        self.assertEqual(limited.headers["Retry-After"], "4")
+        limiter.assert_called_once_with("missing-keys", self.sid, 120, 60)
+
+    def test_sharing_cannot_grow_a_stored_envelope_past_the_cap(self):
+        """share-keys rewrites a row the send path already size-checked."""
+        cid, conv_id, seqs = self._shared_history(count=1)
+        target_sid = self._approved_second_device().json["sid"]
+        before = store.fetch_messages_since(conv_id, 0)[0]["payload"]
+        with mock.patch.object(config, "MAX_ENVELOPE_BYTES", 80):
+            refused = self.client.post(
+                f"/api/conversation/{cid}/share-keys", headers=self.headers,
+                json={"sid": target_sid,
+                      "entries": [{"seq": seqs[0], "ek": SHARE_EK, "n": SHARE_NONCE}]},
+            )
+        self.assertEqual(refused.status_code, 200, refused.json)
+        self.assertEqual((refused.json["added"], refused.json["skipped"]), (0, 1))
+        self.assertEqual(store.fetch_messages_since(conv_id, 0)[0]["payload"], before)
+
+    def test_carrier_status_skips_a_device_revoked_during_the_write(self):
+        """The member list is read before update_carrier_status takes the lock.
+
+        A device revoked inside that window is still in the snapshot, and its
+        old versioned room still holds a connected socket, so the status event
+        reached a device that had just lost the session.
+        """
+        gateway = self.register_and_approve_device({
+            "username": self.username,
+            "pw_hash": self.pw_hash,
+            "device_name": "android-gateway",
+            "device_kind": "android_gateway",
+            "pub_key": "C" * 43,
+        })
+        created = self.create_conversation()
+        gateway_socket = socketio.test_client(
+            app, auth={"token": gateway.json["token"]}
+        )
+        web_socket = socketio.test_client(app, auth={"token": self.token})
+        self.assertTrue(gateway_socket.is_connected())
+        self.assertTrue(web_socket.is_connected())
+        ack = web_socket.emit(
+            "message_send",
+            {
+                "cid": created["cid"],
+                "mid": "carrier-revoke-race-01",
+                "payload": {
+                    "ct": "A" * 22,
+                    "nonce": "A" * 32,
+                    "keys": {
+                        self.sid: {"ek": "A" * 64, "n": "A" * 32},
+                        gateway.json["sid"]: {"ek": "B" * 64, "n": "B" * 32},
+                    },
+                },
+            },
+            callback=True,
+        )
+        self.assertTrue(ack["ok"], ack)
+        gateway_socket.get_received()
+        web_socket.get_received()
+
+        original = store.update_carrier_status
+
+        def revoke_inside_the_write(*args, **kwargs):
+            result = original(*args, **kwargs)
+            with store.conn_ctx() as c:
+                c.execute(
+                    "UPDATE devices SET trust_state='revoked', "
+                    "session_version=session_version+1 WHERE sid=?",
+                    (self.sid,),
+                )
+            return result
+
+        with mock.patch.object(
+            store, "update_carrier_status", side_effect=revoke_inside_the_write
+        ):
+            status = gateway_socket.emit(
+                "carrier_status",
+                {"cid": created["cid"], "seq": ack["seq"], "status": "sent"},
+                callback=True,
+            )
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(
+            [e for e in web_socket.get_received() if e["name"] == "message_status"], []
+        )
+        # The gateway itself did not move, so the fan-out is not simply dead.
+        self.assertEqual(
+            [e["name"] for e in gateway_socket.get_received()], ["message_status"]
+        )
+        gateway_socket.disconnect()
+        web_socket.disconnect()
 
 
 if __name__ == "__main__":

@@ -54,6 +54,20 @@ export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Relay content limits.
+ *
+ * Three layers enforce them: the file picker refuses at attach time, the send
+ * path refuses at send time, and decodeRelayContent silently DROPS anything
+ * over the line on receipt. That last one is why they cannot be per-file
+ * literals — a cap raised in the sender and not the decoder turns into
+ * attachments that vanish on the other device with no error anywhere.
+ */
+export const MAX_ATTACHMENTS = 8;
+export const MAX_ATTACHMENT_BYTES = 512 * 1024;
+export const MAX_TEXT_CHARS = 20_000;
+export const MAX_SUBJECT_CHARS = 120;
+
 export function isSafeMimeType(value: string): boolean {
   return /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(value)
     && value.length <= 120;
@@ -64,7 +78,7 @@ export function decodeRelayContent(value: string): RelayContent {
   try {
     const parsed = JSON.parse(value) as Partial<RelayContent>;
     if (parsed.v === 1 && (parsed.type === "text" || parsed.type === "mms")
-      && typeof parsed.text === "string" && parsed.text.length <= 20_000) {
+      && typeof parsed.text === "string" && parsed.text.length <= MAX_TEXT_CHARS) {
       let totalBytes = 0;
       const candidates = Array.isArray(parsed.attachments) ? parsed.attachments.slice(0, 64) : [];
       const attachments = candidates
@@ -77,8 +91,8 @@ export function decodeRelayContent(value: string): RelayContent {
             || typeof item.size !== "number"
             || !Number.isInteger(item.size)
             || item.size < 0
-            || item.size > 512 * 1024
-            || totalBytes + item.size > 512 * 1024) return false;
+            || item.size > MAX_ATTACHMENT_BYTES
+            || totalBytes + item.size > MAX_ATTACHMENT_BYTES) return false;
           try {
             if (unb64u(item.data).byteLength !== item.size) return false;
           } catch {
@@ -86,17 +100,17 @@ export function decodeRelayContent(value: string): RelayContent {
           }
           totalBytes += item.size;
           return true;
-        }).slice(0, 8);
+        }).slice(0, MAX_ATTACHMENTS);
       return {
         v: 1,
         type: parsed.type,
         text: parsed.text,
-        subject: typeof parsed.subject === "string" ? parsed.subject.slice(0, 120) : undefined,
+        subject: typeof parsed.subject === "string" ? parsed.subject.slice(0, MAX_SUBJECT_CHARS) : undefined,
         attachments,
       };
     }
   } catch {
     // Legacy SMS rows were encrypted as plain text.
   }
-  return { v: 1, type: "text", text: value.slice(0, 20_000), attachments: [] };
+  return { v: 1, type: "text", text: value.slice(0, MAX_TEXT_CHARS), attachments: [] };
 }

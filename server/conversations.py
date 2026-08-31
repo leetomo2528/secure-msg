@@ -15,8 +15,8 @@ import hashlib
 import json
 
 import store
-from auth import _err, _ok, auth_required
-from flask import Blueprint, g, jsonify, request
+from auth import _err, _json_body, _ok, _rate_error, _valid_b64u, auth_required
+from flask import Blueprint, g, request
 from rate_limit import check as rate_limit
 from sockets import emit_to_conv_members, emit_to_user_devices
 
@@ -32,14 +32,12 @@ def create_conversation():
     The conversation id is a random opaque token. `name` is a display label
     (e.g. phone number for SMS bridge conversations).
     """
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
     retry_after = rate_limit("conversation-create", g.auth["sid"], 30, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
     members = body.get("members") or []
     raw_name = body.get("name", "")
     if not isinstance(raw_name, str):
@@ -90,14 +88,12 @@ def create_conversation():
 def rename_conversation():
     """Body: { cid, name } -> { cid, name }. Members only. Fan-out notifies
     all member devices to refresh the conversation label."""
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
     retry_after = rate_limit("conversation-rename", g.auth["sid"], 30, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
     cid = body.get("cid")
     raw_name = body.get("name", "")
     if not isinstance(cid, str) or not cid:
@@ -124,8 +120,8 @@ def sync_contact_names():
     Every target must be a self-only conversation belonging to that account,
     so a contact name can never be leaked into a multi-user conversation.
     """
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
 
     device = store.get_device_by_sid(g.auth["sid"])
@@ -133,9 +129,7 @@ def sync_contact_names():
         return _err("android gateway required", 403)
     retry_after = rate_limit("contact-names-sync", g.auth["sid"], 10, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
 
     raw_entries = body.get("entries")
     if not isinstance(raw_entries, list) or len(raw_entries) > 500:
@@ -296,8 +290,13 @@ def fetch_messages(cid: str):
     return _ok(messages=msgs, conv_id=conv["id"], cid=cid)
 
 
-B64U_RE = re.compile(r"[A-Za-z0-9_-]{1,512}", re.ASCII)
 MAX_SHARE_ENTRIES = 200
+# A re-wrapped envelope key is exactly what the socket send path accepts: a
+# crypto_box of the 32-byte message key (32 + 16 MAC) under a 24-byte nonce.
+# Anything longer is not a key, and since share-keys REWRITES a stored
+# envelope, a looser bound here is a way to grow other accounts' stored rows.
+SHARE_EK_BYTES = 48
+SHARE_NONCE_BYTES = 24
 
 
 @bp.get("/conversation/<cid>/missing-keys")
@@ -308,6 +307,9 @@ def missing_keys(cid: str):
     The sharing device drives history backfill from this list, so it only
     re-wraps what is actually missing.
     """
+    retry_after = rate_limit("missing-keys", g.auth["sid"], 120, 60)
+    if retry_after:
+        return _rate_error(retry_after)
     target_sid = request.args.get("sid", "")
     conv, target, error = _share_target(cid, target_sid)
     if error:
@@ -329,14 +331,12 @@ def share_keys(cid: str):
     key and re-wraps it for the target's public key. The relay only ever sees
     the wrapped keys, exactly as it does for a normal send.
     """
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
+    body = _json_body()
+    if body is None:
         return _err("JSON object required", 400)
     retry_after = rate_limit("share-keys", g.auth["sid"], 120, 60)
     if retry_after:
-        response = jsonify({"ok": False, "error": "too many requests"})
-        response.headers["Retry-After"] = str(retry_after)
-        return response, 429
+        return _rate_error(retry_after)
 
     conv, target, error = _share_target(cid, body.get("sid", ""))
     if error:
@@ -356,10 +356,10 @@ def share_keys(cid: str):
         n = entry.get("n")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
             return _err("seq must be a positive integer", 400)
-        if not isinstance(ek, str) or not B64U_RE.fullmatch(ek):
-            return _err("ek must be base64url", 400)
-        if not isinstance(n, str) or not B64U_RE.fullmatch(n):
-            return _err("n must be base64url", 400)
+        if not _valid_b64u(ek, SHARE_EK_BYTES):
+            return _err(f"ek must be base64url for {SHARE_EK_BYTES} bytes", 400)
+        if not _valid_b64u(n, SHARE_NONCE_BYTES):
+            return _err(f"n must be base64url for {SHARE_NONCE_BYTES} bytes", 400)
         clean.append({"seq": seq, "ek": ek, "n": n})
 
     result = store.share_message_keys(conv["id"], target["sid"], g.auth["sid"], clean)

@@ -439,6 +439,51 @@ describe("history key sharing", () => {
     expect(await getUndecryptableFloor(cid)).toBeNull();
   });
 
+  it("re-reads the gap when the key arrives, however many syncs came first", async () => {
+    // The receiving half again, but with the share landing later than the
+    // second sync. A once-per-session re-read is spent by whichever pass runs
+    // first — a click on the thread, a reconnect's syncAll, any unrelated
+    // message — so the keys shared afterwards stayed invisible until the
+    // browser was reloaded.
+    const a = account(9010);
+    const cid = "conv-share-late-arrival";
+    await pinTrustedDirectory(pinnedSnapshot(a));
+    signedIn(a, "late");
+    __testing.resetSyncJobs();
+
+    const envelope = await encryptMessage(
+      "늦게 열린 메시지", [{ sid: a.mySid, pub_key: a.mine.box.pk }], a.mine,
+    );
+    let served = envelope;
+    vi.spyOn(api, "convMembers").mockResolvedValue(conversationDirectory(a));
+    const fetchMessages = vi.spyOn(api, "fetchMessages").mockImplementation(
+      async (_cid, since, limit = 200) => ({
+        ok: true,
+        messages: since < 1 ? [serverMessage(cid, 1, a, served)].slice(0, limit) : [],
+      }),
+    );
+
+    // Discover the gap, then two more passes with nothing shared yet.
+    for (let pass = 0; pass < 3; pass += 1) {
+      await useStore.getState().syncConversation(cid);
+    }
+    expect(await listMessages(cid)).toEqual([]);
+    expect(await getUndecryptableFloor(cid)).toBe(1);
+    expect(await getCursor(cid)).toBe(1);
+    // A gap that is still shut costs one probe row per pass, not the thread.
+    expect(fetchMessages.mock.calls.filter(([, , limit]) => limit === 1)).toHaveLength(2);
+
+    const rewrapped = rewrapMessageKey(
+      envelope, a.mySid, a.mine, a.mine.box.pk, a.target.box.pk,
+    )!;
+    served = { ...envelope, keys: { ...envelope.keys, [a.targetSid]: rewrapped } };
+    await useStore.getState().syncConversation(cid);
+
+    const rows = await listMessages(cid);
+    expect(rows.map((row) => row.plaintext)).toEqual(["늦게 열린 메시지"]);
+    expect(await getUndecryptableFloor(cid)).toBeNull();
+  });
+
   it("reports the relay error and shares nothing when missing-keys fails", async () => {
     const a = account(9005);
     const cid = "conv-share-error";

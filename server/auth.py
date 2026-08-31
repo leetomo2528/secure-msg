@@ -31,8 +31,26 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 from flask import Blueprint, g, jsonify, request
 from rate_limit import check as rate_limit
+from rate_limit import check_ip as rate_limit_ip
 
 bp = Blueprint("auth", __name__, url_prefix="/api")
+# Every endpoint that verifies a password pays one bcrypt cost-12 hash per
+# attempt whether or not the account exists (see _DUMMY_PW_HASH), and they all
+# key their per-identity bucket on the caller-supplied username. Rotating that
+# username opens a fresh bucket every request, so the three of them also share
+# ONE per-IP budget: that is the only limit that bounds how much of the
+# single-worker deployment's CPU an unauthenticated IP can burn.
+PASSWORD_ATTEMPT_IP_SCOPE = "password-attempt-ip"
+PASSWORD_ATTEMPT_IP_LIMIT = 60
+PASSWORD_ATTEMPT_IP_WINDOW = 60
+# Outbound mail is charged to the deployment's sender reputation, not just its
+# CPU, and the recipient address is entirely attacker-chosen.
+REGISTER_EMAIL_IP_LIMIT = 20
+REGISTER_EMAIL_IP_WINDOW = 3600
+# Returned only when the device row itself says 'revoked'. A pending device
+# acts on this by discarding its local keypair, so it must not be reachable
+# through an ordinary expired/rotated token.
+DEVICE_REVOKED_CODE = "device_revoked"
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 SID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}", re.ASCII)
@@ -62,14 +80,40 @@ def _ok(**kw) -> tuple:
     return jsonify({"ok": True, **kw})
 
 
-def _err(msg: str, status: int = 400) -> tuple:
-    return jsonify({"ok": False, "error": msg}), status
+def _err(msg: str, status: int = 400, code: str | None = None) -> tuple:
+    """``code`` is a stable machine-readable reason.
+
+    Clients must never branch on the prose (it is localized and changeable)
+    and a status alone is not enough where one status covers outcomes that
+    call for opposite handling — see DEVICE_REVOKED_CODE.
+    """
+    body = {"ok": False, "error": msg}
+    if code is not None:
+        body["code"] = code
+    return jsonify(body), status
 
 
 def _rate_error(retry_after: int) -> tuple:
     response = jsonify({"ok": False, "error": "too many requests"})
     response.headers["Retry-After"] = str(retry_after)
     return response, 429
+
+
+def _password_attempt_denied(scope: str, username: str) -> tuple | None:
+    """429 for a bcrypt-paying endpoint, or None to let the attempt through.
+
+    The per-username bucket stops credential stuffing against one account; the
+    shared per-IP bucket stops the same client from side-stepping it entirely
+    by inventing a new username per request. Only the second one is checked
+    when the first already allowed the attempt, so a denied request does not
+    also consume the IP budget.
+    """
+    retry_after = rate_limit(scope, username, 20, 60) or rate_limit_ip(
+        PASSWORD_ATTEMPT_IP_SCOPE,
+        PASSWORD_ATTEMPT_IP_LIMIT,
+        PASSWORD_ATTEMPT_IP_WINDOW,
+    )
+    return _rate_error(retry_after) if retry_after else None
 
 
 def issue_jwt(uid: int, sid: str, session_version: int) -> str:
@@ -95,7 +139,13 @@ def _valid_client_hash(value: object) -> bool:
     return isinstance(value, str) and _valid_b64u(value, 32)
 
 
-def _valid_b64u(value: object, raw_length: int) -> bool:
+def _valid_b64u(value: object, raw_length: int | None = None) -> bool:
+    """Unpadded base64url, optionally of one exact decoded length.
+
+    The single decoder for the whole wire format — REST bodies and Socket.IO
+    event payloads both come through here, so a hardening change to the accepted
+    character set or length cannot apply to one transport and miss the other.
+    """
     if not isinstance(value, str) or not B64U_RE.fullmatch(value):
         return False
     try:
@@ -103,7 +153,7 @@ def _valid_b64u(value: object, raw_length: int) -> bool:
         decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
     except (binascii.Error, ValueError):
         return False
-    return len(decoded) == raw_length
+    return raw_length is None or len(decoded) == raw_length
 
 
 def _text(body: dict, field: str) -> str:
@@ -210,8 +260,16 @@ def pending_auth_required(fn):
         sid = claims["sid"]
         sv = claims["session_version"]
         device = store.get_device_by_sid(sid)
-        if not device or device["user_id"] != uid or device["session_version"] != sv or device["trust_state"] == "revoked":
-            return _err("device revoked or unknown", 401)
+        # Split on purpose. A token that no longer names a live session is
+        # indistinguishable from an expired one and says nothing about the
+        # device's trust state, while an actually revoked device is a fact the
+        # client is entitled to act on destructively. Collapsing both into one
+        # 401 made a pending device discard its local state on any expiry — or
+        # whenever a relay chose to answer 401.
+        if not device or device["user_id"] != uid or device["session_version"] != sv:
+            return _err("invalid token", 401)
+        if device["trust_state"] == "revoked":
+            return _err("device revoked", 401, code=DEVICE_REVOKED_CODE)
         g.auth = {"uid": uid, "sid": sid, "device_id": device["id"], "session_version": sv}
         g.device = device
         return fn(*args, **kwargs)
@@ -233,9 +291,14 @@ def register_email_request():
     pw_hash = _text(body, "pw_hash")
     if not USERNAME_RE.fullmatch(username) or not _email_ok(email) or not _valid_client_hash(pw_hash):
         return _err("username, email and password are required", 400)
-    # This endpoint triggers outbound email; rate limit per IP before any
-    # mailbox lookup so it cannot be used to mail-bomb arbitrary addresses.
-    retry_after = rate_limit("register-email-request", email, 5, 60)
+    # This endpoint triggers outbound email before any mailbox lookup, to an
+    # address the caller chose. The per-address bucket alone would be useless
+    # here — the address IS the bucket key, so a new recipient is a new budget
+    # — hence the second, address-independent per-IP cap that bounds total
+    # sends and keeps this from being an open mailer.
+    retry_after = rate_limit("register-email-request", email, 5, 60) or rate_limit_ip(
+        "register-email-request-ip", REGISTER_EMAIL_IP_LIMIT, REGISTER_EMAIL_IP_WINDOW
+    )
     if retry_after:
         return _rate_error(retry_after)
     if store.get_user_by_name(username) or store.get_user_by_email(email):
@@ -364,9 +427,9 @@ def login():
     if body is None:
         return _err("JSON object required", 400)
     username = _text(body, "username").strip().lower()
-    retry_after = rate_limit("login", username, 20, 60)
-    if retry_after:
-        return _rate_error(retry_after)
+    denied = _password_attempt_denied("login", username)
+    if denied:
+        return denied
     pw_hash = _text(body, "pw_hash")
     if not USERNAME_RE.fullmatch(username) or not _valid_client_hash(pw_hash):
         return _err("username and pw_hash required", 400)
@@ -398,9 +461,9 @@ def device_register():
     if body is None:
         return _err("JSON object required", 400)
     username = _text(body, "username").strip().lower()
-    retry_after = rate_limit("device-register", username, 20, 60)
-    if retry_after:
-        return _rate_error(retry_after)
+    denied = _password_attempt_denied("device-register", username)
+    if denied:
+        return denied
     pw_hash = _text(body, "pw_hash")
     device_name = _text(body, "device_name").strip()[:40]
     pub_key = _text(body, "pub_key")
@@ -481,9 +544,9 @@ def device_login():
     if body is None:
         return _err("JSON object required", 400)
     username = _text(body, "username").strip().lower()
-    retry_after = rate_limit("device-login", username, 20, 60)
-    if retry_after:
-        return _rate_error(retry_after)
+    denied = _password_attempt_denied("device-login", username)
+    if denied:
+        return denied
     pw_hash = _text(body, "pw_hash")
     sid = _text(body, "sid")
     if not (

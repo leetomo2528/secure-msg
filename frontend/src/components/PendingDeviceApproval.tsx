@@ -41,6 +41,7 @@ export default function PendingDeviceApproval() {
   const pendingPairing = useStore((s) => s.pendingPairing);
   const refreshPendingApproval = useStore((s) => s.refreshPendingApproval);
   const forgetLocalDevice = useStore((s) => s.forgetLocalDevice);
+  const discardRevokedDevice = useStore((s) => s.discardRevokedDevice);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [showDetails, setShowDetails] = useState(false);
 
@@ -121,12 +122,16 @@ export default function PendingDeviceApproval() {
     let stopped = false;
     const poll = async () => {
       const state = await refreshPendingApproval();
-      if (!stopped && state === "revoked") await forgetLocalDevice();
+      // The relay decided this, not the user: keep the account's pinned
+      // identity and device keys so the next registration is still checked
+      // against them. Cancelling below is the user's own instruction and does
+      // erase them.
+      if (!stopped && state === "revoked") await discardRevokedDevice();
     };
     void poll();
     const timer = window.setInterval(() => void poll(), 2_000);
     return () => { stopped = true; window.clearInterval(timer); };
-  }, [forgetLocalDevice, refreshPendingApproval]);
+  }, [discardRevokedDevice, refreshPendingApproval]);
 
   return (
     <div className="onboarding-shell grid min-h-full place-items-center overflow-y-auto px-5 py-10">

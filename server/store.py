@@ -252,9 +252,8 @@ def init_schema() -> None:
             ).fetchall()
             quarantined_gateways: list[str] = []
             for duplicate in gateways[1:]:
-                c.execute(
-                    "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
-                    (_b64u(secrets.token_bytes(32)), duplicate["id"]),
+                _quarantine_device_locked(
+                    c, uid, int(duplicate["id"]), str(duplicate["sid"])
                 )
                 quarantined_gateways.append(str(duplicate["sid"]))
             earliest = c.execute(
@@ -482,11 +481,13 @@ def prune_orphan_conversations() -> int:
     """Clear conversations already stranded by an account deleted before the
     drop_conversation_without_members trigger existed.
 
-    Deliberately NOT run at startup. ``create_conversation`` and
-    ``add_member`` are separate transactions at some call sites, so a
-    membership-free conversation is not proof of an orphan — it can also be a
-    creation caught mid-flight. Run this explicitly, after an account
-    deletion, when that ambiguity does not apply.
+    Deliberately NOT run at startup. Every production creation path is a
+    single transaction (create_conversation_with_members,
+    get_or_create_single_member_conversation), but the bare
+    ``create_conversation``/``add_member`` pair is still reachable, so a
+    membership-free conversation is not proof of an orphan on its own. Run
+    this explicitly, after an account deletion, when that ambiguity does not
+    apply.
     """
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -720,16 +721,16 @@ def rotate_device_session(
     device_id: int,
     user_id: int,
     expected_version: int | None = None,
-    require_not_revoked: bool = False,
 ) -> int | None:
     """Atomically revoke existing JWTs for one device and return its new version.
 
     ``expected_version`` prevents an older request from revoking a newer login
     that won a race after the request was authenticated.
 
-    ``require_not_revoked`` makes the trust-state check part of the same SQL
-    update as the version rotation.  This is used by password-based device
-    login so a concurrent revocation cannot be followed by token issuance.
+    Revoking a device is NOT this function's job and no caller asks it to
+    check trust state: password-based device login carries its own
+    ``trust_state != 'revoked'`` guard inside consume_device_login_challenge's
+    update, in the same transaction that issues the session.
     """
     with conn_ctx() as c:
         c.execute("BEGIN IMMEDIATE")
@@ -740,8 +741,6 @@ def rotate_device_session(
             if expected_version is not None:
                 where += " AND session_version = ?"
                 params += (expected_version,)
-            if require_not_revoked:
-                where += " AND trust_state != 'revoked'"
             cur = c.execute(
                 "UPDATE devices SET session_version = session_version + 1, "
                 "last_seen = ? WHERE " + where,
@@ -1005,6 +1004,31 @@ def reject_pending_device(
         return True
 
 
+def _quarantine_device_locked(
+    c: sqlite3.Connection, user_id: int, device_id: int, sid: str
+) -> None:
+    """Send an approved device back to 'pending' and drop its approval certificate.
+
+    The certificate has to go with the approval. device_approvals is
+    UNIQUE(user_id, subject_sid), so a stale row makes the eventual
+    re-approval collide, and the collision is indistinguishable at the route
+    from the one-approved-gateway trigger. It is also no longer verifiable on
+    its own terms: quarantining clears approved_at, which drops the device out
+    of the directory proof's device_history, leaving a certificate whose
+    subject clients cannot resolve.
+    """
+    c.execute(
+        "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', "
+        "challenge=?, session_version=session_version+1, approved_by_sid=NULL, "
+        "approved_at=NULL, approval_signature=NULL WHERE id=?",
+        (_b64u(secrets.token_bytes(32)), device_id),
+    )
+    c.execute(
+        "DELETE FROM device_approvals WHERE user_id=? AND subject_sid=?",
+        (user_id, sid),
+    )
+
+
 def approve_pending_device(
     user_id: int,
     approver_sid: str,
@@ -1069,8 +1093,18 @@ def approve_pending_device(
                 "UPDATE devices SET trust_state = 'approved', verification_state='verified', approved_by_sid = ?, approved_at = ?, approval_signature = ? WHERE user_id = ? AND sid = ? AND trust_state = 'pending'",
                 (approver_sid, timestamp, signature, user_id, subject_sid),
             )
+            # One certificate per subject, and the newest one is the account's
+            # current authorization for it: a device that was quarantined back
+            # to 'pending' and approved again is authorized by the second
+            # signature, not the first. A plain INSERT would raise on the
+            # UNIQUE(user_id, subject_sid) constraint instead, and the route
+            # cannot tell that collision apart from the gateway trigger's.
             c.execute(
-                "INSERT INTO device_approvals(user_id,subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO device_approvals(user_id,subject_sid,approver_sid,parent_epoch,resulting_epoch,statement,signature,created_at) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(user_id,subject_sid) DO UPDATE SET "
+                "approver_sid=excluded.approver_sid, parent_epoch=excluded.parent_epoch, "
+                "resulting_epoch=excluded.resulting_epoch, statement=excluded.statement, "
+                "signature=excluded.signature, created_at=excluded.created_at",
                 (user_id, subject_sid, approver_sid, parent_epoch, epoch, statement, signature, timestamp),
             )
             if pairing is not None:
@@ -1121,12 +1155,11 @@ def upgrade_legacy_security(
                 raise PermissionError("legacy identity anchor required")
             timestamp = now()
             for peer in c.execute(
-                "SELECT id FROM devices WHERE user_id=? AND sid!=? AND trust_state='approved'",
+                "SELECT id,sid FROM devices WHERE user_id=? AND sid!=? AND trust_state='approved'",
                 (user_id, actor_sid),
             ).fetchall():
-                c.execute(
-                    "UPDATE devices SET trust_state='pending', verification_state='legacy_unverified', challenge=?, session_version=session_version+1, approved_by_sid=NULL, approved_at=NULL, approval_signature=NULL WHERE id=?",
-                    (_b64u(secrets.token_bytes(32)), peer["id"]),
+                _quarantine_device_locked(
+                    c, user_id, int(peer["id"]), str(peer["sid"])
                 )
             epoch = parent_epoch + 1
             c.execute(
@@ -1229,11 +1262,6 @@ def _get_directory_proof_with_conn(
     }
 
 
-def get_directory_proof(user_id: int) -> dict[str, Any] | None:
-    with read_snapshot() as c:
-        return _get_directory_proof_with_conn(c, user_id)
-
-
 def list_security_events(user_id: int, limit: int = 200, before_id: int | None = None) -> list[dict[str, Any]]:
     with conn_ctx() as c:
         where = "user_id = ?"
@@ -1253,15 +1281,6 @@ def list_security_events(user_id: int, limit: int = 200, before_id: int | None =
             item["details"] = json.loads(item.pop("event_json"))
             result.append(item)
         return result
-
-
-def count_security_events(user_id: int) -> int:
-    with conn_ctx() as c:
-        row = c.execute(
-            "SELECT COUNT(*) AS count FROM security_events WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return int(row["count"])
 
 
 def count_security_events_before(user_id: int, before_id: int) -> int:
@@ -1373,19 +1392,52 @@ def get_conversation_by_cid(cid: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+# One definition of "the devices this conversation is addressed to". The
+# Socket.IO fan-out and /conversation/<cid>/members must agree on it exactly:
+# the client turns the endpoint's answer into the recipient keyset, and
+# insert_message rejects a payload whose keys do not match the fan-out set.
+# Only the ORDER BY belongs to the individual callers.
+_CONV_MEMBER_DEVICES_SQL = (
+    "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.sig_pub, d.name, d.kind, "
+    "d.session_version, u.security_epoch, u.directory_hash, u.identity_sig_pub "
+    "FROM conversation_members m "
+    "JOIN devices d ON d.user_id = m.user_id "
+    "JOIN users u ON u.id = d.user_id "
+    "WHERE m.conv_id = ? AND d.trust_state = 'approved'"
+)
+
+
 def list_members(conv_id: int) -> list[dict[str, Any]]:
     """Return all devices of all members — needed to fan out envelope keys."""
     with conn_ctx() as c:
-        rows = c.execute(
-            "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.sig_pub, d.name, d.kind, "
-            "d.session_version, u.security_epoch, u.directory_hash, u.identity_sig_pub "
-            "FROM conversation_members m "
-            "JOIN devices d ON d.user_id = m.user_id "
-            "JOIN users u ON u.id = d.user_id "
-            "WHERE m.conv_id = ? AND d.trust_state = 'approved'",
-            (conv_id,),
-        ).fetchall()
+        rows = c.execute(_CONV_MEMBER_DEVICES_SQL, (conv_id,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def current_devices_by_sid(sids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Re-read several devices in one connection, keyed by sid.
+
+    A member list is only a snapshot: a device can be revoked, or rotate its
+    session, between the moment it was read and the moment an event is pushed
+    to its versioned room. Callers that fan out after a write re-read through
+    this and drop anything that moved. Chunked because one conversation can
+    hold far more sids than SQLite's older per-statement variable limit.
+    """
+    unique = list(dict.fromkeys(sids))
+    out: dict[str, dict[str, Any]] = {}
+    if not unique:
+        return out
+    with read_snapshot() as c:
+        for start in range(0, len(unique), 500):
+            chunk = unique[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            for row in c.execute(
+                "SELECT id, user_id, sid, trust_state, session_version FROM devices "
+                f"WHERE sid IN ({placeholders})",
+                chunk,
+            ).fetchall():
+                out[str(row["sid"])] = dict(row)
+    return out
 
 
 def get_conversation_directory_snapshot(cid: str) -> dict[str, Any] | None:
@@ -1402,13 +1454,7 @@ def get_conversation_directory_snapshot(cid: str) -> dict[str, Any] | None:
         members = [
             dict(row)
             for row in c.execute(
-                "SELECT d.id AS device_id, d.sid, d.user_id, d.pub_key, d.sig_pub, d.name, d.kind, "
-                "d.session_version, u.security_epoch, u.directory_hash, u.identity_sig_pub "
-                "FROM conversation_members m "
-                "JOIN devices d ON d.user_id = m.user_id "
-                "JOIN users u ON u.id = d.user_id "
-                "WHERE m.conv_id = ? AND d.trust_state = 'approved' "
-                "ORDER BY d.user_id, d.sid, d.id",
+                _CONV_MEMBER_DEVICES_SQL + " ORDER BY d.user_id, d.sid, d.id",
                 (conv["id"],),
             ).fetchall()
         ]
@@ -1445,15 +1491,6 @@ def get_conversation_directory_snapshot(cid: str) -> dict[str, Any] | None:
 
 
 # ----- messages ---------------------------------------------------------
-
-
-def next_seq(conv_id: int) -> int:
-    with conn_ctx() as c:
-        row = c.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE conv_id = ?",
-            (conv_id,),
-        ).fetchone()
-        return int(row["s"]) + 1
 
 
 def canonical_message_payload(payload: str | dict[str, Any]) -> str:
@@ -1839,15 +1876,6 @@ def is_self_only_conversation_owner(conv_id: int, user_id: int) -> bool:
         return bool(row and int(row["member_count"]) == 1 and int(row["owned"]) == 1)
 
 
-def list_user_device_sids(user_id: int) -> list[str]:
-    with conn_ctx() as c:
-        rows = c.execute(
-            "SELECT sid FROM devices WHERE user_id = ? AND trust_state = 'approved'",
-            (user_id,),
-        ).fetchall()
-        return [str(r["sid"]) for r in rows]
-
-
 # ----- historical key sharing (new-device backfill) ----------------------
 
 #: Envelope key entries added by [share_message_keys] carry the sid of the
@@ -1896,9 +1924,19 @@ def share_message_keys(
                     "n": entry["n"],
                     SHARE_WRAPPER_FIELD: wrapper_sid,
                 }
+                encoded = json.dumps(payload, separators=(",", ":"))
+                # The send path caps an envelope at MAX_ENVELOPE_BYTES; this
+                # path rewrites the same row and must honour the same cap.
+                # Every key added here is permanent — sids stay in the envelope
+                # after their device is revoked — so without this a long series
+                # of register/approve/share cycles grows one stored message
+                # past a limit every peer account then has to download.
+                if len(encoded.encode("utf-8")) > config.MAX_ENVELOPE_BYTES:
+                    skipped += 1
+                    continue
                 c.execute(
                     "UPDATE messages SET payload = ? WHERE id = ?",
-                    (json.dumps(payload, separators=(",", ":")), row["id"]),
+                    (encoded, row["id"]),
                 )
                 added += 1
             c.execute("COMMIT")
@@ -1913,20 +1951,24 @@ def missing_key_sequences(conv_id: int, target_sid: str, limit: int = 500) -> li
 
     Lets a sharing device ask for exactly the work that remains instead of
     re-downloading and re-wrapping history it has already shared.
+
+    Both the filter and the limit are pushed into SQL on purpose. Selecting
+    the payload column and filtering in Python materialized every envelope of
+    the conversation in memory before the limit was applied — up to
+    MAX_ENVELOPE_BYTES each, for the whole history, on a single-worker
+    process. SQLite streams one row at a time and stops at LIMIT, so peak
+    memory is one envelope regardless of thread length. ``json_each`` matches
+    the key by bound parameter rather than by JSON path, so a device sid can
+    never be read as path syntax; the json_valid/json_type guards keep the
+    same rows that the Python loop used to skip.
     """
     with read_snapshot() as c:
         rows = c.execute(
-            "SELECT seq, payload FROM messages WHERE conv_id = ? ORDER BY seq ASC",
-            (conv_id,),
+            "SELECT seq FROM messages WHERE conv_id = ? "
+            "AND json_valid(payload) AND json_type(payload, '$.keys') = 'object' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM json_each(messages.payload, '$.keys') WHERE json_each.key = ?"
+            ") ORDER BY seq ASC LIMIT ?",
+            (conv_id, target_sid, limit),
         ).fetchall()
-    out: list[int] = []
-    for row in rows:
-        try:
-            keys = json.loads(row["payload"]).get("keys")
-        except (TypeError, ValueError):
-            continue
-        if isinstance(keys, dict) and target_sid not in keys:
-            out.append(int(row["seq"]))
-            if len(out) >= limit:
-                break
-    return out
+    return [int(row["seq"]) for row in rows]

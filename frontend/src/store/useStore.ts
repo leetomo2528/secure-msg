@@ -9,13 +9,16 @@
 import { create } from "zustand";
 import {
   api,
+  DEVICE_REVOKED,
   getSocket,
+  isCompleteKeyDirectory,
+  ownDirectoryProof,
   disconnectSocket,
   waitForSocketConnected,
   sendMessage,
   type ServerMessage,
-  type ConvMember,
   type BlockRule,
+  type BlockRuleType,
   type ConversationMembersResult,
 } from "../net/api";
 import {
@@ -76,6 +79,10 @@ import {
   conversationDisplayName,
   errorText,
   isSafeMimeType,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_BYTES,
+  MAX_SUBJECT_CHARS,
+  MAX_TEXT_CHARS,
   matchesBlockedSender,
   ruleToKeywordRow,
   ruleToSenderRow,
@@ -165,7 +172,6 @@ interface State {
   blockKeywords: BlockRow[];
   blockedSenders: SenderRow[];
   notifyEnabled: boolean;
-  deviceCache: Map<string, ConvMember>; // sid -> member info
   /**
    * Set when a login would register this browser as a BRAND-NEW device. The
    * user must acknowledge that the new device starts with no readable history
@@ -184,6 +190,8 @@ interface State {
   loginExistingDevice: (username: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
   forgetLocalDevice: () => Promise<void>;
+  /** Drop a device the relay reports revoked, keeping the account's trust pins. */
+  discardRevokedDevice: () => Promise<void>;
   refreshPendingApproval: () => Promise<"pending" | "approved" | "revoked" | "error">;
   refreshConversations: () => Promise<void>;
   newConversation: (members: string[]) => Promise<string | null>;
@@ -221,7 +229,6 @@ export const useStore = create<State>((set, get) => ({
   blockKeywords: [],
   blockedSenders: [],
   notifyEnabled: readNotifyPref(),
-  deviceCache: new Map(),
   pendingNewDevice: null,
   error: null,
 
@@ -471,7 +478,12 @@ export const useStore = create<State>((set, get) => ({
     const result = await api.deviceApprovalStatus();
     if (!sameContext(context)) return "error";
     if (!result.ok) {
-      if (result.status === 401 || result.status === 403) return "revoked";
+      // Only the relay saying THIS device's row is revoked counts. A bare 401
+      // is also what an expired or superseded token returns — and the caller
+      // reacts by discarding local device state, so treating the two alike let
+      // any 401, including one a hostile relay simply chose to send, throw the
+      // registration away.
+      if (result.code === DEVICE_REVOKED) return "revoked";
       set({ error: result.error ?? "기기 승인 상태를 확인하지 못했습니다." });
       return "error";
     }
@@ -508,10 +520,8 @@ export const useStore = create<State>((set, get) => ({
     disconnectSocket();
     set({
       securityGeneration: logoutGeneration,
-      authed: false, approvalPending: false, securityLocked: false,
-      uid: null, sid: null, deviceName: null, keypair: null, conversations: [],
-      activeCid: null, activeMessages: [], deviceCache: new Map(),
-      pendingNewDevice: null, error: null,
+      ...clearedSessionState(),
+      pendingNewDevice: null,
     });
 
     // Queue cleanup immediately after invalidation. Any DB effect which already
@@ -546,34 +556,17 @@ export const useStore = create<State>((set, get) => ({
     const { localUsername, failed: cleanupFailed } = await cleanup;
     if (get().securityGeneration !== logoutGeneration || get().authed) return;
     set({
-      authed: false, approvalPending: false, securityLocked: false, username: localUsername ?? null, uid: null, sid: null,
-      deviceName: null, keypair: null, conversations: [],
-      activeCid: null, activeMessages: [], deviceCache: new Map(),
+      ...clearedSessionState(),
+      username: localUsername ?? null,
       error: cleanupFailed
         ? "로그아웃됐지만 브라우저의 로컬 캐시를 완전히 지우지 못했습니다. 브라우저 사이트 데이터를 삭제하세요."
         : null,
     });
   },
 
-  forgetLocalDevice: async () => {
-    const forgetGeneration = get().securityGeneration + 1;
-    disconnectSocket();
-    api.setToken(null);
-    set({
-      securityGeneration: forgetGeneration,
-      authed: false, approvalPending: false, securityLocked: false, username: null, uid: null, sid: null,
-      deviceName: null, keypair: null, conversations: [], activeCid: null, activeMessages: [],
-      blockKeywords: [], deviceCache: new Map(), pendingNewDevice: null, error: null,
-    });
-    await sessionCoordinator.exclusive(clearAllData);
-    if (get().securityGeneration !== forgetGeneration || get().authed) return;
-    set({
-      authed: false, approvalPending: false, securityLocked: false, username: null, uid: null, sid: null,
-      deviceName: null, keypair: null, conversations: [],
-      activeCid: null, activeMessages: [], blockKeywords: [],
-      deviceCache: new Map(), error: null,
-    });
-  },
+  forgetLocalDevice: async () => { await resetLocalDevice(clearAllData); },
+
+  discardRevokedDevice: async () => { await resetLocalDevice(clearDeviceForReregistration); },
 
   refreshConversations: async () => {
     const context = captureSecurityContext();
@@ -652,10 +645,6 @@ export const useStore = create<State>((set, get) => ({
       lockForTrustViolation(error, context);
       return;
     }
-    const memberMap = new Map<string, ConvMember>();
-    for (const m of members) memberMap.set(m.sid, m);
-    if (!canUseCrypto(context)) return;
-    set({ deviceCache: memberMap });
     if (!canUseCrypto(context)) return;
     const cached = await runSessionEffect(context, () => cacheDevices(members.map((m) => ({
       sid: m.sid, user_id: m.user_id, pub_key: m.pub_key, sig_pub: m.sig_pub,
@@ -690,13 +679,40 @@ export const useStore = create<State>((set, get) => ({
     const previousFloor = await getUndecryptableFloor(cid);
     if (!canUseCrypto(context)) return;
     // Keys another device shared for old messages arrive with no event of any
-    // kind, and this device's cursor has long since moved past them. Re-read
-    // from the oldest message we failed to open — once per session per
-    // conversation, since every incoming message re-enters this function and a
-    // permanent gap would otherwise re-download the whole thread each time.
-    const rescanKey = `${context.generation}:${cid}`;
-    const rescan = previousFloor != null && !rescannedGaps.has(rescanKey);
-    let cursor = rescan ? Math.min(startCursor, previousFloor! - 1) : startCursor;
+    // kind, and this device's cursor has long since moved past them, so the
+    // gap is only ever found by looking again. Re-reading from the floor on
+    // every pass would re-download the whole thread each time an unopenable
+    // message sits at the bottom of it, and a once-per-session allowance is
+    // worse: it is spent by whichever pass happens to run before the other
+    // device shares, and then the keys are invisible until the page reloads.
+    // Instead probe the ONE message at the floor. It is the sharer's own
+    // starting point (share runs from the relay's missing-keys list, oldest
+    // first), so it becoming readable is the signal that new key material
+    // landed — and a gap that stays shut costs one message per sync, not one
+    // thread.
+    let cursor = startCursor;
+    if (previousFloor != null && previousFloor - 1 < startCursor) {
+      const probe = await api.fetchMessages(cid, previousFloor - 1, 1);
+      if (!canUseCrypto(context)) return;
+      const candidate = probe.ok ? probe.messages?.[0] : undefined;
+      if (candidate && candidate.seq === previousFloor) {
+        let probeSenderKey: string;
+        try {
+          probeSenderKey = verifiedSenderPublicKey(
+            mr, candidate.sender_id, candidate.sender_sid, candidate.sender_pub_key,
+          );
+        } catch (error) {
+          lockForTrustViolation(error, context);
+          return;
+        }
+        const opened = decryptMessageWithSender(
+          candidate.payload, mySid, myKeypair, probeSenderKey,
+          (sid) => wrapperPubkeys.get(sid) ?? null,
+        );
+        if (opened != null) cursor = previousFloor - 1;
+      }
+    }
+    const rescan = cursor < startCursor;
     let lowestUndecryptable: number | null = null;
     let notifyBody: string | null = null;
     let notifyIsIncoming = false;
@@ -778,13 +794,6 @@ export const useStore = create<State>((set, get) => ({
       if (fr.messages.length < pageSize || maxSeq <= cursor) break;
       cursor = maxSeq;
     }
-    // Marked only now, and only by a pass that actually re-read: one that
-    // aborted (offline, logout) has not looked, and the pass that FIRST
-    // records a floor has not either — it is the pass that discovers the gap,
-    // so counting it would spend the budget before anything re-read it. Syncs
-    // for one conversation are serialized, so this cannot race a second
-    // re-read.
-    if (rescan) rescannedGaps.add(rescanKey);
     // A pass that started at the floor covers every gap; one that skipped the
     // re-read only learned about gaps above the stored cursor, so the older
     // floor stands.
@@ -801,7 +810,7 @@ export const useStore = create<State>((set, get) => ({
       if (canUseCrypto(context) && useStore.getState().activeCid === cid) set({ activeMessages: messages });
     }
     if (canUseCrypto(context) && notifyIsIncoming && notifyBody != null) {
-      maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody, gatewaySids.size > 0);
+      maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody);
     }
   },
 
@@ -823,16 +832,16 @@ export const useStore = create<State>((set, get) => ({
         if (sameContext(context)) set({ error: "지원하지 않는 메시지 형식입니다" });
         return false;
       }
-      if (content.text.length > 20_000) {
-        set({ error: "메시지는 20,000자까지 보낼 수 있습니다" });
+      if (content.text.length > MAX_TEXT_CHARS) {
+        set({ error: `메시지는 ${MAX_TEXT_CHARS.toLocaleString("en-US")}자까지 보낼 수 있습니다` });
         return false;
       }
-      if ((content.subject?.length ?? 0) > 120) {
-        set({ error: "MMS 제목은 120자까지 입력할 수 있습니다" });
+      if ((content.subject?.length ?? 0) > MAX_SUBJECT_CHARS) {
+        set({ error: `MMS 제목은 ${MAX_SUBJECT_CHARS}자까지 입력할 수 있습니다` });
         return false;
       }
-      if ((content.attachments?.length ?? 0) > 8) {
-        set({ error: "첨부파일은 최대 8개까지 가능합니다" });
+      if ((content.attachments?.length ?? 0) > MAX_ATTACHMENTS) {
+        set({ error: `첨부파일은 최대 ${MAX_ATTACHMENTS}개까지 가능합니다` });
         return false;
       }
       let attachmentBytes = 0;
@@ -856,8 +865,8 @@ export const useStore = create<State>((set, get) => ({
         }
         attachmentBytes += attachment.size;
       }
-      if (attachmentBytes > 512 * 1024) {
-        set({ error: "첨부파일 전체 크기는 512KB까지 가능합니다" });
+      if (attachmentBytes > MAX_ATTACHMENT_BYTES) {
+        set({ error: `첨부파일 전체 크기는 ${MAX_ATTACHMENT_BYTES / 1024}KB까지 가능합니다` });
         return false;
       }
       if (content.type === "mms" && (content.attachments?.length ?? 0) === 0 && !content.subject) {
@@ -930,94 +939,13 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  addBlock: async (kw) => {
-    const context = captureSecurityContext();
-    if (!sameContext(context)) return;
-    // Apply locally first (instant UI), then share with the other devices.
-    let row: BlockRow | null = null;
-    const added = await runContextEffect(context, async () => {
-      row = await addBlockKeyword(kw);
-    });
-    if (!added || !row || !sameContext(context)) return;
-    const addedRow = row as BlockRow;
-    await get().refreshBlocklist();
-    if (!sameContext(context)) return;
-    if (!await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)))) return;
-    if (!sameContext(context)) return;
-    const r = await api.addBlockRule("keyword", addedRow.keyword);
-    if (!sameContext(context)) return;
-    if (r.ok && r.rule) {
-      if (!await runContextEffect(context, async () => {
-        await removeBlockKeyword(addedRow.id);
-        if (!sameContext(context)) return;
-        await putBlockKeywordRow(ruleToKeywordRow(r.rule!));
-      })) return;
-      if (!sameContext(context)) return;
-      await get().refreshBlocklist();
-    } // offline/failed: keep the local row; syncBlockRules pushes it later
-  },
+  addBlock: async (kw) => { await addSharedBlockRule(KEYWORD_RULES, kw); },
 
-  removeBlock: async (id) => {
-    const context = captureSecurityContext();
-    if (!sameContext(context)) return;
-    if (id.startsWith("srv:")) {
-      const r = await api.removeBlockRule(Number(id.slice(4)));
-      if (!sameContext(context)) return;
-      if (!r.ok) {
-        set({ error: r.error || "차단 키워드를 삭제하지 못했습니다" });
-        return;
-      }
-    }
-    if (!await runContextEffect(context, () => removeBlockKeyword(id))) return;
-    if (!sameContext(context)) return;
-    await get().refreshBlocklist();
-    if (!sameContext(context)) return;
-    await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)));
-  },
+  removeBlock: async (id) => { await removeSharedBlockRule(KEYWORD_RULES, id); },
 
-  addBlockedSenderRule: async (sender) => {
-    const context = captureSecurityContext();
-    if (!sameContext(context)) return;
-    let row: SenderRow | null = null;
-    const added = await runContextEffect(context, async () => {
-      row = await addBlockedSender(sender);
-    });
-    if (!added || !row || !sameContext(context)) return;
-    const addedRow = row as SenderRow;
-    await get().refreshBlocklist();
-    if (!sameContext(context)) return;
-    if (!await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)))) return;
-    if (!sameContext(context)) return;
-    const r = await api.addBlockRule("sender", addedRow.sender);
-    if (!sameContext(context)) return;
-    if (r.ok && r.rule) {
-      if (!await runContextEffect(context, async () => {
-        await removeBlockedSender(addedRow.id);
-        if (!sameContext(context)) return;
-        await putBlockedSenderRow(ruleToSenderRow(r.rule!));
-      })) return;
-      if (!sameContext(context)) return;
-      await get().refreshBlocklist();
-    }
-  },
+  addBlockedSenderRule: async (sender) => { await addSharedBlockRule(SENDER_RULES, sender); },
 
-  removeBlockedSenderRule: async (id) => {
-    const context = captureSecurityContext();
-    if (!sameContext(context)) return;
-    if (id.startsWith("srv:")) {
-      const r = await api.removeBlockRule(Number(id.slice(4)));
-      if (!sameContext(context)) return;
-      if (!r.ok) {
-        set({ error: r.error || "차단 번호를 삭제하지 못했습니다" });
-        return;
-      }
-    }
-    if (!await runContextEffect(context, () => removeBlockedSender(id))) return;
-    if (!sameContext(context)) return;
-    await get().refreshBlocklist();
-    if (!sameContext(context)) return;
-    await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)));
-  },
+  removeBlockedSenderRule: async (id) => { await removeSharedBlockRule(SENDER_RULES, id); },
 
   refreshBlocklist: async () => {
     const context = captureSecurityContext();
@@ -1172,25 +1100,10 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
         }
         throw new Error(directory.error ?? "키 디렉터리를 불러오지 못했습니다.");
       }
-      if (!directory.identity_sig_pub || !directory.directory_hash
-        || !Number.isSafeInteger(directory.security_epoch) || !directory.devices
-        || !directory.device_history || !directory.approval_certificates
-        || !directory.revocation_certificates || !directory.security_upgrade_certificates
-        || (directory.security_mode !== "legacy_v1" && directory.security_mode !== "verified_v2")) {
+      if (!isCompleteKeyDirectory(directory)) {
         throw new Error("서버 키 디렉터리 응답이 불완전합니다.");
       }
-      verifyDirectoryProof({
-        user_id: me.uid,
-        identity_sig_pub: directory.identity_sig_pub,
-        security_epoch: directory.security_epoch!,
-        directory_hash: directory.directory_hash,
-        trust_enforced_at: directory.trust_enforced_at,
-        security_mode: directory.security_mode,
-        device_history: directory.device_history,
-        approval_certificates: directory.approval_certificates,
-        revocation_certificates: directory.revocation_certificates,
-        security_upgrade_certificates: directory.security_upgrade_certificates,
-      }, directory.devices);
+      verifyDirectoryProof(ownDirectoryProof(me.uid, directory), directory.devices);
       if (!canUseCrypto(context)) return;
       const own = directory.devices.find((device) => device.sid === me.sid);
       if (!own || !me.keypair || own.pub_key !== me.keypair.box.pk || own.sig_pub !== me.keypair.sign.pk) {
@@ -1360,8 +1273,6 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
 }
 
 const syncJobs = new Map<string, Promise<void>>();
-/** `${generation}:${cid}` entries whose undecryptable gap was re-read this session. */
-const rescannedGaps = new Set<string>();
 
 function queueConversationSync(cid: string, suppliedContext?: SecurityContext): Promise<void> {
   const context = suppliedContext ?? captureSecurityContext();
@@ -1530,12 +1441,43 @@ function liveSocket(): ReturnType<typeof getSocket> | null {
   return token ? getSocket(token) : null;
 }
 
-function beginAuthAttempt(): number {
+/**
+ * Drop this browser's device and fall back to the sign-in screen.
+ *
+ * ``cleanup`` chooses how much local state goes with it. Forgetting the
+ * account on the user's own instruction erases the pinned trust anchors too;
+ * a device the RELAY reports revoked must not, because those pins are exactly
+ * what would expose a relay that answers the next registration with
+ * substituted keys (see clearDeviceForReregistration).
+ */
+async function resetLocalDevice(cleanup: () => Promise<void>): Promise<void> {
+  const forgetGeneration = useStore.getState().securityGeneration + 1;
   disconnectSocket();
   api.setToken(null);
-  const generation = useStore.getState().securityGeneration + 1;
   useStore.setState({
-    securityGeneration: generation,
+    securityGeneration: forgetGeneration,
+    ...clearedSessionState(),
+    username: null, blockKeywords: [], pendingNewDevice: null,
+  });
+  await sessionCoordinator.exclusive(cleanup);
+  const state = useStore.getState();
+  if (state.securityGeneration !== forgetGeneration || state.authed) return;
+  useStore.setState({
+    ...clearedSessionState(),
+    username: null, blockKeywords: [],
+  });
+}
+
+/**
+ * Every field that belongs to ONE authenticated session, at its signed-out
+ * value. Logout, forgetting the local device and starting a fresh auth attempt
+ * all spread this instead of restating the list, so a field added to State
+ * cannot be cleared by four of the five paths and forgotten by the fifth.
+ * Per-account data that deliberately outlives a session (block rules) and
+ * one-shot UI gates stay explicit at the call sites that want them cleared.
+ */
+function clearedSessionState() {
+  return {
     authed: false,
     approvalPending: false,
     securityLocked: false,
@@ -1546,8 +1488,22 @@ function beginAuthAttempt(): number {
     conversations: [],
     activeCid: null,
     activeMessages: [],
-    deviceCache: new Map(),
+    // Both describe a pending device's in-flight approval. Carrying them into
+    // the next registration renders the QR with the NEW device's keys under
+    // the OLD challenge, which the approver is told to read as an attack.
+    pendingPairing: null,
+    pendingChallenge: null,
     error: null,
+  } satisfies Partial<State>;
+}
+
+function beginAuthAttempt(): number {
+  disconnectSocket();
+  api.setToken(null);
+  const generation = useStore.getState().securityGeneration + 1;
+  useStore.setState({
+    securityGeneration: generation,
+    ...clearedSessionState(),
   });
   return generation;
 }
@@ -1619,9 +1575,97 @@ export const __testing = {
   resetSyncJobs: () => {
     syncJobs.clear();
     postLoginJobs.clear();
-    rescannedGaps.clear();
   },
 };
+
+/**
+ * The two block-rule families differ only in their row type and their four db
+ * functions. The sequence around them — optimistic local insert, refresh,
+ * re-apply to already-stored messages, POST, swap the local row for the
+ * server's — is identical, and every step of it is guarded by the same session
+ * checks. Written out twice, a fix to that sequence (say, deleting the local
+ * row only after the server row is written, so an interrupted swap cannot lose
+ * the rule) lands on one family and silently not the other.
+ */
+interface BlockRuleKind<Row extends { id: string }> {
+  type: BlockRuleType;
+  addLocal: (value: string) => Promise<Row>;
+  removeLocal: (id: string) => Promise<void>;
+  putServerRow: (rule: BlockRule) => Promise<void>;
+  /** The value the relay stores and the other devices apply. */
+  sharedValue: (row: Row) => string;
+  removeError: string;
+}
+
+const KEYWORD_RULES: BlockRuleKind<BlockRow> = {
+  type: "keyword",
+  addLocal: addBlockKeyword,
+  removeLocal: removeBlockKeyword,
+  putServerRow: (rule) => putBlockKeywordRow(ruleToKeywordRow(rule)),
+  sharedValue: (row) => row.keyword,
+  removeError: "차단 키워드를 삭제하지 못했습니다",
+};
+
+const SENDER_RULES: BlockRuleKind<SenderRow> = {
+  type: "sender",
+  addLocal: addBlockedSender,
+  removeLocal: removeBlockedSender,
+  putServerRow: (rule) => putBlockedSenderRow(ruleToSenderRow(rule)),
+  sharedValue: (row) => row.sender,
+  removeError: "차단 번호를 삭제하지 못했습니다",
+};
+
+async function addSharedBlockRule<Row extends { id: string }>(
+  kind: BlockRuleKind<Row>,
+  value: string,
+): Promise<void> {
+  const context = captureSecurityContext();
+  if (!sameContext(context)) return;
+  // Apply locally first (instant UI), then share with the other devices.
+  let inserted: Row | null = null;
+  const added = await runContextEffect(context, async () => {
+    inserted = await kind.addLocal(value);
+  });
+  const localRow = inserted as Row | null;
+  if (!added || !localRow || !sameContext(context)) return;
+  await useStore.getState().refreshBlocklist();
+  if (!sameContext(context)) return;
+  if (!await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)))) return;
+  if (!sameContext(context)) return;
+  const r = await api.addBlockRule(kind.type, kind.sharedValue(localRow));
+  if (!sameContext(context)) return;
+  if (r.ok && r.rule) {
+    const rule = r.rule;
+    if (!await runContextEffect(context, async () => {
+      await kind.removeLocal(localRow.id);
+      if (!sameContext(context)) return;
+      await kind.putServerRow(rule);
+    })) return;
+    if (!sameContext(context)) return;
+    await useStore.getState().refreshBlocklist();
+  } // offline/failed: keep the local row; syncBlockRules pushes it later
+}
+
+async function removeSharedBlockRule<Row extends { id: string }>(
+  kind: BlockRuleKind<Row>,
+  id: string,
+): Promise<void> {
+  const context = captureSecurityContext();
+  if (!sameContext(context)) return;
+  if (id.startsWith("srv:")) {
+    const r = await api.removeBlockRule(Number(id.slice(4)));
+    if (!sameContext(context)) return;
+    if (!r.ok) {
+      useStore.setState({ error: r.error || kind.removeError });
+      return;
+    }
+  }
+  if (!await runContextEffect(context, () => kind.removeLocal(id))) return;
+  if (!sameContext(context)) return;
+  await useStore.getState().refreshBlocklist();
+  if (!sameContext(context)) return;
+  await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)));
+}
 
 async function reapplyBlocklist(shouldContinue: () => boolean = () => true): Promise<void> {
   const keywords = await listBlockKeywords();
@@ -1670,7 +1714,7 @@ async function reapplyBlocklist(shouldContinue: () => boolean = () => true): Pro
 
 /** Compare phone numbers by digits only (handles +82 vs 0082 vs separators). */
 /** Desktop notification for a freshly arrived incoming message. */
-function maybeNotify(title: string, body: string, _isSms: boolean): void {
+function maybeNotify(title: string, body: string): void {
   const state = useStore.getState();
   if (!state.notifyEnabled) return;
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;

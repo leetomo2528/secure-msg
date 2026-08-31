@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   api,
+  isCompleteKeyDirectory,
+  ownDirectoryProof,
   type AccountDevice,
   type DeviceDirectoryResult,
 } from "../net/api";
@@ -71,30 +73,15 @@ export default function DeviceManager() {
 
       // Older servers may omit trust metadata. Keep device management usable,
       // but pin only complete authenticated directory snapshots.
-      if (uid != null && keyDirectory.ok && keyDirectory.identity_sig_pub && keyDirectory.directory_hash
-        && Number.isSafeInteger(keyDirectory.security_epoch) && keyDirectory.devices
-        && keyDirectory.device_history && keyDirectory.approval_certificates
-        && keyDirectory.revocation_certificates && keyDirectory.security_upgrade_certificates
-        && (keyDirectory.security_mode === "legacy_v1" || keyDirectory.security_mode === "verified_v2")) {
+      if (uid != null && keyDirectory.ok && isCompleteKeyDirectory(keyDirectory)) {
         const approved = keyDirectory.devices.filter((device) => device.pub_key && device.sig_pub);
-        verifyDirectoryProof({
-          user_id: uid,
-          identity_sig_pub: keyDirectory.identity_sig_pub,
-          security_epoch: keyDirectory.security_epoch!,
-          directory_hash: keyDirectory.directory_hash,
-          trust_enforced_at: keyDirectory.trust_enforced_at,
-          security_mode: keyDirectory.security_mode,
-          device_history: keyDirectory.device_history,
-          approval_certificates: keyDirectory.approval_certificates,
-          revocation_certificates: keyDirectory.revocation_certificates,
-          security_upgrade_certificates: keyDirectory.security_upgrade_certificates,
-        }, approved);
+        verifyDirectoryProof(ownDirectoryProof(uid, keyDirectory), approved);
         await pinTrustedDirectory({
           uid,
           identity_sig_pub: keyDirectory.identity_sig_pub,
-          security_epoch: keyDirectory.security_epoch!,
+          security_epoch: keyDirectory.security_epoch,
           directory_hash: keyDirectory.directory_hash,
-          security_mode: keyDirectory.security_mode!,
+          security_mode: keyDirectory.security_mode,
           devices: approved.map((device) => ({
             sid: device.sid,
             pub_key: device.pub_key,
@@ -189,7 +176,7 @@ export default function DeviceManager() {
         challenge: device.challenge,
         parentEpoch,
       }, keypair.sign.sk);
-      const result = await api.deviceApprove(device.sid, device.challenge, parentEpoch, signature);
+      const result = await api.deviceApprove(device.sid, parentEpoch, signature);
       if (!result.ok) {
         useStore.setState({ error: result.error ?? "새 기기를 승인하지 못했습니다." });
         return;
@@ -286,7 +273,7 @@ export default function DeviceManager() {
         challenge: subject.challenge,
         parentEpoch,
       }, binding, keypair.sign.sk);
-      const result = await api.deviceApprove(subject.sid, subject.challenge, parentEpoch, signature, {
+      const result = await api.deviceApprove(subject.sid, parentEpoch, signature, {
         pairing_id: session.pairingId,
         nonce_new: session.nonceNew,
         nonce_approver: session.nonceApprover,

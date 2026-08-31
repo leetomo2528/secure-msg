@@ -13,15 +13,26 @@ interface ApiResult {
   ok: boolean;
   error?: string;
   status?: number;
+  /**
+   * Stable machine-readable failure reason from the relay. Branch on this,
+   * never on `error` (localized prose) and never on `status` alone where one
+   * status covers outcomes needing opposite handling — see DEVICE_REVOKED.
+   */
+  code?: string;
 }
 
-export interface LoginResult {
-  ok: boolean;
-  error?: string;
-  status?: number;
+/**
+ * The relay says this device's own row is revoked, as opposed to the 401 it
+ * also returns for an expired or superseded token. Only the first justifies
+ * discarding local device state.
+ */
+export const DEVICE_REVOKED = "device_revoked";
+
+export interface LoginResult extends ApiResult {
   uid?: number;
   username?: string;
-  has_devices?: boolean;
+  has_approved_devices?: boolean;
+  has_pending_devices?: boolean;
 }
 
 export interface DeviceRegisterResult {
@@ -173,6 +184,60 @@ export interface KeyDirectoryResult extends ApiResult {
   approval_certificates?: ApprovalCertificate[];
   revocation_certificates?: RevocationCertificate[];
   security_upgrade_certificates?: SecurityUpgradeCertificate[];
+}
+
+/** A /key-directory answer carrying every field a DirectoryProof needs. */
+export type CompleteKeyDirectory = KeyDirectoryResult & Required<Pick<
+  KeyDirectoryResult,
+  "devices" | "security_epoch" | "directory_hash" | "identity_sig_pub"
+  | "security_mode" | "device_history" | "approval_certificates"
+  | "revocation_certificates" | "security_upgrade_certificates"
+>>;
+
+/**
+ * One completeness test for /key-directory, and one place that turns the
+ * answer into the proof.
+ *
+ * The two callers — post-login verification and the device panel — spelled the
+ * same field list out by hand, and they disagree about what to do when it
+ * fails (login treats an incomplete directory as a hostile relay; the panel
+ * skips verification to stay usable). That disagreement is a policy question
+ * for the call sites, but the LIST is not: a field added to DirectoryProof and
+ * checked on only one path is a verification hole nothing would surface.
+ */
+export function isCompleteKeyDirectory(
+  directory: KeyDirectoryResult,
+): directory is CompleteKeyDirectory {
+  return Boolean(
+    directory.identity_sig_pub
+    && directory.directory_hash
+    && Number.isSafeInteger(directory.security_epoch)
+    && directory.devices
+    && directory.device_history
+    && directory.approval_certificates
+    && directory.revocation_certificates
+    && directory.security_upgrade_certificates
+    && (directory.security_mode === "legacy_v1" || directory.security_mode === "verified_v2"),
+  );
+}
+
+/** The DirectoryProof a complete /key-directory answer stands for. */
+export function ownDirectoryProof(
+  uid: number,
+  directory: CompleteKeyDirectory,
+): DirectoryProof {
+  return {
+    user_id: uid,
+    identity_sig_pub: directory.identity_sig_pub,
+    security_epoch: directory.security_epoch,
+    directory_hash: directory.directory_hash,
+    trust_enforced_at: directory.trust_enforced_at,
+    security_mode: directory.security_mode,
+    device_history: directory.device_history,
+    approval_certificates: directory.approval_certificates,
+    revocation_certificates: directory.revocation_certificates,
+    security_upgrade_certificates: directory.security_upgrade_certificates,
+  };
 }
 
 export interface PairingSessionInfo {
@@ -327,9 +392,6 @@ export class Api {
   deviceLogin(username: string, pwHash: string, sid: string): Promise<DeviceRegisterResult> {
     return this.post("/device-login", { username, pw_hash: pwHash, sid });
   }
-  deviceLoginChallenge(username: string, pwHash: string, sid: string): Promise<DeviceRegisterResult> {
-    return this.deviceLogin(username, pwHash, sid);
-  }
   deviceLoginProof(username: string, pwHash: string, sid: string, challengeId: string, challenge: string, proof: string): Promise<DeviceRegisterResult> {
     return this.post("/device-login", {
       username, pw_hash: pwHash, sid, challenge_id: challengeId, challenge, proof,
@@ -368,14 +430,13 @@ export class Api {
    */
   deviceApprove(
     sid: string,
-    challenge: string,
     parentEpoch: number,
     signature: string,
     pairing?: { pairing_id: string; nonce_new: string; nonce_approver: string },
   ): Promise<ApiResult> {
-    // challenge is covered by the signature and retained in this method's
-    // interface for callers; the server resolves it from the pending row.
-    void challenge;
+    // The pending device's challenge is NOT sent: it is covered by the
+    // signature and the server reads it from the pending row. Taking it as an
+    // argument read as if this call transmitted and bound it.
     return this.post("/device-approve", {
       subject_sid: sid,
       parent_epoch: parentEpoch,

@@ -15,8 +15,6 @@ Real-time flow:
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import logging
 import re
@@ -24,14 +22,15 @@ import time
 
 import config
 import store
-from auth import verify_jwt
+# The REST and socket paths validate the same wire format; one decoder
+# means a length or charset change cannot land on only one of them.
+from auth import _valid_b64u as valid_b64u, verify_jwt
 from flask import request
 from flask_socketio import SocketIO, join_room
 from flask_socketio import disconnect as disconnect_client
 from rate_limit import check as rate_limit
 
 log = logging.getLogger("securemsg.sockets")
-B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 PHONE_RE = re.compile(r"\+?[0-9*#]{3,24}", re.ASCII)
 
 _socketio_ref: SocketIO | None = None
@@ -51,6 +50,36 @@ def _parse_positive_seq(value: object) -> int | None:
 def _device_room(sid: str, session_version: int) -> str:
     """Versioned rooms prevent revoked live sockets from receiving new pushes."""
     return f"device:{sid}:session:{session_version}"
+
+
+def _live_member_rooms(members: list[dict]) -> list[tuple[dict, str]]:
+    """(member, room) pairs for the members still in the exact state we read.
+
+    The member list a handler validated against is a snapshot taken before its
+    write transaction. A device can be revoked, or rotate its session, while
+    that BEGIN IMMEDIATE waits on the write lock (up to busy_timeout), and its
+    old versioned room may still hold a connected socket during exactly that
+    window. Re-reading here and dropping anything whose id/owner/session moved
+    is what keeps a just-revoked device from receiving the fan-out.
+
+    One query rather than one connection per recipient: a 50-member
+    conversation at MAX_DEVICES_PER_USER devices each is ~1000 devices, and
+    the sender's ack waits for this loop.
+    """
+    current = store.current_devices_by_sid(member["sid"] for member in members)
+    live: list[tuple[dict, str]] = []
+    for member in members:
+        device = current.get(member["sid"])
+        if (
+            not device
+            or device["trust_state"] != "approved"
+            or device["id"] != member["device_id"]
+            or device["user_id"] != member["user_id"]
+            or device["session_version"] != member["session_version"]
+        ):
+            continue
+        live.append((member, _device_room(member["sid"], member["session_version"])))
+    return live
 
 
 def emit_to_user_devices(
@@ -112,19 +141,6 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             disconnect_client()
             return None
         return uid, sid, device_id
-
-    def valid_b64u(value: object, raw_length: int | None = None) -> bool:
-        if not isinstance(value, str) or not B64U_RE.fullmatch(value):
-            return False
-        try:
-            decoded = base64.b64decode(
-                value + "=" * (-len(value) % 4),
-                altchars=b"-_",
-                validate=True,
-            )
-        except (binascii.Error, ValueError):
-            return False
-        return raw_length is None or len(decoded) == raw_length
 
     @socketio.on("connect")
     def _connect(auth=None):
@@ -302,28 +318,8 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         }
         # Fan out exactly once per registered device. Sending repeatedly to a
         # shared user room would duplicate carrier SMS when a user has 2+ devices.
-        for device in members:
-            # The committed recipient set is only a snapshot. A device can be
-            # revoked (or rotate its session) after insert_message commits but
-            # before this loop emits. Re-read immediately before each push and
-            # only target the exact still-approved device/session from that
-            # snapshot; otherwise its old versioned room may still contain a
-            # connected socket during the revocation race.
-            current_device = store.get_device_by_sid(device["sid"])
-            if (
-                not current_device
-                or current_device["trust_state"] != "approved"
-                or current_device["id"] != device["device_id"]
-                or current_device["user_id"] != device["user_id"]
-                or current_device["sid"] != device["sid"]
-                or current_device["session_version"] != device["session_version"]
-            ):
-                continue
-            socketio.emit(
-                "message_new",
-                envelope,
-                to=_device_room(device["sid"], device["session_version"]),
-            )
+        for _device, room in _live_member_rooms(members):
+            socketio.emit("message_new", envelope, to=room)
         return {"ok": True, "seq": seq, "id": msg_id}
 
     @socketio.on("message_delivered")
@@ -409,12 +405,8 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             "carrier_error": result["error"],
             "carrier_updated_at": result["updated_at"],
         }
-        for member in members:
-            socketio.emit(
-                "message_status",
-                event,
-                to=_device_room(member["sid"], member["session_version"]),
-            )
+        for _member, room in _live_member_rooms(members):
+            socketio.emit("message_status", event, to=room)
         return {"ok": True, **event}
 
     @socketio.on("typing")
@@ -441,11 +433,11 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         members = store.list_members(conv["id"])
         if not any(d["user_id"] == uid for d in members):
             return
-        for device in members:
+        for device, room in _live_member_rooms(members):
             if device["sid"] == sid:
                 continue
             socketio.emit(
                 "typing",
                 {"cid": cid, "user_id": uid, "is_typing": is_typing},
-                to=_device_room(device["sid"], device["session_version"]),
+                to=room,
             )
