@@ -78,6 +78,7 @@ import com.yunjelee.securemsg.DeviceSecurityController
 import com.yunjelee.securemsg.DeviceSecurityView
 import com.yunjelee.securemsg.DeviceTrustCrypto
 import com.yunjelee.securemsg.DeviceTrustRepository
+import com.yunjelee.securemsg.HistoryRestoreRunner
 import com.yunjelee.securemsg.HistoryShareRunner
 import com.yunjelee.securemsg.PairingHandshake
 import com.yunjelee.securemsg.PairingQrFields
@@ -191,6 +192,14 @@ fun SettingsPane(
     // from the process-scoped runner rather than held here.
     val historyShare by HistoryShareRunner.state.collectAsState()
     val historyShareBusy = historyShare.runningLabel != null
+    // Same reason as the backfill above: a rebuild outlives this composition,
+    // so its progress and result are read from the process-scoped runner.
+    val historyRestore by HistoryRestoreRunner.state.collectAsState()
+    var confirmRestore by remember { mutableStateOf(false) }
+    var restoreMessage by remember { mutableStateOf<String?>(null) }
+    // Logout is destructive to local history and cannot be undone from the
+    // server, so it asks first and says exactly what it takes away.
+    var confirmLogout by remember { mutableStateOf(false) }
     // Which row-list entry is open; null collapses all of them.
     var expanded by remember { mutableStateOf<SettingsRow?>(null) }
 
@@ -446,6 +455,77 @@ fun SettingsPane(
             dismissButton = {
                 TextButton(onClick = { historyShareTarget = null }) {
                     Text("공유하지 않음", color = Sm.text3)
+                }
+            },
+        )
+    }
+
+    // A rebuild that finished while this pane was gone still has to report.
+    LaunchedEffect(historyRestore.result) {
+        historyRestore.result?.let {
+            restoreMessage = it
+            HistoryRestoreRunner.consumeResult()
+        }
+    }
+
+    if (confirmRestore) {
+        AlertDialog(
+            onDismissRequest = { confirmRestore = false },
+            containerColor = Sm.surface,
+            shape = RoundedCornerShape(16.dp),
+            titleContentColor = Sm.text1,
+            textContentColor = Sm.text3,
+            title = { Text("대화 복원") },
+            text = {
+                Text(
+                    "이 휴대폰에 저장된 문자 메시지함을 읽어 주고받은 대화를 다시 만듭니다. " +
+                        "메시지를 보내거나 서버에 올리지 않고, 이미 있는 대화는 건너뛰므로 " +
+                        "여러 번 실행해도 대화가 중복되지 않습니다. " +
+                        "복원되는 것은 SMS뿐이며 MMS(사진·그룹 메시지)는 복원되지 않습니다.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRestore = false
+                    restoreMessage = null
+                    if (!HistoryRestoreRunner.start(context, creds)) {
+                        restoreMessage = "이미 대화를 복원하는 중입니다."
+                    }
+                }) { Text("복원", color = Sm.teal) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRestore = false }) {
+                    Text("취소", color = Sm.text3)
+                }
+            },
+        )
+    }
+
+    if (confirmLogout) {
+        AlertDialog(
+            onDismissRequest = { confirmLogout = false },
+            containerColor = Sm.surface,
+            shape = RoundedCornerShape(16.dp),
+            titleContentColor = Sm.text1,
+            textContentColor = Sm.text3,
+            title = { Text("로그아웃") },
+            text = {
+                Text(
+                    "로그아웃하면 이 기기에 저장된 대화 내용이 모두 삭제됩니다. " +
+                        "서버에서는 되돌릴 수 없습니다. 다시 로그인한 뒤 설정의 '대화 복원'으로 " +
+                        "이 휴대폰의 문자 메시지함에서 SMS 대화를 다시 만들 수 있습니다. " +
+                        "MMS(사진·그룹 메시지)는 복원되지 않습니다.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLogout = false
+                    onLogout()
+                }) { Text("로그아웃", color = Sm.danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLogout = false }) {
+                    Text("취소", color = Sm.text3)
                 }
             },
         )
@@ -940,10 +1020,26 @@ fun SettingsPane(
             }
         }
 
+        SmCard {
+            SectionTitle("대화 복원")
+            Caption(
+                "이 휴대폰의 문자 메시지함에서 주고받은 SMS를 읽어 대화 목록을 다시 만듭니다. " +
+                    "로그아웃하면 이 기기의 대화 내용이 지워지는데, 서버에 있는 메시지에는 " +
+                    "보낸 것인지 받은 것인지가 남지 않아 서버만으로는 되돌릴 수 없기 때문입니다. " +
+                    "MMS(사진·그룹 메시지)는 복원되지 않습니다.",
+            )
+            SmGhostButton(
+                text = historyRestore.progress ?: "대화 복원",
+                onClick = { if (historyRestore.progress == null) confirmRestore = true },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            restoreMessage?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
+        }
+
         SmGhostButton(
             text = "로그아웃",
             textColor = Sm.danger,
-            onClick = onLogout,
+            onClick = { confirmLogout = true },
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(8.dp))

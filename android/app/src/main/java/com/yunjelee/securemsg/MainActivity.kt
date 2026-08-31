@@ -728,11 +728,25 @@ class MainActivity : ComponentActivity() {
                             stopService(Intent(this@MainActivity, SmsBridgeService::class.java))
                             var localCleanupFailed = false
                             try {
+                                // Before anything is cleared: a rebuild is
+                                // process-scoped and this button is not gated on
+                                // it, so a run still walking conversations would
+                                // insert plaintext history back behind the wipe.
+                                // Joining it is what makes the wipe the last write.
+                                HistoryRestoreRunner.cancelAndAwait()
                                 Credentials.clearSession(this@MainActivity)
                                 // Device keys survive logout for same-device re-login, but the
                                 // decrypted history they can re-read must not stay on disk:
                                 // clear plaintext tables (idempotency ledgers and pending
-                                // outbox sends are kept; history re-pulls from the relay).
+                                // outbox sends are kept).
+                                //
+                                // This is a one-way local wipe. The relay cannot put it back —
+                                // an envelope does not record direction, so a re-pull is
+                                // consumed as history and never rendered — and the startup
+                                // inbox import is inbox-only, capped, and skipped for every row
+                                // the retained ledger already names. HistoryRestore rebuilds
+                                // conversations from the phone's own telephony store instead,
+                                // which is what the logout confirmation tells the user.
                                 val db = AppDatabase.get(this@MainActivity)
                                 db.messageDao().clearAll()
                                 db.threadDao().clearAll()

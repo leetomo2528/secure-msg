@@ -944,6 +944,21 @@ internal object LastOpened {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putLong(cid, at).apply()
     }
+
+    /**
+     * Stamps a conversation the user has never opened as read up to [at].
+     *
+     * For HistoryRestore, whose rebuilt conversations carry brand-new cids and
+     * therefore no stamp at all: without this every restored thread whose newest
+     * message is incoming comes back bold with a badge counting the whole
+     * history the user read years ago. An existing stamp is the user's real read
+     * position and is never moved.
+     */
+    fun setIfAbsent(context: Context, cid: String, at: Long) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (prefs.getLong(cid, 0L) > 0L) return
+        prefs.edit().putLong(cid, at).apply()
+    }
 }
 
 // ---------------------------------------------------------------------------

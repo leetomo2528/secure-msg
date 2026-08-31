@@ -1479,19 +1479,35 @@ class SmsBridgeService : Service() {
             val cid = row.optString("cid")
             val phone = ownedPhone(row, c.username)
             if (cid.isNotBlank() && phone != null) {
-                val existing = db.threadDao().get(cid)
-                db.threadDao().upsert(
-                    existing?.copy(
-                        phoneNumber = phone,
-                        serverName = serverConversationName(row),
-                        syncedContactName = nullableContactName(row, "synced_contact_name"),
-                    ) ?: SmsThread(
-                        cid = cid,
-                        phoneNumber = phone,
-                        serverName = serverConversationName(row),
-                        syncedContactName = nullableContactName(row, "synced_contact_name"),
-                    ),
-                )
+                val absorbed = db.withTransaction {
+                    val existing = db.threadDao().get(cid)
+                    db.threadDao().upsert(
+                        existing?.copy(
+                            phoneNumber = phone,
+                            serverName = serverConversationName(row),
+                            syncedContactName = nullableContactName(row, "synced_contact_name"),
+                        ) ?: SmsThread(
+                            cid = cid,
+                            phoneNumber = phone,
+                            serverName = serverConversationName(row),
+                            syncedContactName = nullableContactName(row, "synced_contact_name"),
+                        ),
+                    )
+                    // A provisional thread for this number that no outbox row
+                    // will ever merge — HistoryRestore builds one, because it
+                    // uploads nothing. Absorbing it here is the only path that
+                    // reunites rebuilt history with the relay conversation the
+                    // number's new traffic lands in.
+                    db.threadDao().provisionalByPhone(phone, cid).onEach { stale ->
+                        db.messageDao().moveConversation(stale.cid, cid)
+                        db.relayOutboxDao().moveConversation(stale.cid, cid)
+                        db.threadDao().touch(cid, stale.lastActivityAt)
+                        db.threadDao().deleteByCid(stale.cid)
+                    }
+                }
+                // Outside the transaction, like every other cid rewrite: a
+                // rollback must not strand the read stamp under a dead cid.
+                absorbed.forEach { LastOpened.move(this, it.cid, cid) }
                 ownedCids += cid
             }
         }

@@ -217,6 +217,18 @@ interface ThreadDao {
     @Query("SELECT * FROM sms_threads")
     suspend fun getAll(): List<SmsThread>
 
+    /**
+     * Provisional threads holding the same number as an authoritative one.
+     *
+     * A `local_` conversation is normally merged into the relay cid by the
+     * outbox row that created it. HistoryRestore creates one with no outbox row
+     * at all — it never uploads — so the thread sync reconciles by number
+     * instead; without that the rebuilt history sits in a conversation no new
+     * traffic can ever reach, beside a second row for the same contact.
+     */
+    @Query("SELECT * FROM sms_threads WHERE phoneNumber = :phone AND cid LIKE 'local\\_%' ESCAPE '\\' AND cid != :cid")
+    suspend fun provisionalByPhone(phone: String, cid: String): List<SmsThread>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(thread: SmsThread)
 
@@ -259,6 +271,10 @@ interface MessageDao {
     @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE serverKey = :serverKey)")
     suspend fun hasServerKey(serverKey: String): Boolean
 
+    /** One-shot snapshot of a conversation; the dedupe index a rebuild works against. */
+    @Query("SELECT * FROM messages WHERE cid = :cid")
+    suspend fun getForCid(cid: String): List<MessageRow>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(msg: MessageRow): Long
 
@@ -277,7 +293,14 @@ interface MessageDao {
     @Query("DELETE FROM messages WHERE serverKey = :serverKey AND id != :localId")
     suspend fun deleteServerDuplicate(serverKey: String, localId: Long)
 
-    /** Logout path: remove decrypted plaintext history; re-pulled from the relay after re-login. */
+    /**
+     * Logout path: remove decrypted plaintext history.
+     *
+     * This is not recoverable from the relay. An envelope does not record which
+     * direction a gateway uploaded it in, so the receive path consumes re-pulled
+     * rows as history without rendering them. HistoryRestore rebuilds them from
+     * the phone's own telephony store instead.
+     */
     @Query("DELETE FROM messages")
     suspend fun clearAll()
 
