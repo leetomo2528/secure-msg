@@ -34,6 +34,8 @@ data class SmsThread(
     indices = [
         Index(value = ["serverKey"], unique = true),
         Index(value = ["cid", "seq"]),
+        // Newest-first ordering for the global search; see [MessageDao.searchAll].
+        Index(value = ["createdAt"]),
     ],
 )
 data class MessageRow(
@@ -355,6 +357,36 @@ interface MessageDao {
      */
     @Query("SELECT COUNT(*) FROM messages WHERE cid = :cid AND mine = 0 AND createdAt > :since")
     suspend fun countIncomingSince(cid: String, since: Long): Int
+
+    /**
+     * Body search across every conversation — the list's 메시지 section.
+     *
+     * LIKE, not FTS. An FTS mirror would have to be re-synchronized from each
+     * writer above (insert, updateRelayResult, moveConversation,
+     * moveProvisionalConversation, deleteServerDuplicate, setBlocked, clearAll)
+     * or from triggers Room does not know about, and it would still be wrong
+     * for the content: FTS4's tokenizer breaks on spaces, and Korean puts no
+     * space at a morpheme boundary, so "검색" would not match "재검색합니다".
+     * Matching inside a token needs FTS5's trigram tokenizer, which is not
+     * guaranteed in the SQLite bundled with every minSdk 31 device. A
+     * substring LIKE has neither problem.
+     *
+     * Nothing can index a leading-wildcard LIKE, so the scan is the cost of the
+     * feature; index_messages_createdAt serves the ORDER BY instead. SQLite
+     * walks it backwards — `id` is the rowid, which is the index's own
+     * tiebreaker — and stops at [limit] rather than sorting every match.
+     *
+     * [term] must already be [MessageSearch.escapeLike]d. Blocked rows are
+     * excluded because the conversation renders them as "차단된 메시지": a hit
+     * would print the very text the chat refuses to show.
+     */
+    @Query(
+        "SELECT * FROM messages WHERE blocked = 0 AND (" +
+            "plaintext LIKE '%' || :term || '%' ESCAPE '\\' OR " +
+            "subject LIKE '%' || :term || '%' ESCAPE '\\') " +
+            "ORDER BY createdAt DESC, id DESC LIMIT :limit",
+    )
+    suspend fun searchAll(term: String, limit: Int): List<MessageRow>
 }
 
 @Dao
@@ -382,6 +414,16 @@ interface BlockedSmsDao {
 
     @Delete
     suspend fun delete(msg: BlockedSms)
+
+    /**
+     * Quarantined bodies matching an escaped LIKE term.
+     *
+     * Counted, never listed: these bodies are outside the conversation store,
+     * and folding them into the results would let spam sit among real history.
+     * See [MessageSearch.quarantineNotice].
+     */
+    @Query("SELECT COUNT(*) FROM blocked_sms WHERE body LIKE '%' || :term || '%' ESCAPE '\\'")
+    suspend fun countMatching(term: String): Int
 
     /** Logout path: quarantined spam bodies are local-only and must not survive logout. */
     @Query("DELETE FROM blocked_sms")
@@ -660,7 +702,7 @@ interface CarrierPartResultDao {
         CarrierProviderState::class,
         ProcessedCarrierEvent::class,
     ],
-    version = 11,
+    version = 12,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -696,6 +738,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_8_9,
                     MIGRATION_9_10,
                     MIGRATION_10_11,
+                    MIGRATION_11_12,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -953,6 +996,19 @@ abstract class AppDatabase : RoomDatabase() {
                 "CREATE INDEX IF NOT EXISTS index_relay_outbox_direction_providerEpoch_providerId " +
                     "ON relay_outbox(direction, providerEpoch, providerId)",
             )
+            }
+        }
+
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Ordering support for the global message search. The LIKE
+                // predicate cannot use an index; this one lets SQLite deliver
+                // newest-first rows without materializing and sorting every
+                // match. Name matches Room's generated one, or validation fails.
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_messages_createdAt " +
+                        "ON messages(createdAt)",
+                )
             }
         }
     }

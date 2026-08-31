@@ -69,7 +69,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.VisualTransformation
@@ -81,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import com.yunjelee.securemsg.SearchSnippet
 
 /**
  * SecureMsg design tokens — light palette, mirroring the web app shell so the
@@ -640,6 +644,27 @@ fun SmSearchPill(
                 )
             }
         }
+    }
+}
+
+/**
+ * Styles the matched span of a [SearchSnippet]. The range was measured against
+ * this exact string by `MessageSearch.snippet`, so nothing is searched again
+ * here — a second search would have to repeat its flattening and windowing to
+ * land on the same characters.
+ */
+fun highlightedSnippet(snippet: SearchSnippet): AnnotatedString = buildAnnotatedString {
+    append(snippet.text)
+    if (snippet.hasMatch) {
+        addStyle(
+            SpanStyle(
+                color = Sm.text1,
+                fontWeight = FontWeight.SemiBold,
+                background = Sm.accentTint,
+            ),
+            snippet.matchStart,
+            snippet.matchEnd,
+        )
     }
 }
 

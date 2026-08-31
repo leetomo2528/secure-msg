@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -60,12 +63,14 @@ import com.yunjelee.securemsg.BlocklistManager
 import com.yunjelee.securemsg.BlocklistSync
 import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.ConversationTargetResolver
+import com.yunjelee.securemsg.MessageHit
 import com.yunjelee.securemsg.MessageRow
 import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.SmsNotifier
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -147,6 +152,14 @@ fun ColumnScope.MessagesPane(
     var selectedThread by state::selectedThread
     var composing by state::composing
     var threadSearchQuery by remember { mutableStateOf("") }
+    // Global body-search state. The rows are a one-shot query snapshot, not a
+    // Flow: re-running it on every Room emission would re-scan the whole
+    // message table for each arrival while the field is open.
+    var globalRows by remember { mutableStateOf<List<MessageRow>>(emptyList()) }
+    var quarantineMatches by remember { mutableStateOf(0) }
+    // False from the first keystroke until that query's rows land, so the list
+    // says "검색 중" instead of reporting a stale or empty result as final.
+    var globalSearchSettled by remember { mutableStateOf(true) }
     var messageSearchVisible by remember { mutableStateOf(false) }
     var messageSearchQuery by remember { mutableStateOf("") }
     var reply by remember { mutableStateOf("") }
@@ -190,6 +203,12 @@ fun ColumnScope.MessagesPane(
     }
     val visibleMessages = remember(selectedMessages, messageSearchQuery) {
         MessageSearch.filterMessages(selectedMessages, messageSearchQuery)
+    }
+    // Re-filtered against the CURRENT query, so rows fetched for a shorter
+    // prefix narrow as the user keeps typing instead of showing stale matches
+    // until the next query returns. Also re-labels when a thread is renamed.
+    val messageHits = remember(globalRows, threads, threadSearchQuery) {
+        MessageSearch.globalHits(globalRows, threads, threadSearchQuery)
     }
     // Re-read the wall clock whenever the data it labels changes, so "오늘"
     // cannot stay pinned across midnight for long.
@@ -243,6 +262,33 @@ fun ColumnScope.MessagesPane(
                 }
             }
         }
+    }
+
+    // Cross-conversation body search. Keyed on the query alone: the labels are
+    // resolved from `threads` at render time, so a thread emission must not
+    // restart the scan. Recomposition cancels the previous coroutine, which is
+    // what debounces it — the delay is the first thing the body does, so only
+    // the last keystroke of a burst reaches the database. Room's suspend DAO
+    // dispatches to its own executor; the explicit IO context keeps the LIKE
+    // scan off the main thread even if that ever changes.
+    LaunchedEffect(threadSearchQuery) {
+        val term = threadSearchQuery.trim()
+        if (term.isEmpty()) {
+            globalRows = emptyList()
+            quarantineMatches = 0
+            globalSearchSettled = true
+            return@LaunchedEffect
+        }
+        globalSearchSettled = false
+        delay(SEARCH_DEBOUNCE_MS)
+        val escaped = MessageSearch.escapeLike(term)
+        val (rows, quarantined) = withContext(Dispatchers.IO) {
+            db.messageDao().searchAll(escaped, MessageSearch.GLOBAL_LIMIT) to
+                db.blockedSmsDao().countMatching(escaped)
+        }
+        globalRows = rows
+        quarantineMatches = quarantined
+        globalSearchSettled = true
     }
 
     // A notification can arrive before Room's thread Flow emits (cold process),
@@ -634,26 +680,43 @@ fun ColumnScope.MessagesPane(
                 )
             }
             else -> {
+                val searching = threadSearchQuery.isNotBlank()
                 SmSearchPill(
                     query = threadSearchQuery,
                     onQueryChange = { threadSearchQuery = it.take(200) },
-                    // Filters on name/number only (MessageSearch.filterThreads);
-                    // the artboard's "대화·메시지 검색" would promise body search.
-                    placeholder = "대화 상대·번호 검색",
+                    // Both halves of the promise are met: name/number over the
+                    // loaded threads (MessageSearch.filterThreads) and body text
+                    // over every conversation (MessageDao.searchAll).
+                    placeholder = "대화·메시지 검색",
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp),
                 )
-                if (threadSearchQuery.isNotBlank()) {
+                if (searching) {
                     Text(
-                        "검색 결과 ${visibleThreads.size}/${threads.size}",
+                        if (globalSearchSettled) {
+                            MessageSearch.resultSummary(visibleThreads.size, messageHits.size)
+                        } else {
+                            "대화 상대 ${visibleThreads.size}건 · 메시지 검색 중…"
+                        },
                         color = Sm.text4,
                         fontSize = 11.sp,
                         modifier = Modifier.padding(start = 20.dp, top = 10.dp),
                     )
-                }
-                if (threads.isEmpty()) {
+                    // Only once the count belongs to the query on screen: the
+                    // debounce window would otherwise attribute the previous
+                    // query's spam count to what the user just typed.
+                    MessageSearch.quarantineNotice(
+                        if (globalSearchSettled) quarantineMatches else 0,
+                    )?.let { note ->
+                        Text(
+                            note,
+                            color = Sm.text4,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 4.dp),
+                        )
+                    }
+                } else if (threads.isEmpty()) {
                     EmptyNote("아직 표시할 문자가 없습니다.")
-                } else if (visibleThreads.isEmpty()) {
-                    EmptyNote("일치하는 대화 상대나 전화번호가 없습니다.")
                 }
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth().weight(1f),
@@ -662,7 +725,13 @@ fun ColumnScope.MessagesPane(
                     contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 12.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    items(visibleThreads, key = { it.cid }) { item ->
+                    // Section headers only while searching, so the plain list is
+                    // untouched. Keys are prefixed because the two sections share
+                    // one LazyColumn and a cid must not collide with a message id.
+                    if (searching && visibleThreads.isNotEmpty()) {
+                        item(key = "h:threads") { SmSectionHeader("대화 상대") }
+                    }
+                    items(visibleThreads, key = { "t:${it.cid}" }) { item ->
                         val latest = latestByCid[item.cid]
                         val since = lastOpened[item.cid] ?: 0L
                         val unread = latest != null && !latest.mine && item.lastActivityAt > since
@@ -690,6 +759,35 @@ fun ColumnScope.MessagesPane(
                                 messageSearchVisible = false
                             },
                         )
+                    }
+                    if (searching) {
+                        if (messageHits.isNotEmpty()) {
+                            item(key = "h:messages") { SmSectionHeader("메시지") }
+                        }
+                        items(messageHits, key = { "m:${it.messageId}" }) { hit ->
+                            MessageHitRow(
+                                hit = hit,
+                                time = clock.listTime(hit.createdAt),
+                                onClick = {
+                                    threads.firstOrNull { it.cid == hit.cid }?.let { target ->
+                                        selectedThread = target
+                                        // Hand the query to the in-conversation
+                                        // search instead of scrolling to an id:
+                                        // that pane already filters and shows the
+                                        // matches, and its predicate is a superset
+                                        // of the SQL one, so the tapped message is
+                                        // always among them.
+                                        messageSearchQuery = threadSearchQuery.trim()
+                                        messageSearchVisible = true
+                                    }
+                                },
+                            )
+                        }
+                        if (globalSearchSettled && visibleThreads.isEmpty() && messageHits.isEmpty()) {
+                            item(key = "e:none") {
+                                EmptyNote("일치하는 대화 상대나 메시지가 없습니다.")
+                            }
+                        }
                     }
                 }
             }
@@ -797,6 +895,71 @@ private fun EmptyNote(text: String) {
         fontSize = 12.sp,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
     )
+}
+
+/**
+ * Pause after the last keystroke before the cross-conversation scan runs.
+ * Matches the web client's ChatList debounce so the two feel the same.
+ */
+private const val SEARCH_DEBOUNCE_MS = 200L
+
+/**
+ * One global-search hit, under the 메시지 header.
+ *
+ * Deliberately not an [SmConversationRow]: that row means "a conversation, and
+ * this is its latest message", and reusing it here would say the match IS the
+ * thread's newest message. This one leads with whose conversation the hit is
+ * in, then the matched text, so a hit is never read detached from its
+ * conversation.
+ */
+@Composable
+private fun MessageHitRow(hit: MessageHit, time: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        SmAvatar(hit.displayName, size = 36, personIcon = !hit.showsPhoneSubtitle)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    hit.displayName,
+                    color = Sm.text1,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(time, color = Sm.text4, fontSize = 10.sp)
+            }
+            Text(
+                // The row is titled with the conversation, so without this a
+                // message the user sent reads as one the other side sent.
+                if (hit.mine) {
+                    buildAnnotatedString {
+                        append("나: ")
+                        append(highlightedSnippet(hit.snippet))
+                    }
+                } else {
+                    highlightedSnippet(hit.snippet)
+                },
+                color = Sm.text4,
+                fontSize = 11.sp,
+                lineHeight = 15.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 private const val SEND_FAILED = "SMS 발송 실패 — 번호·권한·메시지 길이를 확인하세요."

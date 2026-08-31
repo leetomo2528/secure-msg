@@ -80,6 +80,7 @@ import com.yunjelee.securemsg.DeviceTrustCrypto
 import com.yunjelee.securemsg.DeviceTrustRepository
 import com.yunjelee.securemsg.HistoryRestoreRunner
 import com.yunjelee.securemsg.HistoryShareRunner
+import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PairingHandshake
 import com.yunjelee.securemsg.PairingQrFields
 import com.yunjelee.securemsg.PendingDeviceApproval
@@ -140,6 +141,13 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
 /** Rows of the settings row-list card; tapping one expands its detail inline below. */
 private enum class SettingsRow { Quarantine, BlockedSenders, ContactSync, Update }
 
+/**
+ * Quarantined rows revealed per "더 보기" tap. A page, not a cap: the notice in
+ * the conversation list counts matches across the whole table and sends the
+ * user here, so every one of them has to stay reachable from this list.
+ */
+private const val QUARANTINE_PAGE = 20
+
 /** Device awaiting a history-share confirmation; [label] is what the user sees. */
 private data class HistoryShareTarget(val sid: String, val label: String)
 
@@ -173,6 +181,16 @@ fun SettingsPane(
     val clipboard = LocalClipboardManager.current
     var newKw by remember { mutableStateOf("") }
     var newBlockedPhone by remember { mutableStateOf("") }
+    // Quarantine list search. Local and synchronous: the whole table is already
+    // in memory from observeAll(), so no second query is worth issuing.
+    var quarantineQuery by remember { mutableStateOf("") }
+    var quarantineShown by remember { mutableStateOf(QUARANTINE_PAGE) }
+    val quarantineHits = remember(blockedSms, quarantineQuery) {
+        MessageSearch.filterQuarantine(blockedSms, quarantineQuery)
+    }
+    // Each query starts at its own first page; a reveal carried over from the
+    // previous one would leave "더 보기" counting against a list it never grew.
+    LaunchedEffect(quarantineQuery) { quarantineShown = QUARANTINE_PAGE }
     // Server-side shared block rules cache (rules added on other devices).
     var sharedRules by remember { mutableStateOf(BlocklistSync.load(context)) }
     var contactStatus by remember { mutableStateOf(ContactSync.loadStatus(context)) }
@@ -834,10 +852,22 @@ fun SettingsPane(
 
             SettingsDetail(visible = expanded == SettingsRow.Quarantine) {
                 SectionTitle("격리된 스팸 (${blockedSms.size})")
-                if (blockedSms.isEmpty()) {
-                    Caption("격리된 문자가 없습니다.")
+                // This list is the destination MessageSearch.quarantineNotice
+                // names, so it has to be able to produce the number that notice
+                // counted: same body predicate, and every match reachable.
+                RuleInput(
+                    value = quarantineQuery,
+                    onValueChange = { quarantineQuery = it.take(200) },
+                    placeholder = "격리된 문자 본문 검색",
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                when {
+                    blockedSms.isEmpty() -> Caption("격리된 문자가 없습니다.")
+                    quarantineHits.isEmpty() -> Caption("본문이 일치하는 격리 문자가 없습니다.")
+                    quarantineQuery.isNotBlank() ->
+                        Caption("${quarantineHits.size}건 일치 (전체 ${blockedSms.size}건 중)")
                 }
-                blockedSms.take(20).forEach { item ->
+                quarantineHits.take(quarantineShown).forEach { item ->
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -847,19 +877,56 @@ fun SettingsPane(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            "${item.phoneNumber}: ${item.reason}\n${item.body.take(120)}",
-                            color = Sm.text3,
-                            fontSize = 11.sp,
-                            lineHeight = 15.sp,
-                            maxLines = 3,
-                            modifier = Modifier.weight(1f).padding(vertical = 4.dp),
-                        )
+                        Column(
+                            Modifier.weight(1f).padding(vertical = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                "${item.phoneNumber}: ${item.reason}",
+                                color = Sm.text3,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            // Windowed on the hit, not the head of the body: a
+                            // match past the first line would otherwise be
+                            // counted but never shown.
+                            val body = remember(item.body, quarantineQuery) {
+                                highlightedSnippet(
+                                    MessageSearch.snippet(
+                                        item.body,
+                                        quarantineQuery,
+                                        radius = 32,
+                                        maxLength = 120,
+                                    ),
+                                )
+                            }
+                            Text(
+                                body,
+                                color = Sm.text3,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                         TextButton(onClick = {
                             scope.launch(Dispatchers.IO) {
                                 db.blockedSmsDao().delete(item)
                             }
                         }) { Text("삭제", color = Sm.danger, fontSize = 12.sp) }
+                    }
+                }
+                // Settings is one scrolling Column, not a lazy list, so the
+                // rows are revealed a page at a time instead of all at once.
+                if (quarantineHits.size > quarantineShown) {
+                    TextButton(onClick = { quarantineShown += QUARANTINE_PAGE }) {
+                        Text(
+                            "더 보기 (${quarantineHits.size - quarantineShown}건 남음)",
+                            color = Sm.teal,
+                            fontSize = 12.sp,
+                        )
                     }
                 }
             }
