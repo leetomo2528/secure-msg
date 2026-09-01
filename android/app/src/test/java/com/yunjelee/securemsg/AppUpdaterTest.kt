@@ -1,5 +1,7 @@
 package com.yunjelee.securemsg
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -82,5 +84,54 @@ class AppUpdaterTest {
                 """{"tag_name": "v1", "assets": [{"name": "a.apk", "browser_download_url": ""}]}""",
             ),
         )
+    }
+
+    @Test
+    fun parseReleaseTreatsANullBodyAsNoNotes() {
+        // GitHub sends body:null for a release published with no description.
+        // This assertion holds on the JVM either way — the reference org.json
+        // on the test classpath does honour optString's fallback for a JSON
+        // null; the platform org.json that shadows it on device returns the
+        // string "null", which is why parseRelease has to ask isNull.
+        val info = AppUpdater.parseRelease(
+            """{"tag_name":"v0.20.0","body":null,"assets":[{"name":"app-release.apk","browser_download_url":"https://x/app-release.apk","size":50000000}]}""",
+        )
+        assertNotNull(info)
+        assertEquals("", info!!.notes)
+        assertEquals("", UpdateNotes.format(info.notes))
+    }
+
+    @Test
+    fun parseReleaseKeepsNotesUpToTheNotificationCap() {
+        val body = "가".repeat(3000)
+        val info = AppUpdater.parseRelease(
+            JSONObject()
+                .put("tag_name", "v0.19.0")
+                .put("body", body)
+                .put(
+                    "assets",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("name", "app-release.apk")
+                            .put("browser_download_url", "https://x/app-release.apk")
+                            .put("size", 50_000_000L),
+                    ),
+                )
+                .toString(),
+        )
+        assertNotNull(info)
+        // Far past the 500 the banner-era cap allowed, and bounded where
+        // BigTextStyle stops being worth carrying.
+        assertEquals(UpdateNotes.MAX_LENGTH, info!!.notes.length)
+    }
+
+    @Test
+    fun pendingUpdateJsonRoundTripsAFullSizeBody() {
+        // The same put/optString pair persistPendingUpdate and pendingUpdate
+        // use; a body at the cap has to survive it unchanged.
+        val notes = UpdateNotes.capRaw("줄 하나\n\"따옴표\" 그리고 \\역슬래시\n".repeat(400))
+        assertEquals(UpdateNotes.MAX_LENGTH, notes.length)
+        val raw = JSONObject().put("notes", notes).toString()
+        assertEquals(notes, JSONObject(raw).optString("notes", ""))
     }
 }

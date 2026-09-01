@@ -496,7 +496,13 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
                     versionName = tag.removePrefix("v").removePrefix("V"),
                     apkUrl = url,
                     sizeBytes = apk.optLong("size", 0L),
-                    notes = obj.optString("body", "").take(500),
+                    // isNull, not optString's fallback: GitHub sends body:null
+                    // for a release published with no description, and the
+                    // platform org.json that shadows the bundled artifact on
+                    // device hands back the four-character string "null" for it
+                    // — which then reads as a usable body all the way to the
+                    // post-update notification.
+                    notes = if (obj.isNull("body")) "" else UpdateNotes.capRaw(obj.optString("body")),
                 )
             } catch (_: Exception) {
                 null

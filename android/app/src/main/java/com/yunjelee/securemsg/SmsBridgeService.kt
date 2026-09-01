@@ -289,6 +289,27 @@ class SmsBridgeService : Service() {
         val serverUrl = getServerUrl()
         val relayApi = RelayApi(serverUrl).also { it.token = loaded.token }
         api = relayApi
+        // Auth is checked BEFORE device trust, and the order is load-bearing.
+        // DeviceSecurityController.refresh() calls GET /key-directory, which is
+        // @auth_required; it special-cases only 404 (serverUnsupported) and 403
+        // (selfPending), so a 401 falls through to a generic `error` and the
+        // trust gate below answers it with a silent stopSelf(). That skips
+        // notifySessionExpired and Credentials.clearSession, leaves the dead
+        // token on disk, and every later start repeats it — the bridge just
+        // goes dark. The server's absolute session cap
+        // (SESSION_MAX_AGE_SECONDS) makes token death a scheduled certainty
+        // rather than a rare accident, so this can no longer be a rare path.
+        val authCheck = try {
+            relayApi.listConversations()
+        } catch (_: Exception) {
+            // Offline: say nothing and let the next start retry. Only a
+            // server that actually answered 401 is a dead session.
+            null
+        }
+        if (authCheck?.optInt("_http_status") == 401) {
+            invalidateSession("REST authentication rejected")
+            return
+        }
         val trustView = DeviceSecurityController(
             RelayTrustedDeviceApi(relayApi, loaded.uid.toLong()),
             loaded,
@@ -299,15 +320,6 @@ class SmsBridgeService : Service() {
         ) {
             Log.e(TAG, "Bridge blocked by device trust: $trustView")
             stopSelf()
-            return
-        }
-        val authCheck = try {
-            relayApi.listConversations()
-        } catch (_: Exception) {
-            null
-        }
-        if (authCheck?.optInt("_http_status") == 401) {
-            invalidateSession("REST authentication rejected")
             return
         }
         relay?.disconnect()
@@ -424,6 +436,15 @@ class SmsBridgeService : Service() {
         }
         val fresh = response.optString("token")
         if (!response.optBoolean("ok") || fresh.isEmpty()) {
+            // The relay distinguishes "this session hit its absolute age cap"
+            // from an ordinary refusal. The key on this device is still good
+            // and one /device-login gets the bridge back, but nothing here can
+            // do that unattended — so tell the user now instead of letting the
+            // token die and the bridge go quiet at the next start.
+            if (response.optString("code") == "session_expired") {
+                invalidateSession("session reached its absolute age limit")
+                return
+            }
             Log.w(TAG, "Token refresh refused: ${response.optString("error", "unknown")}")
             return
         }

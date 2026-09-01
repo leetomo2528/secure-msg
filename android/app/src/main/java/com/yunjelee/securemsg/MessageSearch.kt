@@ -223,6 +223,9 @@ object MessageSearch {
      * would otherwise leave a lone surrogate in the snippet — which Compose
      * paints as a replacement glyph. Moving the start forward and the end back
      * drops the split character rather than emitting half of it.
+     *
+     * [codePointEnd] is internal, not private: [UpdateNotes] clips release
+     * notes on this same rule, and a second copy of it would drift.
      */
     private fun codePointStart(text: String, index: Int): Int =
         if (index > 0 && index < text.length && Character.isLowSurrogate(text[index])) {
@@ -231,7 +234,7 @@ object MessageSearch {
             index
         }
 
-    private fun codePointEnd(text: String, index: Int): Int =
+    internal fun codePointEnd(text: String, index: Int): Int =
         if (index in 1 until text.length && Character.isHighSurrogate(text[index - 1])) {
             index - 1
         } else {

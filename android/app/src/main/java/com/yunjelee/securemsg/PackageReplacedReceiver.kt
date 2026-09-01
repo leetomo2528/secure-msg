@@ -77,10 +77,18 @@ class PackageReplacedReceiver : BroadcastReceiver() {
         pending.file.delete()
         updater.clearPendingUpdate()
         InstallResultReceiver.cancelConfirmNotification(context)
-        postUpdatedNotification(context)
+        // Read off the entry loaded above: clearing dropped the only persisted
+        // copy of the notes, and this is the last moment they exist.
+        postUpdatedNotification(context, UpdateNotes.format(pending.info.notes))
     }
 
-    private fun postUpdatedNotification(context: Context) {
+    /**
+     * Fires once per update, not once per broadcast: the manifest filter is
+     * MY_PACKAGE_REPLACED alone (no BOOT_COMPLETED), and the caller has already
+     * consumed the pending entry — a repeat broadcast finds none and returns
+     * before reaching here.
+     */
+    private fun postUpdatedNotification(context: Context, notes: String) {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
                 context, Manifest.permission.POST_NOTIFICATIONS,
             ) != PackageManager.PERMISSION_GRANTED
@@ -98,23 +106,25 @@ class PackageReplacedReceiver : BroadcastReceiver() {
             ),
         )
         val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
-        val notification = Notification.Builder(context, DONE_CHANNEL_ID)
+        val builder = Notification.Builder(context, DONE_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_message)
             .setContentTitle(
                 "SecureMsg가 v${BuildConfig.VERSION_NAME}(으)로 업데이트되었습니다",
             )
             .setAutoCancel(true)
-            .apply {
-                if (launch != null) {
-                    setContentIntent(
-                        PendingIntent.getActivity(
-                            context, 0, launch, PendingIntent.FLAG_IMMUTABLE,
-                        ),
-                    )
-                }
-            }
-            .build()
-        manager.notify(DONE_TAG, DONE_ID, notification)
+        if (notes.isNotEmpty()) {
+            // Collapsed, the shade has room for one line; the rest sits behind
+            // the expander. A release with no usable body keeps the bare title
+            // instead — an empty expanded notification says less than none.
+            builder.setContentText(notes.substringBefore('\n'))
+                .setStyle(Notification.BigTextStyle().bigText(notes))
+        }
+        if (launch != null) {
+            builder.setContentIntent(
+                PendingIntent.getActivity(context, 0, launch, PendingIntent.FLAG_IMMUTABLE),
+            )
+        }
+        manager.notify(DONE_TAG, DONE_ID, builder.build())
     }
 
     private companion object {
