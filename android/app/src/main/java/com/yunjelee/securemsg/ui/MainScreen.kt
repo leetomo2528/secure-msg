@@ -218,12 +218,11 @@ fun MainScreen(
                 transitionSpec = {
                     val direction = SmMotion.slideDirection(initialState, targetState)
                     val slide = tween<IntOffset>(durations.tabMs, easing = SmMotion.Standard)
-                    val fade = tween<Float>(durations.tabMs, easing = SmMotion.Standard)
-                    (
-                        fadeIn(fade) + slideInHorizontally(slide) { it / 12 * direction }
-                        ) togetherWith (
-                        fadeOut(fade) + slideOutHorizontally(slide) { -it / 12 * direction }
-                        )
+                    // The same sideways slide as the conversation, only quicker:
+                    // one full-width travel in the direction the finger moved
+                    // along the nav. A fade on top of it just blurred the edge.
+                    slideInHorizontally(slide) { it * direction } togetherWith
+                        slideOutHorizontally(slide) { -it * direction }
                 },
                 modifier = Modifier.fillMaxSize(),
                 label = "section",

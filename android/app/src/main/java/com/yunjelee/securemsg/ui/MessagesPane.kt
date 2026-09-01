@@ -5,8 +5,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -62,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -595,33 +594,20 @@ fun ColumnScope.MessagesPane(
     AnimatedContent(
         targetState = targetSurface,
         transitionSpec = {
-            // Push: the arriving surface travels the full width in from the
-            // trailing edge while the list underneath drifts a quarter of that
-            // and fades, so the list reads as being COVERED rather than as a
-            // second screen making the same journey. Pop reverses the pair.
+            // Both surfaces travel the same full width in the same direction,
+            // so the pair reads as one sheet sliding sideways. No fade and no
+            // parallax: covering the list with a second, slower-moving layer
+            // muddied the movement instead of clarifying it.
             val push = SmMotion.slideDirection(initialState.ordinal, targetState.ordinal) >= 0
             val towards = if (push) {
                 AnimatedContentTransitionScope.SlideDirection.Start
             } else {
                 AnimatedContentTransitionScope.SlideDirection.End
             }
-            val enter = if (push) {
-                slideIntoContainer(towards, tween(surfaceMs, easing = SmMotion.Enter))
-            } else {
-                slideIntoContainer(towards, tween(surfaceMs, easing = SmMotion.Enter)) { it / 4 } +
-                    fadeIn(tween(surfaceMs, easing = SmMotion.Standard))
-            }
-            val exit = if (push) {
-                slideOutOfContainer(towards, tween(surfaceMs, easing = SmMotion.Exit)) { it / 4 } +
-                    fadeOut(tween(surfaceMs, easing = SmMotion.Standard))
-            } else {
-                slideOutOfContainer(towards, tween(surfaceMs, easing = SmMotion.Exit))
-            }
-            // The conversation is always the upper layer: it covers the list on
-            // the way in and uncovers it on the way out. Left to itself
-            // AnimatedContent draws whatever arrived last on top, which would
-            // paint the returning list over the chat still sliding off it.
-            (enter togetherWith exit).apply { targetContentZIndex = if (push) 1f else 0f }
+            val spec = tween<IntOffset>(surfaceMs, easing = SmMotion.Standard)
+            // Equal z on both sides: neither layer overlaps the other now that
+            // they move together, so there is nothing to order.
+            slideIntoContainer(towards, spec) togetherWith slideOutOfContainer(towards, spec)
         },
         modifier = Modifier.fillMaxWidth().weight(1f),
         label = "messages-surface",
