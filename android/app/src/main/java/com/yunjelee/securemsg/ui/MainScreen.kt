@@ -1,5 +1,17 @@
 package com.yunjelee.securemsg.ui
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +45,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunjelee.securemsg.AppDatabase
@@ -80,6 +93,7 @@ fun MainScreen(
 ) {
     val context = LocalContext.current
     val db = AppDatabase.get(context)
+    val durations = rememberSmDurations()
     // Remembered: the DAO hands out a new Flow per call and collectAsState
     // keys on the instance, so an unremembered one re-runs the query on every
     // recomposition of this screen.
@@ -95,6 +109,14 @@ fun MainScreen(
     // Pending request for the number-entry composer: FAB, the 연락처 entry
     // card, or a contact that has no thread yet.
     var composeTarget by remember { mutableStateOf<ComposeTarget?>(null) }
+
+    // The notification that was already waiting when this screen first
+    // composed: a cold start, where the conversation IS the app's first frame.
+    // Latched here rather than inside the pane, because the pane is recreated
+    // on every tab switch and the effect below selects 메시지 before it
+    // composes — a pane-local latch would read a notification tapped from
+    // 연락처/설정 as a cold start too and delete that transition as well.
+    val coldStartRequestId = remember { conversationTarget?.requestId }
 
     LaunchedEffect(conversationTarget?.requestId, conversationTarget?.cid) {
         if (conversationTarget != null) selectedSection = SECTION_MESSAGES
@@ -159,30 +181,22 @@ fun MainScreen(
         selectedSection = SECTION_MESSAGES
     }
 
-    // UpdateBanner emits nothing for these states. The padding wrapper below
-    // would otherwise be an empty child and still claim the column spacing.
-    val showsUpdateBanner = when (val state = update.state) {
-        UpdateUiState.Idle, UpdateUiState.Checking -> false
-        is UpdateUiState.Failed -> state.info != null
-        else -> true
-    }
     // True while the 메시지 tab shows a conversation or the composer. Gated on
     // the tab so a chat left open behind another tab cannot hide the nav.
     val conversationOpen = selectedSection == SECTION_MESSAGES && messagesState.fullHeightView
-    // 연락처/설정 draw their own titled headers and an open chat has
-    // SmChatHeader, so the wordmark row belongs to the 메시지 list alone.
-    val showsWordmark = selectedSection == SECTION_MESSAGES && !conversationOpen
-    // The chat artboard starts with its header; approval, role/permission and
-    // update notices wait on the list. The pane explains a greyed send button
-    // itself. 설정 already shows the pending request inside 기기 보안.
-    val showsNotices = !conversationOpen
-    val showsPendingBanner = showsNotices && pendingApprovalCount > 0 && selectedSection != SECTION_SETTINGS
+    // Zero while the shell is showing a conversation it never animated into —
+    // a notification tapped before this screen had drawn anything. The nav and
+    // the FAB then simply are not there, rather than sliding off a list the
+    // user was never shown; the pane makes the same exemption for the chat.
+    val chromeMs = if (messagesState.openedWithoutMotion) 0 else durations.chromeMs
 
-    // Insets: the root takes the sides and the keyboard. The top is taken
-    // here only while a list screen is up — in a chat the header runs under
-    // the status bar and pads it inside its surface — and the bottom always
-    // belongs to whichever surface is last (nav or composer), so the white
-    // continues into the gesture area as the artboards draw it.
+    // Insets: the root takes the sides and the keyboard. The top belongs to
+    // whichever surface draws the topmost pixel — ShellHeader on the three
+    // list screens, SmChatHeader/ComposeHeader inside a chat and the composer
+    // — so a surface that is sliding out carries its status-bar padding with
+    // it instead of having the shell pull the padding away underneath. The
+    // bottom always belongs to whichever surface is last (nav or composer), so
+    // the white continues into the gesture area as the artboards draw it.
     // Horizontal padding is owned per child (20dp headers, 16dp cards) so the
     // panes can run their chat header, composer and nav edge to edge.
     Column(
@@ -190,21 +204,185 @@ fun MainScreen(
             .fillMaxSize()
             .background(Sm.bg)
             .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
-            .imePadding()
-            .then(
-                if (conversationOpen) {
-                    Modifier
-                } else {
-                    Modifier
-                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
-                        .padding(top = 14.dp)
+            .imePadding(),
+    ) {
+        Box(Modifier.fillMaxWidth().weight(1f)) {
+            // A crossfade would say nothing about where 메시지/연락처/설정 sit
+            // relative to each other; a full-width push would be far too
+            // much for a control that gets tapped all day. This is the
+            // middle: a fade with a slide of a twelfth of the width, keyed
+            // on the nav order so the pane moves the way the finger did,
+            // over half the conversation's duration.
+            AnimatedContent(
+                targetState = selectedSection,
+                transitionSpec = {
+                    val direction = SmMotion.slideDirection(initialState, targetState)
+                    val slide = tween<IntOffset>(durations.tabMs, easing = SmMotion.Standard)
+                    val fade = tween<Float>(durations.tabMs, easing = SmMotion.Standard)
+                    (
+                        fadeIn(fade) + slideInHorizontally(slide) { it / 12 * direction }
+                        ) togetherWith (
+                        fadeOut(fade) + slideOutHorizontally(slide) { -it / 12 * direction }
+                        )
                 },
-            ),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxSize(),
+                label = "section",
+            ) { section ->
+                Column(Modifier.fillMaxSize()) {
+                    when (section) {
+                        SECTION_MESSAGES -> MessagesPane(
+                            state = messagesState,
+                            threads = threads,
+                            conversationTarget = conversationTarget,
+                            coldStartRequestId = coldStartRequestId,
+                            // The activity clears its own only on a matching id.
+                            onConversationTargetConsumed = onConversationTargetConsumed,
+                            smsRoleHeld = smsRoleHeld,
+                            smsPermissionsGranted = smsPermissionsGranted,
+                            setStatus = setStatus,
+                            sendSms = sendSms,
+                            composeTarget = composeTarget,
+                            onComposeTargetConsumed = { composeTarget = null },
+                            // Handed to the pane instead of being drawn above
+                            // it: the thread list is the only 메시지 surface
+                            // without a header of its own, and living inside
+                            // the pane's own AnimatedContent is what lets the
+                            // list carry this off screen — drawn out here it
+                            // would be deleted at t=0 and drop the list a
+                            // header's worth of pixels before it even moved.
+                            listHeader = {
+                                ShellHeader(
+                                    showsWordmark = true,
+                                    status = status,
+                                    pendingApprovalCount = pendingApprovalCount,
+                                    onOpenDeviceSecurity = { selectedSection = SECTION_SETTINGS },
+                                    smsRoleHeld = smsRoleHeld,
+                                    smsPermissionsGranted = smsPermissionsGranted,
+                                    requestSmsRole = requestSmsRole,
+                                    requestPerms = requestPerms,
+                                    update = update,
+                                )
+                            },
+                        )
+                        SECTION_CONTACTS -> {
+                            ShellHeader(
+                                showsWordmark = false,
+                                status = status,
+                                pendingApprovalCount = pendingApprovalCount,
+                                onOpenDeviceSecurity = { selectedSection = SECTION_SETTINGS },
+                                smsRoleHeld = smsRoleHeld,
+                                smsPermissionsGranted = smsPermissionsGranted,
+                                requestSmsRole = requestSmsRole,
+                                requestPerms = requestPerms,
+                                update = update,
+                            )
+                            ContactsPane(
+                                state = contactsState,
+                                threads = threads,
+                                onOpenThread = { openThread(it) },
+                                onNewNumber = { composeTo(null) },
+                                // No thread yet: the composer takes the number and
+                                // the thread appears only after the first send.
+                                onStartConversation = { phone, _ -> composeTo(phone) },
+                            )
+                        }
+                        else -> {
+                            // 설정 already shows the pending request inside 기기 보안,
+                            // so the banner would only repeat what is on screen.
+                            ShellHeader(
+                                showsWordmark = false,
+                                status = status,
+                                pendingApprovalCount = 0,
+                                onOpenDeviceSecurity = {},
+                                smsRoleHeld = smsRoleHeld,
+                                smsPermissionsGranted = smsPermissionsGranted,
+                                requestSmsRole = requestSmsRole,
+                                requestPerms = requestPerms,
+                                update = update,
+                            )
+                            SettingsPane(
+                                creds = creds,
+                                update = update,
+                                notificationPermissionGranted = notificationPermissionGranted,
+                                onRequestNotificationPermission = requestNotificationPermission,
+                                onLogout = onLogout,
+                                onSimulateSms = onSimulateSms,
+                                onTestUpdateFlow = onTestUpdateFlow,
+                            )
+                        }
+                    }
+                }
+            }
+            FabSlot(
+                visible = selectedSection == SECTION_MESSAGES && !conversationOpen,
+                durationMs = chromeMs,
+                onClick = { composeTo(null) },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 20.dp, bottom = 20.dp),
+            )
+        }
+        // Collapses its own height on the way out, so the chat's composer
+        // rides down into the space as the bar leaves it. A bare slide
+        // would keep the height reserved and show the page through it.
+        AnimatedVisibility(
+            visible = !conversationOpen,
+            enter = expandVertically(tween(chromeMs, easing = SmMotion.Enter)) +
+                fadeIn(tween(chromeMs, easing = SmMotion.Standard)),
+            exit = shrinkVertically(tween(chromeMs, easing = SmMotion.Exit)) +
+                fadeOut(tween(chromeMs, easing = SmMotion.Standard)),
+        ) {
+            SmBottomNav(
+                items = NAV_ITEMS,
+                selected = selectedSection,
+                onSelect = { selectedSection = it },
+            )
+        }
+    }
+}
+
+/**
+ * The status/wordmark row and the shell-wide notices, drawn by each list
+ * screen rather than by the shell above them.
+ *
+ * It owns the top inset for the screen that draws it, so a pane leaving under
+ * a transition keeps its status-bar padding for as long as it is on screen —
+ * and a chat, which pads the inset inside its own header, simply never draws
+ * this. Each item carries its own 10dp gap to whatever follows instead of the
+ * column spacing it, so a header with nothing to report is exactly the inset
+ * and the pane beneath it does not move.
+ *
+ * [pendingApprovalCount] of 0 hides the approval card; [showsWordmark] is for
+ * the 메시지 list alone, since 연락처/설정 draw their own titled headers.
+ */
+@Composable
+private fun ShellHeader(
+    showsWordmark: Boolean,
+    status: String,
+    pendingApprovalCount: Int,
+    onOpenDeviceSecurity: () -> Unit,
+    smsRoleHeld: Boolean,
+    smsPermissionsGranted: Boolean,
+    requestSmsRole: () -> Unit,
+    requestPerms: () -> Unit,
+    update: UpdateFlow,
+) {
+    // UpdateBanner emits nothing for these states. The padding wrapper below
+    // would otherwise be an empty child and still claim its gap.
+    val showsUpdateBanner = when (val state = update.state) {
+        UpdateUiState.Idle, UpdateUiState.Checking -> false
+        is UpdateUiState.Failed -> state.info != null
+        else -> true
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+            .padding(top = 14.dp),
     ) {
         if (showsWordmark) {
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -231,11 +409,11 @@ fun MainScreen(
                 }
             }
         }
-        if (showsPendingBanner) {
+        if (pendingApprovalCount > 0) {
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
+                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
                     .clip(RoundedCornerShape(14.dp))
                     .background(Sm.teal.copy(alpha = 0.10f))
                     .border(1.dp, Sm.teal, RoundedCornerShape(14.dp))
@@ -248,21 +426,21 @@ fun MainScreen(
                 )
                 SmGradientButton(
                     text = "기기 보안 열기",
-                    onClick = { selectedSection = SECTION_SETTINGS },
+                    onClick = onOpenDeviceSecurity,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
         }
-        if (showsNotices && !smsRoleHeld) {
-            SmCard(Modifier.padding(horizontal = 16.dp)) {
+        if (!smsRoleHeld) {
+            SmCard(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("기본 SMS 앱 설정이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
                     SmGhostButton(text = "설정", onClick = requestSmsRole)
                 }
             }
         }
-        if (showsNotices && smsRoleHeld && !smsPermissionsGranted) {
-            SmCard(Modifier.padding(horizontal = 16.dp)) {
+        if (smsRoleHeld && !smsPermissionsGranted) {
+            SmCard(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("SMS 권한이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
                     SmGhostButton(text = "허용", onClick = requestPerms)
@@ -273,8 +451,8 @@ fun MainScreen(
         // The updater checks in the background from this screen. Keep the
         // resulting action visible here; without this banner an Available
         // result was silently reduced to the settings-card status text.
-        if (showsNotices && showsUpdateBanner) {
-            Box(Modifier.padding(horizontal = 16.dp)) {
+        if (showsUpdateBanner) {
+            Box(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
                 UpdateBanner(
                     state = update.state,
                     onUpdate = update.onUpdate,
@@ -286,62 +464,37 @@ fun MainScreen(
                 )
             }
         }
+    }
+}
 
-        // Pane + nav share one block so the nav sits flush under the pane
-        // instead of picking up the column spacing above.
-        Column(Modifier.fillMaxWidth().weight(1f)) {
-            Box(Modifier.fillMaxWidth().weight(1f)) {
-                Column(Modifier.fillMaxSize()) {
-                    when (selectedSection) {
-                        SECTION_MESSAGES -> MessagesPane(
-                            state = messagesState,
-                            threads = threads,
-                            conversationTarget = conversationTarget,
-                            // The activity clears its own only on a matching id.
-                            onConversationTargetConsumed = onConversationTargetConsumed,
-                            smsRoleHeld = smsRoleHeld,
-                            smsPermissionsGranted = smsPermissionsGranted,
-                            setStatus = setStatus,
-                            sendSms = sendSms,
-                            composeTarget = composeTarget,
-                            onComposeTargetConsumed = { composeTarget = null },
-                        )
-                        SECTION_CONTACTS -> ContactsPane(
-                            state = contactsState,
-                            threads = threads,
-                            onOpenThread = { openThread(it) },
-                            onNewNumber = { composeTo(null) },
-                            // No thread yet: the composer takes the number and
-                            // the thread appears only after the first send.
-                            onStartConversation = { phone, _ -> composeTo(phone) },
-                        )
-                        else -> SettingsPane(
-                            creds = creds,
-                            update = update,
-                            notificationPermissionGranted = notificationPermissionGranted,
-                            onRequestNotificationPermission = requestNotificationPermission,
-                            onLogout = onLogout,
-                            onSimulateSms = onSimulateSms,
-                            onTestUpdateFlow = onTestUpdateFlow,
-                        )
-                    }
-                }
-                if (selectedSection == SECTION_MESSAGES && !conversationOpen) {
-                    SmFab(
-                        onClick = { composeTo(null) },
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(end = 20.dp, bottom = 20.dp),
-                    )
-                }
-            }
-            if (!conversationOpen) {
-                SmBottomNav(
-                    items = NAV_ITEMS,
-                    selected = selectedSection,
-                    onSelect = { selectedSection = it },
-                )
-            }
-        }
+/**
+ * The 메시지 FAB, arriving and leaving with the list it belongs to — it scales
+ * out of the corner it sits in rather than blinking, because a conversation
+ * takes the whole screen away from it.
+ *
+ * The button stops taking taps the frame the exit starts: it is drawn above
+ * the section content and stays composed for the whole 180ms, long enough to
+ * cover a 연락처 row or a chat's send button and answer a tap meant for them.
+ *
+ * Its own composable on purpose: at the call site both the shell's BoxScope
+ * and the ColumnScope around it are implicit receivers, and AnimatedVisibility
+ * has a ColumnScope overload that then claims the call it must not have.
+ */
+@Composable
+private fun FabSlot(
+    visible: Boolean,
+    durationMs: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(tween(durationMs, easing = SmMotion.Standard)) +
+            scaleIn(tween(durationMs, easing = SmMotion.Enter), initialScale = 0.7f),
+        exit = fadeOut(tween(durationMs, easing = SmMotion.Standard)) +
+            scaleOut(tween(durationMs, easing = SmMotion.Exit), targetScale = 0.7f),
+    ) {
+        SmFab(onClick = onClick, enabled = visible)
     }
 }

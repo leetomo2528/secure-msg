@@ -1,5 +1,12 @@
 package com.yunjelee.securemsg.ui
 
+import android.content.ContentResolver
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -49,7 +56,12 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -65,6 +77,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -85,6 +98,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.yunjelee.securemsg.SearchSnippet
+import kotlin.math.roundToInt
 
 /**
  * SecureMsg design tokens — light palette, mirroring the web app shell so the
@@ -148,6 +162,132 @@ object Sm {
         listOf(Color(0xFF4F46E5), Color(0xFF5B52E8)),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------
+
+/**
+ * One screen change's timings, already reduced by the platform's animation
+ * scale. Built by [SmMotion.durations]; a screen reads it once and hands the
+ * numbers to every transition it runs, so nothing on screen can drift out of
+ * step with the rest.
+ */
+@Immutable
+data class SmDurations(val conversationMs: Int, val tabMs: Int, val chromeMs: Int)
+
+/**
+ * The one place screen-transition timing lives. Everything here is short on
+ * purpose: this is a messaging app whose screens are opened and closed dozens
+ * of times a sitting, and a transition the user has to wait out is worse than
+ * no transition at all.
+ */
+object SmMotion {
+    /** Conversation open/close — a full-width push, so the longest one here. */
+    const val CONVERSATION_MS = 230
+
+    /** Tab switch. Roughly half the push: it fires on every 메시지/연락처/설정 tap. */
+    const val TAB_MS = 120
+
+    /** Bottom nav and FAB, which come and go with the conversation. */
+    const val CHROME_MS = 180
+
+    /** One frame at 60Hz — the floor any non-zero scale is held to. */
+    private const val MIN_MS = 16
+
+    /** Arriving content: leaves immediately, settles softly. */
+    val Enter: Easing = CubicBezierEasing(0f, 0f, 0f, 1f)
+
+    /** Departing content: eases off, then clears the screen quickly. */
+    val Exit: Easing = CubicBezierEasing(0.3f, 0f, 1f, 1f)
+
+    /** Anything that enters and leaves in place — fades, the tab slide. */
+    val Standard: Easing = CubicBezierEasing(0.2f, 0f, 0f, 1f)
+
+    /**
+     * Folds `ANIMATOR_DURATION_SCALE` and `TRANSITION_ANIMATION_SCALE` into a
+     * single factor. Either one at zero means animations are off — developer
+     * options, or the accessibility toggle that writes the same global keys —
+     * so the stricter of the two wins rather than an average: a device that
+     * asked for no motion must get none, and the low-end phones that ship with
+     * the scales turned down are exactly the ones that cannot afford them. A
+     * figure the platform could not report (negative, NaN) is treated as
+     * unset instead of as "off".
+     */
+    fun effectiveScale(animatorScale: Float, transitionScale: Float): Float {
+        val animator = if (animatorScale.isFinite() && animatorScale >= 0f) animatorScale else 1f
+        val transition = if (transitionScale.isFinite() && transitionScale >= 0f) transitionScale else 1f
+        return minOf(animator, transition)
+    }
+
+    /**
+     * [baseMs] under [scale]. Zero comes back exactly, never rounded up to
+     * something merely fast: Compose runs a 0ms tween as an instant snap,
+     * which is the only correct reading of the setting. Every other result
+     * keeps at least one frame, so a fractional scale slows a transition down
+     * instead of quietly deleting it.
+     */
+    fun scaledDuration(baseMs: Int, scale: Float): Int {
+        if (baseMs <= 0 || scale <= 0f || !scale.isFinite()) return 0
+        return (baseMs * scale).roundToInt().coerceAtLeast(MIN_MS)
+    }
+
+    /** Every duration at once, for a screen that runs more than one of them. */
+    fun durations(scale: Float): SmDurations = SmDurations(
+        conversationMs = scaledDuration(CONVERSATION_MS, scale),
+        tabMs = scaledDuration(TAB_MS, scale),
+        chromeMs = scaledDuration(CHROME_MS, scale),
+    )
+
+    /**
+     * Which way a move between two ordered surfaces travels: 1 when [to] sits
+     * after [from] — a push, so the arriving screen comes in from the trailing
+     * edge — and -1 for the pop that reverses it. The bottom-nav tabs and the
+     * 메시지 tab's list → composer → conversation depth are both numbered left
+     * to right, so the one rule serves both.
+     */
+    fun slideDirection(from: Int, to: Int): Int = when {
+        to > from -> 1
+        to < from -> -1
+        else -> 0
+    }
+}
+
+/**
+ * The platform animation scale, live, as ready-to-use durations.
+ *
+ * Registered as an observer rather than read once because both developer
+ * options and the accessibility toggle change these values while the app is
+ * running: a phone that has just been told to stop animating must not have to
+ * be restarted before it stops.
+ */
+@Composable
+fun rememberSmDurations(): SmDurations {
+    val resolver = LocalContext.current.contentResolver
+    var scale by remember(resolver) { mutableFloatStateOf(readMotionScale(resolver)) }
+    DisposableEffect(resolver) {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                scale = readMotionScale(resolver)
+            }
+        }
+        resolver.registerContentObserver(
+            Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE), false, observer,
+        )
+        resolver.registerContentObserver(
+            Settings.Global.getUriFor(Settings.Global.TRANSITION_ANIMATION_SCALE), false, observer,
+        )
+        onDispose { resolver.unregisterContentObserver(observer) }
+    }
+    return remember(scale) { SmMotion.durations(scale) }
+}
+
+/** Both global scales as one factor. 1f is the platform's own default. */
+private fun readMotionScale(resolver: ContentResolver): Float = SmMotion.effectiveScale(
+    Settings.Global.getFloat(resolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f),
+    Settings.Global.getFloat(resolver, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f),
+)
+
 
 /** Full-round pill used by chips, search and the composer field. */
 private val Pill = RoundedCornerShape(999.dp)
@@ -674,16 +814,25 @@ fun highlightedSnippet(snippet: SearchSnippet): AnnotatedString = buildAnnotated
     }
 }
 
-/** Compose-new floating button. Position it from the caller (20dp off the corner). */
+/**
+ * Compose-new floating button. Position it from the caller (20dp off the corner).
+ *
+ * [enabled] false drops the clickable outright rather than disabling it: this
+ * button animates out over what replaced it, and a Box with no pointer input is
+ * the only way the tap reaches the row or the send button underneath — a
+ * clickable that merely ignores its callback still swallows the gesture.
+ */
 @Composable
-fun SmFab(onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun SmFab(onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
     val glow = Sm.sky.copy(alpha = 0.28f)
     Box(
         modifier = modifier
             .size(56.dp)
             .shadow(8.dp, CircleShape, ambientColor = glow, spotColor = glow)
             .background(Sm.brandGradient)
-            .clickable(role = Role.Button, onClick = onClick)
+            .then(
+                if (enabled) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier,
+            )
             .semantics { contentDescription = "새 메시지" },
         contentAlignment = Alignment.Center,
     ) {

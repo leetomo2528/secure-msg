@@ -2,6 +2,12 @@ package com.yunjelee.securemsg.ui
 
 import android.content.Context
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -13,6 +19,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
@@ -102,6 +109,16 @@ class MessagesPaneState {
     var selectedThread by mutableStateOf<SmsThread?>(null)
     var composing by mutableStateOf(false)
 
+    /**
+     * True while the conversation on screen got there without a gesture that
+     * could have been animated — a notification tapped before this tab had
+     * shown anything, i.e. a cold start. The pane and the shell both read it,
+     * so the app's FIRST screen appears rather than sliding in over a list the
+     * user never saw. Cleared the moment that conversation is left, so backing
+     * out of it animates like any other close.
+     */
+    var openedWithoutMotion by mutableStateOf(false)
+
     /** True while a conversation or the composer is showing. */
     val fullHeightView: Boolean get() = selectedThread != null || composing
 
@@ -113,11 +130,13 @@ class MessagesPaneState {
     fun open(thread: SmsThread) {
         selectedThread = thread
         composing = false
+        openedWithoutMotion = false
     }
 
     fun reset() {
         selectedThread = null
         composing = false
+        openedWithoutMotion = false
     }
 }
 
@@ -137,6 +156,31 @@ private data class SendNotice(val text: String, val failed: Boolean)
 private data class PinNotice(val text: String, val nonce: Long)
 
 /**
+ * Which of the 메시지 tab's three surfaces is up. Declared in the order they
+ * stack — the list is the root, the composer and a conversation sit on top of
+ * it — because [SmMotion.slideDirection] reads the ordinal to tell a push from
+ * a pop, so reordering these reverses the animation.
+ */
+private enum class MessagesView { List, Composer, Conversation }
+
+/**
+ * What the conversation surface is drawing, held across its own exit.
+ *
+ * AnimatedContent keeps the leaving chat composed for the length of its slide,
+ * by which time back has already cleared `selectedThread` and with it the
+ * message Flow keyed on that thread — so without this the bubbles and the
+ * header name blink out from under the surface while it is still on screen.
+ * Deliberately NOT snapshot state: it is written and read in the same
+ * composition pass, and making it observable would buy nothing but an extra
+ * recomposition per arriving message.
+ */
+private class ChatSurface {
+    var thread: SmsThread? = null
+    var messages: List<MessageRow> = emptyList()
+    var blocked: Boolean = false
+}
+
+/**
  * "메시지" tab: thread list, the number-entry composer, and the open
  * conversation — one of the three is on screen at a time.
  *
@@ -149,11 +193,13 @@ fun ColumnScope.MessagesPane(
     state: MessagesPaneState,
     threads: List<SmsThread>,
     conversationTarget: ConversationTarget?,
+    coldStartRequestId: String?,
     onConversationTargetConsumed: (String) -> Unit,
     smsRoleHeld: Boolean,
     smsPermissionsGranted: Boolean,
     setStatus: (String) -> Unit,
     sendSms: suspend (phone: String, text: String) -> Boolean,
+    listHeader: @Composable () -> Unit,
     composeTarget: ComposeTarget? = null,
     onComposeTargetConsumed: () -> Unit = {},
 ) {
@@ -204,7 +250,25 @@ fun ColumnScope.MessagesPane(
     val selectedMessageFlow = remember(selectedThread?.cid) {
         selectedThread?.let { db.messageDao().observeForCid(it.cid) } ?: flowOf(emptyList())
     }
-    val selectedMessages by selectedMessageFlow.collectAsState(initial = emptyList())
+    val liveMessages by selectedMessageFlow.collectAsState(initial = emptyList())
+    // Copied across only while a thread is actually selected, so closing one
+    // leaves its last frame standing for the conversation that is still
+    // sliding away rather than emptying it mid-exit (see [ChatSurface]).
+    val chat = remember { ChatSurface() }
+    selectedThread?.let {
+        chat.thread = it
+        chat.messages = liveMessages
+    }
+    val chatThread = chat.thread
+    val selectedMessages = chat.messages
+    val durations = rememberSmDurations()
+    // Zero only for a conversation that arrived without a gesture to animate,
+    // i.e. the cold start the shell latched [coldStartRequestId] for.
+    val surfaceMs = if (state.openedWithoutMotion) 0 else durations.conversationMs
+    // The way OUT always runs at full length — openedWithoutMotion exempts the
+    // way in alone, and closeConversation clears it in the snapshot that
+    // starts the exit — so the back level below is held for this, not surfaceMs.
+    val exitMs = durations.conversationMs
     val latestMessages by remember { db.messageDao().observeLatestPerCid() }
         .collectAsState(initial = emptyList())
     val latestByCid = remember(latestMessages) { latestMessages.associateBy { it.cid } }
@@ -244,15 +308,53 @@ fun ColumnScope.MessagesPane(
     val selectedBlocked = remember(selectedThread?.phoneNumber, senderRules) {
         selectedThread?.let { BlocklistManager.senderBlocked(it.phoneNumber, senderRules) } == true
     }
+    // Retained like the bubbles above: back clears the selection while the
+    // chat is still sliding off, and its 차단됨 badge and composer notice must
+    // not flip out from under it. Never copied while there is no selection,
+    // so the number-entry composer keeps reading false.
+    if (selectedThread != null) chat.blocked = selectedBlocked
+
+    // A back press retires its own back level one frame later, but the surface
+    // it dismissed stays on screen for the whole of [exitMs]. Held open across
+    // that window so a second press lands on the screen the user can still
+    // see, instead of falling through to the activity and closing the app.
+    var dismissing by remember { mutableStateOf(false) }
+    var dismissTick by remember { mutableStateOf(0) }
+    LaunchedEffect(dismissTick) {
+        if (dismissTick == 0) return@LaunchedEffect
+        delay(exitMs.toLong())
+        dismissing = false
+    }
+    // The tick, not the flag, is the key: two dismissals in a row must restart
+    // the window rather than have the second retired by the first one's timer.
+    fun holdBackWhileLeaving() {
+        if (exitMs <= 0) return
+        dismissing = true
+        dismissTick++
+    }
 
     fun closeConversation() {
         selectedThread = null
-        reply = ""
-        sendNotice = null
-        messageSearchQuery = ""
-        messageSearchVisible = false
+        // Same snapshot as the clear above, so the recomposition that starts
+        // the exit already sees the normal duration: only the way IN to a
+        // cold-start conversation is exempt from motion, never the way out.
+        state.openedWithoutMotion = false
+        // Draft, notice and in-chat search stay: the conversation slot is on
+        // screen for the whole exit and keeps recomposing off them, so
+        // clearing here would drop the search pill, un-filter the list and
+        // scroll it to the newest message while it is still sliding away.
+        // Every path that opens a conversation clears them on the way in.
+        // The menu and the dialog do go: both are popups over a surface that
+        // is leaving.
         moreMenuOpen = false
         confirmBlockFor = null
+        holdBackWhileLeaving()
+    }
+
+    fun closeComposer() {
+        composing = false
+        openAfterSend = null
+        holdBackWhileLeaving()
     }
 
     /**
@@ -335,6 +437,7 @@ fun ColumnScope.MessagesPane(
         val target = conversationTarget ?: return@LaunchedEffect
         val resolved = ConversationTargetResolver.resolve(threads, target)
             ?: return@LaunchedEffect
+        state.openedWithoutMotion = target.requestId == coldStartRequestId
         selectedThread = resolved
         composing = false
         openAfterSend = null
@@ -434,15 +537,16 @@ fun ColumnScope.MessagesPane(
     val fullHeightView = state.fullHeightView
     DisposableEffect(state) { onDispose { state.reset() } }
 
-    // Live only while there is somewhere to go back to; on the list the
-    // system back must fall through to the activity as before.
-    BackHandler(enabled = fullHeightView) {
-        if (selectedThread != null) {
-            closeConversation()
-        } else {
-            composing = false
-            openAfterSend = null
-            sendNotice = null
+    // Live while there is somewhere to go back to, and across the exit a press
+    // has just started; on the list the system back must fall through to the
+    // activity as before.
+    BackHandler(enabled = fullHeightView || dismissing) {
+        when {
+            selectedThread != null -> closeConversation()
+            composing -> closeComposer()
+            // The surface this press would have dismissed is still on screen.
+            // Absorb it rather than closing the app out from under it.
+            else -> Unit
         }
     }
 
@@ -450,14 +554,17 @@ fun ColumnScope.MessagesPane(
     // The role/permission cards live on the list, which a chat covers; say
     // here why the send button is grey instead of leaving it mute.
     val notice = sendNotice
-    val composerNotice: Pair<String, Color>? = when {
+    // [blocked] is the verdict for the surface asking: the retained one in a
+    // conversation, always false in the number-entry composer, which has no
+    // single recipient to judge.
+    fun composerNotice(blocked: Boolean): Pair<String, Color>? = when {
         notice != null -> notice.text to (if (notice.failed) Sm.danger else Sm.text4)
         !smsRoleHeld -> "기본 SMS 앱으로 설정해야 보낼 수 있습니다." to Sm.warning
         !smsPermissionsGranted -> "SMS 권한이 필요합니다 — 설정에서 승인하세요." to Sm.warning
         // Blocking is receive-side only (OutgoingSmsDispatcher never consults
         // the blocklist). Say so rather than leaving a live send button next to
         // a header that reads 차단됨.
-        selectedBlocked -> BLOCKED_SENDER_NOTICE to Sm.text4
+        blocked -> BLOCKED_SENDER_NOTICE to Sm.text4
         else -> null
     }
 
@@ -476,387 +583,434 @@ fun ColumnScope.MessagesPane(
         )
     }
 
-    Column(Modifier.fillMaxWidth().weight(1f)) {
-        val thread = selectedThread
-        when {
-            thread != null -> {
-                val conversationListState = rememberLazyListState()
-                var followsLatest by remember(thread.cid) { mutableStateOf(true) }
-                val chatRows = remember(visibleMessages, clock) { buildChatRows(visibleMessages, clock) }
+    // The one the user actually named: opening a conversation must read as a
+    // surface arriving over the list, not as an instant swap. AnimatedContent
+    // owns the swap so both halves are driven by one transition — hand-rolling
+    // an offset would leave the leaving screen composed with nothing to end it.
+    val targetSurface = when {
+        selectedThread != null -> MessagesView.Conversation
+        composing -> MessagesView.Composer
+        else -> MessagesView.List
+    }
+    AnimatedContent(
+        targetState = targetSurface,
+        transitionSpec = {
+            // Push: the arriving surface travels the full width in from the
+            // trailing edge while the list underneath drifts a quarter of that
+            // and fades, so the list reads as being COVERED rather than as a
+            // second screen making the same journey. Pop reverses the pair.
+            val push = SmMotion.slideDirection(initialState.ordinal, targetState.ordinal) >= 0
+            val towards = if (push) {
+                AnimatedContentTransitionScope.SlideDirection.Start
+            } else {
+                AnimatedContentTransitionScope.SlideDirection.End
+            }
+            val enter = if (push) {
+                slideIntoContainer(towards, tween(surfaceMs, easing = SmMotion.Enter))
+            } else {
+                slideIntoContainer(towards, tween(surfaceMs, easing = SmMotion.Enter)) { it / 4 } +
+                    fadeIn(tween(surfaceMs, easing = SmMotion.Standard))
+            }
+            val exit = if (push) {
+                slideOutOfContainer(towards, tween(surfaceMs, easing = SmMotion.Exit)) { it / 4 } +
+                    fadeOut(tween(surfaceMs, easing = SmMotion.Standard))
+            } else {
+                slideOutOfContainer(towards, tween(surfaceMs, easing = SmMotion.Exit))
+            }
+            // The conversation is always the upper layer: it covers the list on
+            // the way in and uncovers it on the way out. Left to itself
+            // AnimatedContent draws whatever arrived last on top, which would
+            // paint the returning list over the chat still sliding off it.
+            (enter togetherWith exit).apply { targetContentZIndex = if (push) 1f else 0f }
+        },
+        modifier = Modifier.fillMaxWidth().weight(1f),
+        label = "messages-surface",
+    ) { surface ->
+        Column(Modifier.fillMaxSize()) {
+            val thread = chatThread
+            when {
+                surface == MessagesView.Conversation && thread != null -> {
+                    val conversationListState = rememberLazyListState()
+                    var followsLatest by remember(thread.cid) { mutableStateOf(true) }
+                    val chatRows = remember(visibleMessages, clock) { buildChatRows(visibleMessages, clock) }
 
-                // Only user scrolling changes follow mode. A Room emission can
-                // shift keyed rows when a new message is inserted at index 0; it
-                // must not accidentally make an at-bottom user look scrolled up.
-                // Index 0 is still the newest MESSAGE: date pills follow the
-                // oldest row of their day, never precede the newest one.
-                LaunchedEffect(conversationListState, thread.cid) {
-                    snapshotFlow { conversationListState.isScrollInProgress }
-                        .distinctUntilChanged()
-                        .collect { scrolling ->
-                            if (scrolling) {
-                                // Stop follow mode as soon as a drag/fling starts so an arrival during
-                                // the gesture cannot pull the reader back to the latest message.
-                                followsLatest = false
-                            } else {
-                                followsLatest =
-                                    conversationListState.firstVisibleItemIndex == 0 &&
-                                    conversationListState.firstVisibleItemScrollOffset == 0
+                    // Only user scrolling changes follow mode. A Room emission can
+                    // shift keyed rows when a new message is inserted at index 0; it
+                    // must not accidentally make an at-bottom user look scrolled up.
+                    // Index 0 is still the newest MESSAGE: date pills follow the
+                    // oldest row of their day, never precede the newest one.
+                    LaunchedEffect(conversationListState, thread.cid) {
+                        snapshotFlow { conversationListState.isScrollInProgress }
+                            .distinctUntilChanged()
+                            .collect { scrolling ->
+                                if (scrolling) {
+                                    // Stop follow mode as soon as a drag/fling starts so an arrival during
+                                    // the gesture cannot pull the reader back to the latest message.
+                                    followsLatest = false
+                                } else {
+                                    followsLatest =
+                                        conversationListState.firstVisibleItemIndex == 0 &&
+                                        conversationListState.firstVisibleItemScrollOffset == 0
+                                }
                             }
-                        }
-                }
+                    }
 
-                // Opening/switching a conversation starts at its newest message.
-                // Continue following arrivals only while the user is already at
-                // the latest position; reading older history is never interrupted.
-                LaunchedEffect(
-                    visibleMessages.firstOrNull()?.id,
-                ) {
-                    if (
-                        followsLatest &&
-                        !conversationListState.isScrollInProgress &&
-                        visibleMessages.isNotEmpty()
+                    // Opening/switching a conversation starts at its newest message.
+                    // Continue following arrivals only while the user is already at
+                    // the latest position; reading older history is never interrupted.
+                    LaunchedEffect(
+                        visibleMessages.firstOrNull()?.id,
                     ) {
-                        conversationListState.scrollToItem(0)
+                        if (
+                            followsLatest &&
+                            !conversationListState.isScrollInProgress &&
+                            visibleMessages.isNotEmpty()
+                        ) {
+                            conversationListState.scrollToItem(0)
+                        }
                     }
-                }
 
-                // A new/cleared search is a new result set, so begin at its latest
-                // match. Subsequent arrivals still respect the user's scroll mode.
-                LaunchedEffect(thread.cid, messageSearchQuery) {
-                    followsLatest = true
-                    if (visibleMessages.isNotEmpty()) {
-                        conversationListState.scrollToItem(0)
+                    // A new/cleared search is a new result set, so begin at its latest
+                    // match. Subsequent arrivals still respect the user's scroll mode.
+                    LaunchedEffect(thread.cid, messageSearchQuery) {
+                        followsLatest = true
+                        if (visibleMessages.isNotEmpty()) {
+                            conversationListState.scrollToItem(0)
+                        }
                     }
-                }
 
-                // An alphanumeric sender id cannot become a rule — 설정 validates
-                // new sender rules with this same pattern — so the ⋮ would open
-                // a menu whose only item does nothing. A thread already covered
-                // by a rule keeps it either way, or the block could not be lifted.
-                val ruleCandidate = remember(thread.phoneNumber) {
-                    SenderRulePattern.matches(PhoneNumberNormalizer.normalize(thread.phoneNumber))
-                }
-                SmChatHeader(
-                    name = thread.displayName,
-                    subtitle = "SMS · ${thread.phoneNumber}" + (if (selectedBlocked) " · 차단됨" else ""),
-                    onBack = { closeConversation() },
-                    onSearch = {
-                        messageSearchVisible = !messageSearchVisible
-                        if (!messageSearchVisible) messageSearchQuery = ""
-                    },
-                    onMore = if (selectedBlocked || ruleCandidate) ({ moreMenuOpen = true }) else null,
-                    moreMenu = {
-                        SmMenu(expanded = moreMenuOpen, onDismiss = { moreMenuOpen = false }) {
-                            if (selectedBlocked) {
-                                // Reversible and non-destructive: no confirmation.
-                                SmMenuItem(
-                                    text = "차단 해제",
-                                    onClick = {
-                                        moreMenuOpen = false
-                                        changeSenderRule(thread.phoneNumber, unblocking = true) {
-                                            unblockSenderFromChat(context, thread.phoneNumber, senderRules)
-                                        }
-                                    },
-                                )
-                            } else {
-                                SmMenuItem(
-                                    text = "이 번호 차단",
-                                    onClick = {
-                                        moreMenuOpen = false
-                                        confirmBlockFor = thread
-                                    },
-                                    textColor = Sm.danger,
-                                )
+                    // An alphanumeric sender id cannot become a rule — 설정 validates
+                    // new sender rules with this same pattern — so the ⋮ would open
+                    // a menu whose only item does nothing. A thread already covered
+                    // by a rule keeps it either way, or the block could not be lifted.
+                    val ruleCandidate = remember(thread.phoneNumber) {
+                        SenderRulePattern.matches(PhoneNumberNormalizer.normalize(thread.phoneNumber))
+                    }
+                    SmChatHeader(
+                        name = thread.displayName,
+                        subtitle = "SMS · ${thread.phoneNumber}" + (if (chat.blocked) " · 차단됨" else ""),
+                        onBack = { closeConversation() },
+                        onSearch = {
+                            messageSearchVisible = !messageSearchVisible
+                            if (!messageSearchVisible) messageSearchQuery = ""
+                        },
+                        onMore = if (chat.blocked || ruleCandidate) ({ moreMenuOpen = true }) else null,
+                        moreMenu = {
+                            SmMenu(expanded = moreMenuOpen, onDismiss = { moreMenuOpen = false }) {
+                                if (chat.blocked) {
+                                    // Reversible and non-destructive: no confirmation.
+                                    SmMenuItem(
+                                        text = "차단 해제",
+                                        onClick = {
+                                            moreMenuOpen = false
+                                            changeSenderRule(thread.phoneNumber, unblocking = true) {
+                                                unblockSenderFromChat(context, thread.phoneNumber, senderRules)
+                                            }
+                                        },
+                                    )
+                                } else {
+                                    SmMenuItem(
+                                        text = "이 번호 차단",
+                                        onClick = {
+                                            moreMenuOpen = false
+                                            confirmBlockFor = thread
+                                        },
+                                        textColor = Sm.danger,
+                                    )
+                                }
+                            }
+                        },
+                    )
+                    if (messageSearchVisible) {
+                        SmSearchPill(
+                            query = messageSearchQuery,
+                            onQueryChange = { messageSearchQuery = it.take(200) },
+                            placeholder = "이 대화에서 검색",
+                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp),
+                        )
+                        if (messageSearchQuery.isNotBlank() && visibleMessages.isEmpty()) {
+                            Text(
+                                "일치하는 메시지나 제목이 없습니다.",
+                                color = Sm.text4,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(start = 20.dp, top = 8.dp),
+                            )
+                        }
+                    }
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        state = conversationListState,
+                        reverseLayout = true,
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom),
+                    ) {
+                        items(chatRows, key = { it.key }, contentType = { it::class }) { row ->
+                            when (row) {
+                                is ChatRow.DayPill -> SmDatePill(row.label)
+                                is ChatRow.Message -> {
+                                    val message = row.message
+                                    ChatBubble(
+                                        mine = message.mine,
+                                        blocked = message.blocked,
+                                        text = if (message.blocked) "차단된 메시지" else message.plaintext,
+                                        statusLine = if (message.blocked) {
+                                            null
+                                        } else {
+                                            clock.clockTime(message.createdAt) + carrierStatusLabel(message.carrierStatus)
+                                        },
+                                    )
+                                }
                             }
                         }
-                    },
-                )
-                if (messageSearchVisible) {
-                    SmSearchPill(
-                        query = messageSearchQuery,
-                        onQueryChange = { messageSearchQuery = it.take(200) },
-                        placeholder = "이 대화에서 검색",
-                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp),
+                    }
+                    composerNotice(chat.blocked)?.let { (text, color) -> ComposerNotice(text, color) }
+                    SmComposer(
+                        value = reply,
+                        onValueChange = {
+                            reply = it.take(20_000)
+                            sendNotice = null
+                        },
+                        placeholder = "메시지 입력",
+                        canSend = canSend,
+                        sending = sending,
+                        onSend = {
+                            val text = reply.trim()
+                            if (text.isBlank() || sending) return@SmComposer
+                            sending = true
+                            sendNotice = null
+                            scope.launch(Dispatchers.IO) {
+                                val sent = sendSms(thread.phoneNumber, text)
+                                withContext(Dispatchers.Main) {
+                                    if (sent) {
+                                        reply = ""
+                                    } else {
+                                        sendNotice = SendNotice(SEND_FAILED, failed = true)
+                                        setStatus(SEND_FAILED)
+                                    }
+                                    sending = false
+                                }
+                            }
+                        },
                     )
-                    if (messageSearchQuery.isNotBlank() && visibleMessages.isEmpty()) {
+                }
+                surface == MessagesView.Composer -> {
+                    val recipientFocus = remember { FocusRequester() }
+                    val messageFocus = remember { FocusRequester() }
+                    // An empty recipient (FAB) starts in the number field; a
+                    // prefilled one (contact) goes straight to the message.
+                    // SmComposer owns its text field, so the requester sits on
+                    // its wrapper and resolves to the first focusable descendant.
+                    LaunchedEffect(Unit) {
+                        if (newPhone.isBlank()) recipientFocus.requestFocus() else messageFocus.requestFocus()
+                    }
+
+                    ComposeHeader(onBack = { closeComposer() })
+                    RecipientField(
+                        value = newPhone,
+                        onValueChange = { newPhone = it.take(32) },
+                        focusRequester = recipientFocus,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                         Text(
-                            "일치하는 메시지나 제목이 없습니다.",
+                            "첫 메시지를 보내면 대화가 시작됩니다.",
                             color = Sm.text4,
                             fontSize = 12.sp,
-                            modifier = Modifier.padding(start = 20.dp, top = 8.dp),
                         )
                     }
-                }
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    state = conversationListState,
-                    reverseLayout = true,
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom),
-                ) {
-                    items(chatRows, key = { it.key }, contentType = { it::class }) { row ->
-                        when (row) {
-                            is ChatRow.DayPill -> SmDatePill(row.label)
-                            is ChatRow.Message -> {
-                                val message = row.message
-                                ChatBubble(
-                                    mine = message.mine,
-                                    blocked = message.blocked,
-                                    text = if (message.blocked) "차단된 메시지" else message.plaintext,
-                                    statusLine = if (message.blocked) {
-                                        null
-                                    } else {
-                                        clock.clockTime(message.createdAt) + carrierStatusLabel(message.carrierStatus)
-                                    },
-                                )
-                            }
-                        }
-                    }
-                }
-                composerNotice?.let { (text, color) -> ComposerNotice(text, color) }
-                SmComposer(
-                    value = reply,
-                    onValueChange = {
-                        reply = it.take(20_000)
-                        sendNotice = null
-                    },
-                    placeholder = "메시지 입력",
-                    canSend = canSend,
-                    sending = sending,
-                    onSend = {
-                        val text = reply.trim()
-                        if (text.isBlank() || sending) return@SmComposer
-                        sending = true
-                        sendNotice = null
-                        scope.launch(Dispatchers.IO) {
-                            val sent = sendSms(thread.phoneNumber, text)
-                            withContext(Dispatchers.Main) {
-                                if (sent) {
-                                    reply = ""
-                                } else {
-                                    sendNotice = SendNotice(SEND_FAILED, failed = true)
-                                    setStatus(SEND_FAILED)
-                                }
-                                sending = false
-                            }
-                        }
-                    },
-                )
-            }
-            composing -> {
-                val recipientFocus = remember { FocusRequester() }
-                val messageFocus = remember { FocusRequester() }
-                // An empty recipient (FAB) starts in the number field; a
-                // prefilled one (contact) goes straight to the message.
-                // SmComposer owns its text field, so the requester sits on
-                // its wrapper and resolves to the first focusable descendant.
-                LaunchedEffect(Unit) {
-                    if (newPhone.isBlank()) recipientFocus.requestFocus() else messageFocus.requestFocus()
-                }
-
-                ComposeHeader(
-                    onBack = {
-                        composing = false
-                        openAfterSend = null
-                    },
-                )
-                RecipientField(
-                    value = newPhone,
-                    onValueChange = { newPhone = it.take(32) },
-                    focusRequester = recipientFocus,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                )
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    Text(
-                        "첫 메시지를 보내면 대화가 시작됩니다.",
-                        color = Sm.text4,
-                        fontSize = 12.sp,
-                    )
-                }
-                composerNotice?.let { (text, color) -> ComposerNotice(text, color) }
-                SmComposer(
-                    value = newMsg,
-                    onValueChange = {
-                        newMsg = it.take(20_000)
-                        sendNotice = null
-                    },
-                    placeholder = "메시지 입력",
-                    canSend = canSend && newPhone.isNotBlank(),
-                    sending = sending,
-                    onSend = {
-                        val phone = newPhone.trim()
-                        val text = newMsg.trim()
-                        if (sending || phone.isBlank() || text.isBlank()) return@SmComposer
-                        sending = true
-                        sendNotice = null
-                        scope.launch(Dispatchers.IO) {
-                            val sent = sendSms(phone, text)
-                            withContext(Dispatchers.Main) {
-                                // Either way the thread (if the dispatcher got as
-                                // far as creating it) is where the result shows:
-                                // a queued bubble or a failed one.
-                                openAfterSend = PhoneNumberNormalizer.normalize(phone)
-                                if (sent) {
-                                    newMsg = ""
-                                    sendNotice = SendNotice(SEND_QUEUED, failed = false)
-                                    setStatus(SEND_QUEUED)
-                                } else {
-                                    sendNotice = SendNotice(SEND_FAILED, failed = true)
-                                    setStatus(SEND_FAILED)
-                                }
-                                sending = false
-                            }
-                        }
-                    },
-                    modifier = Modifier.focusRequester(messageFocus),
-                )
-            }
-            else -> {
-                val searching = threadSearchQuery.isNotBlank()
-                val threadListState = rememberLazyListState()
-                // A pin toggle reorders keyed rows, and LazyColumn answers that
-                // by holding whatever row was first visible at the same y — so
-                // the row the user just pinned is carried off the top of the
-                // viewport instead of appearing there, and an unpin drags the
-                // list down chasing that same anchor. An explicit scroll clears
-                // the anchor key, and index 0 is where the pinned block starts,
-                // which is what PIN_ADDED tells the user to look at.
-                var pinScrollTick by remember { mutableStateOf(0) }
-                LaunchedEffect(pinScrollTick) {
-                    if (pinScrollTick > 0) threadListState.scrollToItem(0)
-                }
-                SmSearchPill(
-                    query = threadSearchQuery,
-                    onQueryChange = { threadSearchQuery = it.take(200) },
-                    // Both halves of the promise are met: name/number over the
-                    // loaded threads (MessageSearch.filterThreads) and body text
-                    // over every conversation (MessageDao.searchAll).
-                    placeholder = "대화·메시지 검색",
-                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp),
-                )
-                pinNotice?.let { note ->
-                    Text(
-                        note.text,
-                        color = Sm.text4,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp),
-                    )
-                }
-                if (searching) {
-                    Text(
-                        if (globalSearchSettled) {
-                            MessageSearch.resultSummary(visibleThreads.size, messageHits.size)
-                        } else {
-                            "대화 상대 ${visibleThreads.size}건 · 메시지 검색 중…"
+                    composerNotice(blocked = false)?.let { (text, color) -> ComposerNotice(text, color) }
+                    SmComposer(
+                        value = newMsg,
+                        onValueChange = {
+                            newMsg = it.take(20_000)
+                            sendNotice = null
                         },
-                        color = Sm.text4,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(start = 20.dp, top = 10.dp),
+                        placeholder = "메시지 입력",
+                        canSend = canSend && newPhone.isNotBlank(),
+                        sending = sending,
+                        onSend = {
+                            val phone = newPhone.trim()
+                            val text = newMsg.trim()
+                            if (sending || phone.isBlank() || text.isBlank()) return@SmComposer
+                            sending = true
+                            sendNotice = null
+                            scope.launch(Dispatchers.IO) {
+                                val sent = sendSms(phone, text)
+                                withContext(Dispatchers.Main) {
+                                    // Either way the thread (if the dispatcher got as
+                                    // far as creating it) is where the result shows:
+                                    // a queued bubble or a failed one.
+                                    openAfterSend = PhoneNumberNormalizer.normalize(phone)
+                                    if (sent) {
+                                        newMsg = ""
+                                        sendNotice = SendNotice(SEND_QUEUED, failed = false)
+                                        setStatus(SEND_QUEUED)
+                                    } else {
+                                        sendNotice = SendNotice(SEND_FAILED, failed = true)
+                                        setStatus(SEND_FAILED)
+                                    }
+                                    sending = false
+                                }
+                            }
+                        },
+                        modifier = Modifier.focusRequester(messageFocus),
                     )
-                    // Only once the count belongs to the query on screen: the
-                    // debounce window would otherwise attribute the previous
-                    // query's spam count to what the user just typed.
-                    MessageSearch.quarantineNotice(
-                        if (globalSearchSettled) quarantineMatches else 0,
-                    )?.let { note ->
+                }
+                else -> {
+                    listHeader()
+                    val searching = threadSearchQuery.isNotBlank()
+                    val threadListState = rememberLazyListState()
+                    // A pin toggle reorders keyed rows, and LazyColumn answers that
+                    // by holding whatever row was first visible at the same y — so
+                    // the row the user just pinned is carried off the top of the
+                    // viewport instead of appearing there, and an unpin drags the
+                    // list down chasing that same anchor. An explicit scroll clears
+                    // the anchor key, and index 0 is where the pinned block starts,
+                    // which is what PIN_ADDED tells the user to look at.
+                    var pinScrollTick by remember { mutableStateOf(0) }
+                    LaunchedEffect(pinScrollTick) {
+                        if (pinScrollTick > 0) threadListState.scrollToItem(0)
+                    }
+                    SmSearchPill(
+                        query = threadSearchQuery,
+                        onQueryChange = { threadSearchQuery = it.take(200) },
+                        // Both halves of the promise are met: name/number over the
+                        // loaded threads (MessageSearch.filterThreads) and body text
+                        // over every conversation (MessageDao.searchAll).
+                        placeholder = "대화·메시지 검색",
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp),
+                    )
+                    pinNotice?.let { note ->
                         Text(
-                            note,
+                            note.text,
                             color = Sm.text4,
                             fontSize = 11.sp,
                             lineHeight = 15.sp,
-                            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 4.dp),
-                        )
-                    }
-                } else if (threads.isEmpty()) {
-                    EmptyNote("아직 표시할 문자가 없습니다.")
-                }
-                LazyColumn(
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    state = threadListState,
-                    // Bottom inset clears the 56dp FAB the shell floats 20dp
-                    // off the corner, so the last row can scroll out from under it.
-                    contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 12.dp, bottom = 88.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    // Section headers only while searching, so the plain list is
-                    // untouched. Keys are prefixed because the two sections share
-                    // one LazyColumn and a cid must not collide with a message id.
-                    if (searching && visibleThreads.isNotEmpty()) {
-                        item(key = "h:threads") { SmSectionHeader("대화 상대") }
-                    }
-                    items(visibleThreads, key = { "t:${it.cid}" }) { item ->
-                        val latest = latestByCid[item.cid]
-                        val since = lastOpened[item.cid] ?: 0L
-                        val unread = latest != null && !latest.mine && item.lastActivityAt > since
-                        // One count query per unread row on screen, re-run on
-                        // the next arrival (latest id) or when the thread is
-                        // read (since). The threshold is per thread, so this
-                        // cannot fold into the single latest-per-cid query.
-                        val unreadCount by produceState(0, item.cid, since, latest?.id, unread) {
-                            value = if (unread) db.messageDao().countIncomingSince(item.cid, since) else 0
-                        }
-                        val pinned = ConversationOrder.isPinned(item, pinnedPhones)
-                        SmConversationRow(
-                            name = item.displayName,
-                            subtitle = snippet(item, latest),
-                            time = clock.listTime(item.lastActivityAt),
-                            unread = unread,
-                            // Floor of 1 while the count is still loading, or
-                            // when only lastActivityAt moved past the stamp
-                            // (relay-timestamped arrival): the row is already
-                            // bold, so the badge must not vanish under it.
-                            unreadCount = unreadCount.coerceAtLeast(1),
-                            showPersonIcon = !item.showsPhoneSubtitle,
-                            onClick = {
-                                selectedThread = item
-                                messageSearchQuery = ""
-                                messageSearchVisible = false
-                            },
-                            pinned = pinned,
-                            onLongClick = {
-                                val next = PinnedConversations.toggle(context, item.phoneNumber)
-                                // Read the flip back instead of assuming it: a
-                                // number that normalizes to nothing is not
-                                // stored, and claiming otherwise would leave the
-                                // list contradicting the notice.
-                                if (next != pinnedPhones) {
-                                    pinnedPhones = next
-                                    pinNotice = PinNotice(
-                                        pinNoticeText(wasPinned = pinned, searching = searching),
-                                        (pinNotice?.nonce ?: 0L) + 1,
-                                    )
-                                    if (!searching) pinScrollTick++
-                                }
-                            },
+                            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp),
                         )
                     }
                     if (searching) {
-                        if (messageHits.isNotEmpty()) {
-                            item(key = "h:messages") { SmSectionHeader("메시지") }
+                        Text(
+                            if (globalSearchSettled) {
+                                MessageSearch.resultSummary(visibleThreads.size, messageHits.size)
+                            } else {
+                                "대화 상대 ${visibleThreads.size}건 · 메시지 검색 중…"
+                            },
+                            color = Sm.text4,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(start = 20.dp, top = 10.dp),
+                        )
+                        // Only once the count belongs to the query on screen: the
+                        // debounce window would otherwise attribute the previous
+                        // query's spam count to what the user just typed.
+                        MessageSearch.quarantineNotice(
+                            if (globalSearchSettled) quarantineMatches else 0,
+                        )?.let { note ->
+                            Text(
+                                note,
+                                color = Sm.text4,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp,
+                                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 4.dp),
+                            )
                         }
-                        items(messageHits, key = { "m:${it.messageId}" }) { hit ->
-                            MessageHitRow(
-                                hit = hit,
-                                time = clock.listTime(hit.createdAt),
+                    } else if (threads.isEmpty()) {
+                        EmptyNote("아직 표시할 문자가 없습니다.")
+                    }
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        state = threadListState,
+                        // Bottom inset clears the 56dp FAB the shell floats 20dp
+                        // off the corner, so the last row can scroll out from under it.
+                        contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 12.dp, bottom = 88.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        // Section headers only while searching, so the plain list is
+                        // untouched. Keys are prefixed because the two sections share
+                        // one LazyColumn and a cid must not collide with a message id.
+                        if (searching && visibleThreads.isNotEmpty()) {
+                            item(key = "h:threads") { SmSectionHeader("대화 상대") }
+                        }
+                        items(visibleThreads, key = { "t:${it.cid}" }) { item ->
+                            val latest = latestByCid[item.cid]
+                            val since = lastOpened[item.cid] ?: 0L
+                            val unread = latest != null && !latest.mine && item.lastActivityAt > since
+                            // One count query per unread row on screen, re-run on
+                            // the next arrival (latest id) or when the thread is
+                            // read (since). The threshold is per thread, so this
+                            // cannot fold into the single latest-per-cid query.
+                            val unreadCount by produceState(0, item.cid, since, latest?.id, unread) {
+                                value = if (unread) db.messageDao().countIncomingSince(item.cid, since) else 0
+                            }
+                            val pinned = ConversationOrder.isPinned(item, pinnedPhones)
+                            SmConversationRow(
+                                name = item.displayName,
+                                subtitle = snippet(item, latest),
+                                time = clock.listTime(item.lastActivityAt),
+                                unread = unread,
+                                // Floor of 1 while the count is still loading, or
+                                // when only lastActivityAt moved past the stamp
+                                // (relay-timestamped arrival): the row is already
+                                // bold, so the badge must not vanish under it.
+                                unreadCount = unreadCount.coerceAtLeast(1),
+                                showPersonIcon = !item.showsPhoneSubtitle,
+                                // Prepared on the way in: closing a
+                                // conversation leaves its own state standing
+                                // for the exit it is still animating.
                                 onClick = {
-                                    threads.firstOrNull { it.cid == hit.cid }?.let { target ->
-                                        selectedThread = target
-                                        // Hand the query to the in-conversation
-                                        // search instead of scrolling to an id:
-                                        // that pane already filters and shows the
-                                        // matches, and its predicate is a superset
-                                        // of the SQL one, so the tapped message is
-                                        // always among them.
-                                        messageSearchQuery = threadSearchQuery.trim()
-                                        messageSearchVisible = true
+                                    selectedThread = item
+                                    messageSearchQuery = ""
+                                    messageSearchVisible = false
+                                    reply = ""
+                                    sendNotice = null
+                                },
+                                pinned = pinned,
+                                onLongClick = {
+                                    val next = PinnedConversations.toggle(context, item.phoneNumber)
+                                    // Read the flip back instead of assuming it: a
+                                    // number that normalizes to nothing is not
+                                    // stored, and claiming otherwise would leave the
+                                    // list contradicting the notice.
+                                    if (next != pinnedPhones) {
+                                        pinnedPhones = next
+                                        pinNotice = PinNotice(
+                                            pinNoticeText(wasPinned = pinned, searching = searching),
+                                            (pinNotice?.nonce ?: 0L) + 1,
+                                        )
+                                        if (!searching) pinScrollTick++
                                     }
                                 },
                             )
                         }
-                        if (globalSearchSettled && visibleThreads.isEmpty() && messageHits.isEmpty()) {
-                            item(key = "e:none") {
-                                EmptyNote("일치하는 대화 상대나 메시지가 없습니다.")
+                        if (searching) {
+                            if (messageHits.isNotEmpty()) {
+                                item(key = "h:messages") { SmSectionHeader("메시지") }
+                            }
+                            items(messageHits, key = { "m:${it.messageId}" }) { hit ->
+                                MessageHitRow(
+                                    hit = hit,
+                                    time = clock.listTime(hit.createdAt),
+                                    onClick = {
+                                        threads.firstOrNull { it.cid == hit.cid }?.let { target ->
+                                            selectedThread = target
+                                            reply = ""
+                                            sendNotice = null
+                                            // Hand the query to the in-conversation
+                                            // search instead of scrolling to an id:
+                                            // that pane already filters and shows the
+                                            // matches, and its predicate is a superset
+                                            // of the SQL one, so the tapped message is
+                                            // always among them.
+                                            messageSearchQuery = threadSearchQuery.trim()
+                                            messageSearchVisible = true
+                                        }
+                                    },
+                                )
+                            }
+                            if (globalSearchSettled && visibleThreads.isEmpty() && messageHits.isEmpty()) {
+                                item(key = "e:none") {
+                                    EmptyNote("일치하는 대화 상대나 메시지가 없습니다.")
+                                }
                             }
                         }
                     }
