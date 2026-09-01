@@ -40,6 +40,14 @@ cp -f "$UNSIGNED" "$OUT"
 # that proves the rotation. apksigner refuses v2 with a lineage unless the
 # oldest signer is supplied, which is exactly why both appear here.
 # v1 is off: it only matters below API 24 and minSdk is 31.
+#
+# --rotation-min-sdk-version 31 forces one plain v3 block instead of apksigner's
+# default SDK-targeted v3.1 + v3.0 pair. With two blocks the app's own updater
+# reads the archive through getPackageArchiveInfo and it is not decidable here
+# which signer it would report; if it picked the older block, the check
+# "history.last() == archiveCurrent" fails and the app refuses its own update.
+# minSdk is 31, so targeting rotation at 31 covers every device that can install
+# this at all and leaves exactly one answer.
 "$APKSIGNER" sign \
   --ks "$HOME/.android/debug.keystore" --ks-key-alias androiddebugkey \
   --ks-pass pass:android --key-pass pass:android \
@@ -47,6 +55,7 @@ cp -f "$UNSIGNED" "$OUT"
   --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
   --lineage "$LINEAGE" \
   --min-sdk-version 31 \
+  --rotation-min-sdk-version 31 \
   --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
   "$OUT"
 
