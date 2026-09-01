@@ -13,16 +13,29 @@ android {
         applicationId = "com.yunjelee.securemsg"
         minSdk = 31
         targetSdk = 35
-        versionCode = 32
-        versionName = "0.17.0"
+        versionCode = 33
+        versionName = "0.18.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // Shipping the debug build put a debuggable, publicly-signed
+            // default SMS app on the phone; releases are this build type now.
+            //
+            // R8 stays off for the moment. Room, socket.io-client, lazysodium
+            // and the JSON layer all resolve names reflectively, and there is
+            // no instrumented run in this project to prove the shrunk app still
+            // starts — turning it on unverified would trade a signing problem
+            // for a runtime one. Enable it together with keep rules and a real
+            // device check, not before.
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Deliberately unsigned here: the update from the old debug key
+            // needs a v3 rotation lineage, which the Gradle signing config
+            // cannot express. tools/release-apk.sh signs the output with
+            // apksigner --lineage instead.
         }
     }
     compileOptions {

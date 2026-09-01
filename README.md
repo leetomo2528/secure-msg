@@ -149,8 +149,10 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 - APK는 GitHub 릴리스의 공식 자산을 HTTPS로 내려받고, 앱이 자산 크기·패키지명·현재 설치본과 APK 서명 인증서 SHA-256 일치를 먼저 검증한 뒤 시스템 패키지 설치기로 넘긴다.
 - Play Protect가 사이드로드 APK를 차단하거나 사용자가 취소하면 앱으로 결과가 돌아와 원인별 안내를 표시한다. 차단 시 시스템 세부정보에서 설치를 허용하거나 GitHub 릴리스에서 APK를 직접 설치할 수 있다.
-- 업데이트가 성립하려면 서명 키가 같아야 하므로, 릴리스는 계속 이 Mac의 디버그 키스토어(`~/.android/debug.keystore`)로 서명된 APK를 사용한다. 키스토어를 잃어버리면 기존 설치를 덮어쓸 수 없으니 주의.
-- 릴리스 방법: `gh release create v<version> android/app/build/outputs/apk/debug/app-debug.apk` — 이 자산이 곧 업데이트 공급 소스다.
+- 릴리스는 전용 키스토어(`~/keystores/securemsg-release.jks`)로 서명한다. 자격증명은 `~/.gradle/gradle.properties`에만 두고 레포에는 절대 넣지 않는다. 이 키스토어와 `~/keystores/securemsg-lineage.bin`을 잃어버리면 기존 설치를 덮어쓸 수 없다 — 백업해 둘 것.
+- v0.18.0 이전 설치본은 공개된 디버그 키로 서명돼 있었다. 그래서 새 키는 v3 회전 계보를 함께 실어, 디버그 키로 설치된 기기도 그대로 업데이트를 받는다. 회전이 끝난 기기는 반대로 디버그 키로 서명된 APK를 거부한다(`SigningRotationTest`가 이 두 방향을 모두 고정한다).
+- 릴리스 빌드: `./tools/release-apk.sh` — assembleRelease 후 apksigner로 v2(옛 키)+v3(새 키+계보) 서명까지 한 번에 한다. Gradle의 signingConfig로는 계보를 표현할 수 없어 서명은 이 스크립트가 맡는다.
+- 릴리스 방법: `gh release create v<version> android/app/build/outputs/apk/release/securemsg-release.apk` — 이 자산이 곧 업데이트 공급 소스다. 디버그 APK는 더 이상 배포하지 않는다(`debuggable=true`인 기본 문자 앱을 배포하던 셈이라, 개발자 도구도 함께 노출됐다).
 
 ## Oracle Cloud 배포
 
@@ -164,6 +166,22 @@ SECUREMSG_CORS=https://msg.example.com
 EOF
 docker compose up -d --build
 ```
+
+### 백엔드 볼륨 소유권 (비루트 전환 시 1회)
+
+백엔드 컨테이너는 root가 아니라 uid/gid `10001`(`securemsg`)로 실행된다. 기존
+`secure-msg_backend-data` 볼륨은 root가 만들고 채웠기 때문에, **업그레이드 배포 전에 한 번**
+소유권을 옮겨야 한다. 옮기지 않으면 SQLite가 `/data`에 WAL/SHM 파일을 만들지 못해
+릴레이가 기동하지 않는다.
+
+```bash
+cd ~/secure-msg
+docker compose -f deploy/oracle/docker-compose.yml stop backend
+docker run --rm -v secure-msg_backend-data:/data alpine chown -R 10001:10001 /data
+docker compose -f deploy/oracle/docker-compose.yml up -d --build
+```
+
+새로 만드는 볼륨은 이미지의 `/data` 소유권을 그대로 물려받으므로 이 작업이 필요 없다.
 
 DNS A 레코드를 서버 IP로 연결하고 Oracle VCN 보안 목록에서 80/443을 허용한다. Caddy가 `SECUREMSG_DOMAIN`을 기준으로 자동 TLS 인증서를 발급한다. 실제 운영에서는 `.env`를 백업·공유하지 말고, SQLite 볼륨과 JWT secret을 별도로 보호한다.
 
