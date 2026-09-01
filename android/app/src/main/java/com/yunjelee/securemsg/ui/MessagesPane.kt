@@ -61,12 +61,14 @@ import com.yunjelee.securemsg.AppDatabase
 import com.yunjelee.securemsg.BlockedSender
 import com.yunjelee.securemsg.BlocklistManager
 import com.yunjelee.securemsg.BlocklistSync
+import com.yunjelee.securemsg.ConversationOrder
 import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.ConversationTargetResolver
 import com.yunjelee.securemsg.MessageHit
 import com.yunjelee.securemsg.MessageRow
 import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PhoneNumberNormalizer
+import com.yunjelee.securemsg.PinnedConversations
 import com.yunjelee.securemsg.SmsNotifier
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
@@ -124,6 +126,15 @@ fun rememberMessagesPaneState(): MessagesPaneState = remember { MessagesPaneStat
 
 /** Feedback line above the composer: the last send's outcome. */
 private data class SendNotice(val text: String, val failed: Boolean)
+
+/**
+ * Transient line under the list's search pill: what the last pin toggle did.
+ *
+ * [nonce] distinguishes two toggles that produce the same sentence, so the
+ * dismissal timer restarts instead of the second one riding out the first's
+ * remaining time.
+ */
+private data class PinNotice(val text: String, val nonce: Long)
 
 /**
  * "메시지" tab: thread list, the number-entry composer, and the open
@@ -186,6 +197,10 @@ fun ColumnScope.MessagesPane(
     var sharedRules by remember { mutableStateOf(BlocklistSync.load(context)) }
     var moreMenuOpen by remember { mutableStateOf(false) }
     var confirmBlockFor by remember { mutableStateOf<SmsThread?>(null) }
+    // In-memory mirror of the pin prefs, same shape as the 연락처 tab's
+    // favourites: the file is read once and the rows recompose off this.
+    var pinnedPhones by remember { mutableStateOf(PinnedConversations.load(context)) }
+    var pinNotice by remember { mutableStateOf<PinNotice?>(null) }
     val selectedMessageFlow = remember(selectedThread?.cid) {
         selectedThread?.let { db.messageDao().observeForCid(it.cid) } ?: flowOf(emptyList())
     }
@@ -198,8 +213,16 @@ fun ColumnScope.MessagesPane(
     val lastOpened = remember {
         mutableStateMapOf<String, Long>().apply { putAll(LastOpened.all(context)) }
     }
-    val visibleThreads = remember(threads, threadSearchQuery) {
-        MessageSearch.filterThreads(threads, threadSearchQuery)
+    // Pins lift rows only on the plain list. A search is ranked by what was
+    // asked for, so letting a pin jump a weaker match to the top would answer
+    // a different question than the one typed; filterThreads returns `threads`
+    // untouched for a blank query, so this branch is not a second filter.
+    val visibleThreads = remember(threads, threadSearchQuery, pinnedPhones) {
+        if (threadSearchQuery.isBlank()) {
+            ConversationOrder.pinnedFirst(threads, pinnedPhones)
+        } else {
+            MessageSearch.filterThreads(threads, threadSearchQuery)
+        }
     }
     val visibleMessages = remember(selectedMessages, messageSearchQuery) {
         MessageSearch.filterMessages(selectedMessages, messageSearchQuery)
@@ -289,6 +312,15 @@ fun ColumnScope.MessagesPane(
         globalRows = rows
         quarantineMatches = quarantined
         globalSearchSettled = true
+    }
+
+    // The pin notice reports something already visible (the pin on the row,
+    // and on the plain list the place it just took), so it retires itself
+    // rather than sitting above the list until the next unrelated interaction.
+    LaunchedEffect(pinNotice?.nonce) {
+        if (pinNotice == null) return@LaunchedEffect
+        delay(PIN_NOTICE_MS)
+        pinNotice = null
     }
 
     // A notification can arrive before Room's thread Flow emits (cold process),
@@ -681,6 +713,18 @@ fun ColumnScope.MessagesPane(
             }
             else -> {
                 val searching = threadSearchQuery.isNotBlank()
+                val threadListState = rememberLazyListState()
+                // A pin toggle reorders keyed rows, and LazyColumn answers that
+                // by holding whatever row was first visible at the same y — so
+                // the row the user just pinned is carried off the top of the
+                // viewport instead of appearing there, and an unpin drags the
+                // list down chasing that same anchor. An explicit scroll clears
+                // the anchor key, and index 0 is where the pinned block starts,
+                // which is what PIN_ADDED tells the user to look at.
+                var pinScrollTick by remember { mutableStateOf(0) }
+                LaunchedEffect(pinScrollTick) {
+                    if (pinScrollTick > 0) threadListState.scrollToItem(0)
+                }
                 SmSearchPill(
                     query = threadSearchQuery,
                     onQueryChange = { threadSearchQuery = it.take(200) },
@@ -690,6 +734,15 @@ fun ColumnScope.MessagesPane(
                     placeholder = "대화·메시지 검색",
                     modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp),
                 )
+                pinNotice?.let { note ->
+                    Text(
+                        note.text,
+                        color = Sm.text4,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp),
+                    )
+                }
                 if (searching) {
                     Text(
                         if (globalSearchSettled) {
@@ -720,6 +773,7 @@ fun ColumnScope.MessagesPane(
                 }
                 LazyColumn(
                     modifier = Modifier.fillMaxWidth().weight(1f),
+                    state = threadListState,
                     // Bottom inset clears the 56dp FAB the shell floats 20dp
                     // off the corner, so the last row can scroll out from under it.
                     contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 12.dp, bottom = 88.dp),
@@ -742,6 +796,7 @@ fun ColumnScope.MessagesPane(
                         val unreadCount by produceState(0, item.cid, since, latest?.id, unread) {
                             value = if (unread) db.messageDao().countIncomingSince(item.cid, since) else 0
                         }
+                        val pinned = ConversationOrder.isPinned(item, pinnedPhones)
                         SmConversationRow(
                             name = item.displayName,
                             subtitle = snippet(item, latest),
@@ -757,6 +812,22 @@ fun ColumnScope.MessagesPane(
                                 selectedThread = item
                                 messageSearchQuery = ""
                                 messageSearchVisible = false
+                            },
+                            pinned = pinned,
+                            onLongClick = {
+                                val next = PinnedConversations.toggle(context, item.phoneNumber)
+                                // Read the flip back instead of assuming it: a
+                                // number that normalizes to nothing is not
+                                // stored, and claiming otherwise would leave the
+                                // list contradicting the notice.
+                                if (next != pinnedPhones) {
+                                    pinnedPhones = next
+                                    pinNotice = PinNotice(
+                                        pinNoticeText(wasPinned = pinned, searching = searching),
+                                        (pinNotice?.nonce ?: 0L) + 1,
+                                    )
+                                    if (!searching) pinScrollTick++
+                                }
                             },
                         )
                     }
@@ -970,6 +1041,28 @@ private const val UNBLOCK_FAILED =
     "차단 해제 실패 — 서버에 반영되지 않아 계속 차단됩니다. 연결 후 다시 시도하세요."
 private const val BLOCK_FAILED =
     "차단 실패 — 규칙이 저장되지 않았습니다. 연결 후 다시 시도하세요."
+private const val PIN_ADDED = "대화를 고정했습니다 — 목록 맨 위에 표시됩니다. 이 기기에만 저장됩니다."
+private const val PIN_ADDED_SEARCHING =
+    "대화를 고정했습니다 — 검색을 지우면 목록 맨 위에 표시됩니다. 이 기기에만 저장됩니다."
+private const val PIN_REMOVED = "대화 고정을 해제했습니다."
+
+/** How long a pin toggle's line stays under the search pill. */
+private const val PIN_NOTICE_MS = 2_500L
+
+/**
+ * The line a pin toggle leaves under the search pill, given the row's state
+ * before the flip and whether a query is on screen.
+ *
+ * [searching] changes what can be promised: pins lift rows only on the plain
+ * list (see visibleThreads), so a pin made from search results moves nothing
+ * the user can see and the notice has to name the moment it comes true.
+ * Un-pinning claims no position either way, so it reads the same in both.
+ */
+internal fun pinNoticeText(wasPinned: Boolean, searching: Boolean): String = when {
+    wasPinned -> PIN_REMOVED
+    searching -> PIN_ADDED_SEARCHING
+    else -> PIN_ADDED
+}
 
 /** One line directly above [SmComposer]: a send result, or why sending is off. */
 @Composable

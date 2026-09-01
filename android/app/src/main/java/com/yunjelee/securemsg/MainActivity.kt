@@ -630,8 +630,9 @@ class MainActivity : ComponentActivity() {
                         ContactSync.clearStatus(this@MainActivity)
                         // Device-local prefs that are really per-account: a
                         // different account signing in here must not inherit
-                        // the previous one's stars or read positions.
+                        // the previous one's stars, pins or read positions.
                         Favorites.clear(this@MainActivity)
+                        PinnedConversations.clear(this@MainActivity)
                         LastOpened.clear(this@MainActivity)
                         AppDatabase.get(this@MainActivity).clearAllTables()
                         withContext(Dispatchers.Main) { localDeviceUsername = null }

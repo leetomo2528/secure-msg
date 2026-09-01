@@ -429,6 +429,7 @@ fun SmChipSmall(text: String, color: Color) {
 enum class SmIconKind {
     Bubble, Users, Gear, Search, Pencil, Plus, ChevronRight, ChevronLeft,
     MoreVertical, Paperclip, ArrowUp, Star, Person, CircleSlash, Qr, Smartphone,
+    Pin,
 }
 
 /** Core material glyph, or null when the kind is drawn from [pathData]. */
@@ -470,6 +471,11 @@ private val SmIconKind.pathData: String
                 "M14 14h3v3h-3zM20 14v3M17 20h4"
         SmIconKind.Smartphone ->
             "M9 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM11 17h2"
+        // Upright pushpin: cap bar, tapering head, needle. Not from an artboard
+        // — no design file draws a pin — so it is built on the same 24-unit
+        // grid and stays inside the 3..21 box the other glyphs keep to.
+        SmIconKind.Pin ->
+            "M9 3.5h6M10 3.5v5.6l-2.8 3.4v1.1h9.6v-1.1L14 9.1V3.5M12 13.6v6.9"
         else -> ""
     }
 
@@ -692,7 +698,12 @@ fun SmFab(onClick: () -> Unit, modifier: Modifier = Modifier) {
 /**
  * Conversation list row. Unread rows lift onto a translucent card and bold
  * the name; [unreadCount] fills the badge and is only read while [unread].
+ *
+ * [pinned] draws the pin that explains why the row sits above older ones —
+ * without it the reordering reads as a bug. [onLongClick] is the pin toggle;
+ * the row had no long-press before, so nothing is displaced by it.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun SmConversationRow(
     name: String,
@@ -703,6 +714,8 @@ fun SmConversationRow(
     showPersonIcon: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    pinned: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val shape = RoundedCornerShape(14.dp)
     Row(
@@ -717,7 +730,21 @@ fun SmConversationRow(
                     Modifier.clip(shape)
                 },
             )
-            .clickable(onClick = onClick)
+            .then(
+                // Plain clickable when there is no long-press action:
+                // combinedClickable delays nothing, but it also reports a
+                // long-click affordance to accessibility services that would
+                // then do nothing.
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(
+                        onClick = onClick,
+                        onLongClick = onLongClick,
+                        onLongClickLabel = if (pinned) "고정 해제" else "대화 고정",
+                    )
+                } else {
+                    Modifier.clickable(onClick = onClick)
+                },
+            )
             .padding(horizontal = 10.dp, vertical = 11.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -725,6 +752,19 @@ fun SmConversationRow(
         SmAvatar(name, size = 44, personIcon = showPersonIcon)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (pinned) {
+                    SmIcon(
+                        SmIconKind.Pin,
+                        size = 12.dp,
+                        tint = Sm.sky,
+                        strokeWidth = 1.6.dp,
+                        // Aligned to the row box, not the baseline: a 12dp glyph
+                        // sitting on a 14sp baseline hangs below the cap height.
+                        modifier = Modifier
+                            .align(Alignment.CenterVertically)
+                            .semantics { contentDescription = "고정됨" },
+                    )
+                }
                 Text(
                     name,
                     modifier = Modifier.weight(1f).alignByBaseline(),
@@ -1362,6 +1402,7 @@ private fun SmPrimitivesPreview() {
         SmConversationRow(
             name = "010-9999-0000", subtitle = "SMS", time = "어제",
             unread = false, unreadCount = 0, showPersonIcon = true, onClick = {},
+            pinned = true, onLongClick = {},
         )
         SmEntryCard("번호로 새 문자", "연락처에 없는 번호로 바로 보내기", onClick = {})
         SmSectionHeader("즐겨찾기", leadingStar = true)
