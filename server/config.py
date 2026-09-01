@@ -14,6 +14,19 @@ DB_PATH = Path(os.environ.get("SECUREMSG_DB", BASE_DIR / "securemsg.db"))
 JWT_SECRET = os.environ.get("SECUREMSG_JWT_SECRET", "")
 JWT_ALG = "HS256"
 JWT_TTL_SECONDS = int(os.environ.get("SECUREMSG_JWT_TTL") or 604800)  # 7 days
+# Absolute ceiling on ONE device session, measured from the moment that
+# session was actually established (device-register, or a device-login proof)
+# — a column on the device row, never the `iat` the client hands back, since
+# the whole point is to survive a stolen token. /token-refresh refuses past
+# it, so a token that keeps sliding can no longer live forever and
+# session_version revocation stops being the only backstop.
+# 180 days is two production token lifetimes (SECUREMSG_JWT_TTL is 90 days
+# there), so an active device is never cut off mid-token; re-auth is
+# /device-login with the key this device already stores, which costs the user
+# one password entry and loses no history.
+SESSION_MAX_AGE_SECONDS = int(
+    os.environ.get("SECUREMSG_SESSION_MAX_AGE") or 15552000
+)  # 180 days
 
 # Abuse limits. Envelopes contain ciphertext and one wrapped key per device, so
 # keep both dimensions bounded before serializing or writing to SQLite.
@@ -73,6 +86,13 @@ def enforce_secret() -> None:
         )
     if not 300 <= JWT_TTL_SECONDS <= 365 * 24 * 60 * 60:
         raise RuntimeError("SECUREMSG_JWT_TTL must be between 300 seconds and 365 days")
+    # A cap below the TTL would be inert: /token-refresh would refuse while
+    # the token already in the client's hands stayed valid past the deadline.
+    if not JWT_TTL_SECONDS <= SESSION_MAX_AGE_SECONDS <= 2 * 365 * 24 * 60 * 60:
+        raise RuntimeError(
+            "SECUREMSG_SESSION_MAX_AGE must be at least SECUREMSG_JWT_TTL "
+            "and at most 2 years"
+        )
     if not 64 * 1024 <= MAX_ENVELOPE_BYTES <= 8 * 1024 * 1024:
         raise RuntimeError("SECUREMSG_MAX_ENVELOPE must be between 64KB and 8MB")
     if not MAX_ENVELOPE_BYTES <= MAX_HTTP_BODY_BYTES <= 10 * 1024 * 1024:

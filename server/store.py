@@ -219,6 +219,18 @@ def init_schema() -> None:
                 "ALTER TABLE devices ADD COLUMN session_version "
                 "INTEGER NOT NULL DEFAULT 1"
             )
+        if "session_started_at" not in device_cols:
+            c.execute(
+                "ALTER TABLE devices ADD COLUMN session_started_at "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            # Sessions that predate the column cannot be dated retroactively:
+            # created_at is the device's age, not its current session's. A 0
+            # would put every live session past the absolute cap the instant
+            # this migration ran and force the whole fleet — the Android
+            # gateway included — back through /device-login at once, so they
+            # start their clock here and get one full window from the upgrade.
+            c.execute("UPDATE devices SET session_started_at = ?", (now(),))
         trust_columns = {
             "trust_state": "TEXT NOT NULL DEFAULT 'approved'",
             "challenge": "TEXT NOT NULL DEFAULT ''",
@@ -662,9 +674,9 @@ def add_device(
             fingerprint = device_fingerprint(pub_key, sig_pub)
             cur = c.execute(
                 "INSERT INTO devices(user_id, sid, name, kind, pub_key, sig_pub, "
-                "session_version, trust_state, challenge, approved_by_sid, approved_at, fingerprint, verification_state, created_at, last_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'verified', ?, ?)",
-                (user_id, sid, name, kind, pub_key, sig_pub, trust_state, challenge, sid if trust_state == "approved" else None, timestamp if trust_state == "approved" else None, fingerprint, timestamp, timestamp),
+                "session_version, session_started_at, trust_state, challenge, approved_by_sid, approved_at, fingerprint, verification_state, created_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'verified', ?, ?)",
+                (user_id, sid, name, kind, pub_key, sig_pub, timestamp, trust_state, challenge, sid if trust_state == "approved" else None, timestamp if trust_state == "approved" else None, fingerprint, timestamp, timestamp),
             )
             user = c.execute("SELECT security_epoch, identity_sig_pub FROM users WHERE id = ?", (user_id,)).fetchone()
             if trust_state == "approved":
@@ -689,7 +701,7 @@ def get_device_by_sid(sid: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
             "SELECT d.id, d.user_id, d.sid, d.name, d.kind, d.pub_key, d.sig_pub, "
-            "d.session_version, d.trust_state, d.challenge, d.approved_by_sid, d.approved_at, d.approval_signature, d.fingerprint, d.revoked_at, d.verification_state, d.created_at, d.last_seen, "
+            "d.session_version, d.session_started_at, d.trust_state, d.challenge, d.approved_by_sid, d.approved_at, d.approval_signature, d.fingerprint, d.revoked_at, d.verification_state, d.created_at, d.last_seen, "
             "u.username, u.identity_sig_pub, u.security_epoch, u.directory_hash, u.security_mode FROM devices d JOIN users u ON u.id = d.user_id WHERE d.sid = ?",
             (sid,),
         ).fetchone()
@@ -813,10 +825,14 @@ def consume_device_login_challenge(
             "UPDATE device_login_challenges SET consumed_at=? WHERE challenge_id=? AND consumed_at IS NULL",
             (timestamp, challenge_id),
         )
+        # A fresh key proof is a NEW session, so the absolute-cap clock
+        # restarts here. /token-refresh must never touch this column: sliding
+        # a session is exactly what the cap exists to bound.
         rotated = c.execute(
-            "UPDATE devices SET session_version=session_version+1,last_seen=? "
+            "UPDATE devices SET session_version=session_version+1,"
+            "session_started_at=?,last_seen=? "
             "WHERE id=? AND user_id=? AND sid=? AND session_version=? AND trust_state!='revoked'",
-            (timestamp, device_id, user_id, sid, session_version),
+            (timestamp, timestamp, device_id, user_id, sid, session_version),
         )
         if consumed.rowcount != 1 or rotated.rowcount != 1:
             c.execute("ROLLBACK")

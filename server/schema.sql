@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS devices (
     pub_key       TEXT    NOT NULL,                 -- base64 X25519
     sig_pub       TEXT    NOT NULL,                 -- base64 Ed25519
     session_version INTEGER NOT NULL DEFAULT 1,     -- rotated to revoke issued JWTs
+    -- Set when a session is established (device-register / device-login proof)
+    -- and never by a refresh: it is the fixed origin for the absolute cap.
+    session_started_at INTEGER NOT NULL DEFAULT 0,
     trust_state   TEXT NOT NULL DEFAULT 'approved' CHECK(trust_state IN ('pending','approved','revoked')),
     challenge     TEXT NOT NULL DEFAULT '',
     approved_by_sid TEXT,

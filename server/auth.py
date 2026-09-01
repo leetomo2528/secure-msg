@@ -16,9 +16,11 @@ import base64
 import binascii
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from functools import wraps
 
@@ -34,6 +36,7 @@ from rate_limit import check as rate_limit
 from rate_limit import check_ip as rate_limit_ip
 
 bp = Blueprint("auth", __name__, url_prefix="/api")
+log = logging.getLogger("securemsg.auth")
 # Every endpoint that verifies a password pays one bcrypt cost-12 hash per
 # attempt whether or not the account exists (see _DUMMY_PW_HASH), and they all
 # key their per-identity bucket on the caller-supplied username. Rotating that
@@ -47,10 +50,19 @@ PASSWORD_ATTEMPT_IP_WINDOW = 60
 # CPU, and the recipient address is entirely attacker-chosen.
 REGISTER_EMAIL_IP_LIMIT = 20
 REGISTER_EMAIL_IP_WINDOW = 3600
+# Same reasoning for the reset mailer, and it needs its own budget: the two
+# endpoints mail different things, and spending one must not close the other.
+PASSWORD_RESET_IP_SCOPE = "password-reset-request-ip"
+PASSWORD_RESET_IP_LIMIT = 20
+PASSWORD_RESET_IP_WINDOW = 3600
 # Returned only when the device row itself says 'revoked'. A pending device
 # acts on this by discarding its local keypair, so it must not be reachable
 # through an ordinary expired/rotated token.
 DEVICE_REVOKED_CODE = "device_revoked"
+# The session passed config.SESSION_MAX_AGE_SECONDS. Distinct from a revoked
+# device: nothing is wrong with the key, the device just has to prove it holds
+# it again through /device-login.
+SESSION_EXPIRED_CODE = "session_expired"
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 SID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}", re.ASCII)
@@ -116,13 +128,30 @@ def _password_attempt_denied(scope: str, username: str) -> tuple | None:
     return _rate_error(retry_after) if retry_after else None
 
 
-def issue_jwt(uid: int, sid: str, session_version: int) -> str:
+def issue_jwt(
+    uid: int, sid: str, session_version: int, session_started_at: int | None = None
+) -> str:
+    """Mint a device token, never outliving the session's absolute deadline.
+
+    ``session_started_at`` is the device row's column, not a claim from the
+    caller. Passing it clamps ``exp``, which is what makes the cap absolute:
+    a token minted one second before the deadline would otherwise keep
+    authenticating a full TTL past it and refusing the NEXT refresh would come
+    far too late. Fresh sessions (register / device-login) leave it None
+    because their deadline is a full window away.
+    """
+    issued_at = int(time.time())
+    expires_at = issued_at + config.JWT_TTL_SECONDS
+    if session_started_at is not None:
+        expires_at = min(
+            expires_at, session_started_at + config.SESSION_MAX_AGE_SECONDS
+        )
     payload = {
         "uid": uid,
         "sid": sid,
         "sv": session_version,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + config.JWT_TTL_SECONDS,
+        "iat": issued_at,
+        "exp": expires_at,
     }
     return jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALG)
 
@@ -132,6 +161,50 @@ def verify_jwt(token: str) -> dict | None:
         return jwt.decode(token, config.JWT_SECRET, algorithms=[config.JWT_ALG])
     except jwt.PyJWTError:
         return None
+
+
+def _expired_session_error(token: str) -> tuple | None:
+    """Name the absolute cap when the cap is what actually ended this token.
+
+    issue_jwt clamps ``exp`` to ``session_started_at + SESSION_MAX_AGE_SECONDS``,
+    so the last token of a session expires AT the deadline. By the time the cap
+    bites, the signature check has already refused the request and the
+    /token-refresh branch below it is unreachable: without this, the cap would
+    surface as a bare "invalid token" on every endpoint at once, which is
+    exactly the wrong instruction — the device's key is fine and /device-login
+    alone gets it back, but that 401 is indistinguishable from a revoked or
+    rotated session.
+
+    The signature is still verified here; only ``exp`` is ignored, and nothing
+    is granted. The request fails 401 either way — this only picks the code.
+    """
+    try:
+        claims = jwt.decode(
+            token,
+            config.JWT_SECRET,
+            algorithms=[config.JWT_ALG],
+            options={"verify_exp": False},
+        )
+        uid = int(claims["uid"])
+        sid = str(claims["sid"])
+        session_version = int(claims["sv"])
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
+        return None
+    device = store.get_device_by_sid(sid)
+    if (
+        not device
+        or device["user_id"] != uid
+        or device["session_version"] != session_version
+        # A revoked device must keep falling through to the opaque 401 (and,
+        # on a live token, to DEVICE_REVOKED_CODE). Telling it to re-run
+        # /device-login would be the opposite of the instruction it needs.
+        or device["trust_state"] == "revoked"
+    ):
+        return None
+    started_at = int(device["session_started_at"] or 0)
+    if int(time.time()) < started_at + config.SESSION_MAX_AGE_SECONDS:
+        return None
+    return _err("session expired; sign in again", 401, code=SESSION_EXPIRED_CODE)
 
 
 def _valid_client_hash(value: object) -> bool:
@@ -205,7 +278,7 @@ def _request_claims(*, missing_error: str) -> tuple[dict | None, tuple | None]:
         return None, _err(missing_error, 401)
     decoded = verify_jwt(header[7:])
     if not decoded:
-        return None, _err("invalid token", 401)
+        return None, _expired_session_error(header[7:]) or _err("invalid token", 401)
     try:
         claims = {
             "uid": int(decoded["uid"]),
@@ -242,6 +315,7 @@ def auth_required(fn):
             "sid": sid,
             "device_id": device["id"],
             "session_version": session_version,
+            "session_started_at": int(device["session_started_at"] or 0),
         }
         return fn(*args, **kwargs)
 
@@ -270,7 +344,10 @@ def pending_auth_required(fn):
             return _err("invalid token", 401)
         if device["trust_state"] == "revoked":
             return _err("device revoked", 401, code=DEVICE_REVOKED_CODE)
-        g.auth = {"uid": uid, "sid": sid, "device_id": device["id"], "session_version": sv}
+        g.auth = {
+            "uid": uid, "sid": sid, "device_id": device["id"], "session_version": sv,
+            "session_started_at": int(device["session_started_at"] or 0),
+        }
         g.device = device
         return fn(*args, **kwargs)
 
@@ -341,6 +418,48 @@ def register_email_verify():
     return _ok(uid=uid, username=pending["username"], email=pending["email"])
 
 
+def _detach(task) -> None:
+    """Run an account-existence-dependent tail off the request thread.
+
+    Identical status, body and headers are not enough to stop enumeration if
+    only ONE of the two paths pays for them: the reset mail is a synchronous
+    HTTPS POST to the provider (emailer.send_code -> urlopen, ~300ms) and only
+    the existing-account path made it, so response TIME still answered whether
+    a (username, email) pair was a real account — a leak /register/email/request
+    does not have, since its 409 tests username and address independently.
+
+    Moving the whole tail here makes the two paths identical by construction
+    rather than by measurement: after the rate limits, the view does exactly
+    "hand off, return the canned response" no matter what is in the database.
+    The task must not touch ``request``/``g`` — it outlives them. Tests replace
+    this seam with an inline call so a sent code stays observable.
+    """
+    threading.Thread(target=task, name="securemsg-detached", daemon=True).start()
+
+
+def _deliver_password_reset(
+    username: str, email: str, challenge_id: str, code: str, expires_at: int
+) -> None:
+    """Record the reset challenge and mail the code. Detached; see _detach."""
+    try:
+        user = store.get_user_by_name(username)
+        # A manually linked-but-not-yet-verified address can still receive the
+        # first reset code; completing that code marks the address verified.
+        if not user or user.get("email") != email:
+            return
+        store.create_password_reset_challenge(
+            challenge_id, int(user["id"]), email, _code_digest(challenge_id, code),
+            expires_at,
+        )
+        emailer.send_code(
+            email, "SecureMsg 비밀번호 재설정 코드", code, "비밀번호 재설정"
+        )
+    except Exception:
+        # Nothing here may reach the caller: whether this succeeded is exactly
+        # what must not be observable. The response was already returned.
+        log.exception("password reset delivery failed")
+
+
 @bp.post("/password-reset/request")
 def password_reset_request():
     """Send a reset code; always return a generic response to avoid enumeration."""
@@ -350,32 +469,34 @@ def password_reset_request():
     username = _text(body, "username").strip().lower()
     email = _email(body.get("email"))
     challenge_id = secrets.token_urlsafe(18)
+    expires_at = int(time.time()) + config.EMAIL_CODE_TTL_SECONDS
     response = _ok(
         message="계정이 존재하면 이메일로 인증 코드를 보냈습니다.",
         challenge_id=challenge_id,
-        expires_at=int(time.time()) + config.EMAIL_CODE_TTL_SECONDS,
+        expires_at=expires_at,
     )
     if not USERNAME_RE.fullmatch(username) or not _email_ok(email):
         return response
-    # Rate limit per IP+email: the response must stay identical whether or not
-    # the account exists, so check before any user lookup and swallow the 429.
-    if rate_limit("password-reset-request", email, 5, 60):
+    # Both limits run before any user lookup and their denial is swallowed:
+    # the response must stay identical whether or not the account exists.
+    #
+    # The per-address bucket is keyed on (IP, email), so 5/min is 300 messages
+    # an hour into ONE inbox, and more IPs multiply it. Requiring the address
+    # to match the account only keeps a stranger's inbox out of range; it does
+    # nothing for the owner of an account whose username and address are
+    # known. The second, address-independent cap is what bounds the volume.
+    # `or` on purpose: a request the first limit already denied must not also
+    # spend the IP budget.
+    if rate_limit("password-reset-request", email, 5, 60) or rate_limit_ip(
+        PASSWORD_RESET_IP_SCOPE, PASSWORD_RESET_IP_LIMIT, PASSWORD_RESET_IP_WINDOW
+    ):
         return response
-    user = store.get_user_by_name(username)
-    # A manually linked-but-not-yet-verified address can still receive the
-    # first reset code; completing that code marks the address verified.
-    if not user or user.get("email") != email:
-        return response
+    # Everything that depends on the account existing runs off this thread,
+    # including the lookup itself: see _detach.
     code = _new_email_code()
-    expires_at = int(time.time()) + config.EMAIL_CODE_TTL_SECONDS
-    store.create_password_reset_challenge(
-        challenge_id, int(user["id"]), email, _code_digest(challenge_id, code), expires_at,
+    _detach(
+        lambda: _deliver_password_reset(username, email, challenge_id, code, expires_at)
     )
-    try:
-        emailer.send_code(email, "SecureMsg 비밀번호 재설정 코드", code, "비밀번호 재설정")
-    except Exception:
-        # Do not reveal whether this email belongs to an account.
-        pass
     return response
 
 
@@ -627,8 +748,32 @@ def token_refresh():
     login screen; the background bridge just went dark). Revocation still cuts
     immediately: auth_required re-checks the per-device session_version, so a
     rotated session refuses the refresh like any other call.
+
+    Sliding is bounded: a session may only slide until
+    config.SESSION_MAX_AGE_SECONDS past the moment it was established, read
+    from the device row rather than from the token's own `iat` (the client
+    hands that back, and this exists to survive a stolen token). Past the
+    deadline the device re-proves possession of its key through
+    /device-login, which needs no approval and keeps its history.
+
+    Because issue_jwt clamps ``exp`` to that same deadline, a client that keeps
+    refreshing normally never reaches the check below — its token expires AT
+    the deadline and _expired_session_error is what hands it
+    SESSION_EXPIRED_CODE. This stays as the route-local invariant (a refusal
+    here can never be later than the cap) and is what fires when an operator
+    lowers SECUREMSG_SESSION_MAX_AGE under tokens already in the field.
     """
-    return _ok(token=issue_jwt(g.auth["uid"], g.auth["sid"], g.auth["session_version"]))
+    deadline = g.auth["session_started_at"] + config.SESSION_MAX_AGE_SECONDS
+    if int(time.time()) >= deadline:
+        return _err("session expired; sign in again", 401, code=SESSION_EXPIRED_CODE)
+    return _ok(
+        token=issue_jwt(
+            g.auth["uid"],
+            g.auth["sid"],
+            g.auth["session_version"],
+            g.auth["session_started_at"],
+        )
+    )
 
 
 @bp.get("/devices")

@@ -26,11 +26,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app, socketio
 import auth
+import jwt
 from auth import approval_statement, revoke_statement, device_login_statement
 import config
 import store
 
 app.config["TESTING"] = True
+
+# /password-reset/request hands its whole account-dependent tail to a thread so
+# the response time cannot answer whether the account exists (auth._detach).
+# Tests need the code the moment the request returns, so the seam runs inline —
+# except where the detachment itself is what is under test.
+_REAL_DETACH = auth._detach
 
 # Envelope keys are validated by decoded length on both the socket send path
 # and share-keys: 48 raw bytes of crypto_box output, 24-byte nonce.
@@ -66,6 +73,9 @@ def register_account(client, username: str, pw_hash: str):
 
 class ServerSmokeTest(unittest.TestCase):
     def setUp(self):
+        inline = mock.patch("auth._detach", lambda task: task())
+        inline.start()
+        self.addCleanup(inline.stop)
         self.client = app.test_client()
         self.pw_hash = "A" * 43
         self.signing_key = SigningKey(bytes([7]) * 32)
@@ -207,6 +217,100 @@ class ServerSmokeTest(unittest.TestCase):
                 "/api/token-refresh", headers={"Authorization": f"Bearer {stale}"}
             )
             self.assertEqual(denied.status_code, 401, denied.json)
+
+    def test_token_refresh_stops_sliding_at_the_absolute_session_age(self):
+        """Sliding renewal used to have no ceiling at all.
+
+        A stolen token could refresh itself forever — with the production TTL
+        at 90 days, noticing late was the only thing that ever ended it. The
+        deadline is read from the device row, not from the token's own `iat`,
+        precisely so a thief holding the token cannot move it.
+        """
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE devices SET session_started_at = ? WHERE sid = ?",
+                (store.now() - config.SESSION_MAX_AGE_SECONDS - 1, self.sid),
+            )
+        denied = self.client.post("/api/token-refresh", headers=self.headers)
+        self.assertEqual(denied.status_code, 401, denied.json)
+        self.assertEqual(denied.json["code"], auth.SESSION_EXPIRED_CODE)
+        # The cap ends renewal, not the token: nothing else changed about this
+        # device, so its still-unexpired token keeps working until `exp`.
+        self.assertEqual(
+            self.client.get("/api/devices", headers=self.headers).status_code, 200
+        )
+        # Re-proving the device key starts a new session, and sliding resumes.
+        relogin = self.device_login()
+        self.assertEqual(relogin.status_code, 200, relogin.json)
+        renewed = self.client.post(
+            "/api/token-refresh",
+            headers={"Authorization": f"Bearer {relogin.json['token']}"},
+        )
+        self.assertEqual(renewed.status_code, 200, renewed.json)
+
+    def test_token_refresh_never_mints_a_token_outliving_the_deadline(self):
+        """Refusing the NEXT refresh is too late if this one is unbounded.
+
+        A renewal issued just before the deadline would otherwise authenticate
+        for another full TTL past it, and the absolute cap would be advisory.
+        """
+        started_at = store.now() - config.SESSION_MAX_AGE_SECONDS + 90
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE devices SET session_started_at = ? WHERE sid = ?",
+                (started_at, self.sid),
+            )
+        refreshed = self.client.post("/api/token-refresh", headers=self.headers)
+        self.assertEqual(refreshed.status_code, 200, refreshed.json)
+        claims = auth.verify_jwt(refreshed.json["token"])
+        self.assertEqual(claims["exp"], started_at + config.SESSION_MAX_AGE_SECONDS)
+        # Renewing must not push the origin forward — that would restore the
+        # unbounded slide one refresh at a time.
+        self.assertEqual(
+            store.get_device_by_sid(self.sid)["session_started_at"], started_at
+        )
+
+    def test_expired_token_past_the_cap_names_the_session_instead_of_the_token(self):
+        """The cap has to be legible, or it reads as a revoked device.
+
+        issue_jwt clamps `exp` to the deadline, so the last token of a session
+        dies AT the cap: /token-refresh is already unreachable by then and the
+        cap would otherwise surface as a bare "invalid token" on every
+        endpoint at once. The key is still good — /device-login alone gets the
+        device back — and only the code says so.
+        """
+        device = store.get_device_by_sid(self.sid)
+        started_at = store.now() - config.SESSION_MAX_AGE_SECONDS - 1
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE devices SET session_started_at = ? WHERE sid = ?",
+                (started_at, self.sid),
+            )
+        expired = jwt.encode(
+            {
+                "uid": self.uid,
+                "sid": self.sid,
+                "sv": device["session_version"],
+                "iat": started_at,
+                "exp": store.now() - 1,
+            },
+            config.JWT_SECRET,
+            algorithm=config.JWT_ALG,
+        )
+        headers = {"Authorization": f"Bearer {expired}"}
+        denied = self.client.get("/api/devices", headers=headers)
+        self.assertEqual(denied.status_code, 401, denied.json)
+        self.assertEqual(denied.json["code"], auth.SESSION_EXPIRED_CODE)
+        # The same expired token inside a session that has NOT hit the cap is
+        # just a dead token, and must stay opaque: it says nothing about why.
+        with store.conn_ctx() as c:
+            c.execute(
+                "UPDATE devices SET session_started_at = ? WHERE sid = ?",
+                (store.now(), self.sid),
+            )
+        opaque = self.client.get("/api/devices", headers=headers)
+        self.assertEqual(opaque.status_code, 401, opaque.json)
+        self.assertNotIn("code", opaque.json)
 
     def test_unverified_registration_endpoint_is_gone(self):
         """Accounts must go through email verification; the old path is removed."""
@@ -2367,6 +2471,26 @@ class ServerSmokeTest(unittest.TestCase):
             self.assertEqual(response.status_code, 400, response.json)
 
 
+    def test_backend_image_runs_unprivileged_and_owns_its_data_volume(self):
+        """The relay ran as root in production until this was pinned.
+
+        Both halves matter and only together: dropping to a user without
+        handing it /data leaves SQLite unable to create the WAL beside the
+        database, which is a dead relay rather than a hardened one.
+        """
+        dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+        directives = [
+            line.split(None, 1)[1].strip()
+            for line in dockerfile.splitlines()
+            if line.startswith("USER ")
+        ]
+        self.assertTrue(directives, "backend image has no USER directive")
+        self.assertNotIn(directives[-1].split(":")[0], {"root", "0"})
+        self.assertIn("chown securemsg:securemsg /data", dockerfile)
+        # The uid is part of the deploy contract: the production volume is
+        # chowned to it by hand, so renumbering here silently breaks the relay.
+        self.assertIn("--uid 10001", dockerfile)
+
     # ----- abuse limits ---------------------------------------------------
 
     def _with_real_limiter(self):
@@ -2438,6 +2562,75 @@ class ServerSmokeTest(unittest.TestCase):
         )
         self.assertEqual(statuses[-1], 429)
         self.assertEqual(send_code.call_count, auth.REGISTER_EMAIL_IP_LIMIT)
+
+    def test_password_reset_requests_are_capped_per_ip_across_addresses(self):
+        """5/min per (IP, address) is 300 messages an hour into one inbox.
+
+        The address has to match the account, which keeps a stranger's inbox
+        out of range — it does nothing to stop the owner's from being buried
+        by anyone who knows the username and address pair.
+        """
+        email = f"{self.username}@example.test"
+        self._with_real_limiter()
+        with mock.patch("emailer.send_code") as send_code:
+            allowed = self.client.post(
+                "/api/password-reset/request",
+                json={"username": self.username, "email": email},
+            )
+            self.assertEqual(allowed.status_code, 200, allowed.json)
+            self.assertEqual(send_code.call_count, 1)
+            # Rotating the address opens a fresh per-address bucket every
+            # time, so this drains the IP budget without ever tripping the
+            # first limit. None of these match an account, so none send mail.
+            for index in range(auth.PASSWORD_RESET_IP_LIMIT - 1):
+                drained = self.client.post(
+                    "/api/password-reset/request",
+                    json={
+                        "username": f"resetdrone{index:03d}",
+                        "email": f"resetdrone{index:03d}@example.test",
+                    },
+                )
+                self.assertEqual(drained.status_code, 200, drained.json)
+            self.assertEqual(send_code.call_count, 1)
+            throttled = self.client.post(
+                "/api/password-reset/request",
+                json={"username": self.username, "email": email},
+            )
+        # The budget is spent, so the real account's inbox is spared…
+        self.assertEqual(send_code.call_count, 1)
+        # …and the refusal stays indistinguishable from the sent case: same
+        # status, same fields, same message, and no Retry-After to leak it.
+        self.assertEqual(throttled.status_code, allowed.status_code)
+        self.assertEqual(sorted(throttled.json), sorted(allowed.json))
+        self.assertEqual(throttled.json["message"], allowed.json["message"])
+        self.assertNotIn("Retry-After", throttled.headers)
+
+    def test_password_reset_never_mails_on_the_request_thread(self):
+        """Identical bodies still leak if only one path pays for them.
+
+        emailer.send_code is a synchronous HTTPS POST to the provider, and it
+        ran only when the (username, email) pair matched a real account — so
+        the response TIME answered the question the body refuses to. The whole
+        account-dependent tail now runs detached, which is why the seam has to
+        be the real one here.
+        """
+        email = f"{self.username}@example.test"
+        delivered = threading.Event()
+        sender = {}
+
+        def record(*args, **kwargs):
+            sender["thread"] = threading.current_thread().ident
+            delivered.set()
+
+        with mock.patch("auth._detach", _REAL_DETACH), \
+                mock.patch("emailer.send_code", side_effect=record):
+            requested = self.client.post(
+                "/api/password-reset/request",
+                json={"username": self.username, "email": email},
+            )
+            self.assertEqual(requested.status_code, 200, requested.json)
+            self.assertTrue(delivered.wait(5), "reset mail was never dispatched")
+        self.assertNotEqual(sender["thread"], threading.current_thread().ident)
 
     def test_missing_keys_is_throttled_and_never_materializes_the_thread(self):
         """The limit used to be applied in Python AFTER selecting every payload."""
