@@ -116,6 +116,15 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             }
         } catch (e: Exception) {
             UpdateCheckResult.Failed(e.message ?: "네트워크 오류")
+        } catch (e: LinkageError) {
+            // A class that fails to initialise is an Error, not an Exception,
+            // so the branch above never saw it: in v0.19.0 a regex the
+            // platform's ICU engine rejects took the whole UpdateNotes object
+            // down inside parseRelease, on a worker thread, and a default SMS
+            // app died on every launch. Checking for updates is optional work
+            // and must never be able to do that again.
+            Log.e("AppUpdater", "update check could not load a class", e)
+            UpdateCheckResult.Failed("업데이트 확인 실패 (내부 오류)")
         }
     }
 

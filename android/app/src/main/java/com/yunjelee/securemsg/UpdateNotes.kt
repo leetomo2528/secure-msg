@@ -42,11 +42,19 @@ object UpdateNotes {
     private val ITALIC = Regex("(?<!\\*)\\*(?!\\s)([^*\\n]+?)\\*")
     // Underscore emphasis is boundary-guarded: without it an identifier such as
     // KEY_PENDING_UPDATE, which release notes are full of, loses its middle.
-    // (?U) is what extends that guard past ASCII: java.util.regex leaves \w as
-    // [a-zA-Z0-9_] by default, so every Hangul neighbour satisfies both
-    // lookarounds and 설정_파일_이름 — or a URL path — loses its underscores.
-    private val BOLD_UNDER = Regex("(?U)(?<![\\w_])__(.+?)__(?!\\w)")
-    private val ITALIC_UNDER = Regex("(?U)(?<![\\w_])_(?!\\s)([^_\\n]+?)_(?!\\w)")
+    // The guard has to reach past ASCII, or every Hangul neighbour satisfies
+    // both lookarounds and 설정_파일_이름 — or a URL path — loses its underscores;
+    // WORD below is how, and why it is not \w.
+    /**
+     * A word character spelled out as Unicode properties. Android's
+     * java.util.regex is ICU, which has no (?U) flag — the v0.19.0 build
+     * used one and every launch died in this object's static initialiser,
+     * while the JVM unit tests passed. \\p{L}\\p{N}\\p{M} read the same on
+     * both engines, so a Korean identifier keeps its underscores everywhere.
+     */
+    private const val WORD = "[\\p{L}\\p{N}\\p{M}_]"
+    private val BOLD_UNDER = Regex("(?<!$WORD)__(.+?)__(?!$WORD)")
+    private val ITALIC_UNDER = Regex("(?<!$WORD)_(?!\\s)([^_\\n]+?)_(?!$WORD)")
 
     /**
      * Markdown in, notification text out. Empty when [raw] carries nothing

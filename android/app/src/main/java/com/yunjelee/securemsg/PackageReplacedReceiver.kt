@@ -79,7 +79,7 @@ class PackageReplacedReceiver : BroadcastReceiver() {
         InstallResultReceiver.cancelConfirmNotification(context)
         // Read off the entry loaded above: clearing dropped the only persisted
         // copy of the notes, and this is the last moment they exist.
-        postUpdatedNotification(context, UpdateNotes.format(pending.info.notes))
+        postUpdatedNotification(context, formatNotesSafely(pending.info.notes))
     }
 
     /**
@@ -134,3 +134,23 @@ class PackageReplacedReceiver : BroadcastReceiver() {
         const val DONE_ID = 3
     }
 }
+
+
+/**
+ * The release notes are decoration on a notification that fires inside a
+ * BroadcastReceiver, and an uncaught throwable in a receiver takes the whole
+ * process with it. UpdateNotes once failed in its static initialiser on the
+ * platform's ICU regex engine (v0.19.0) — a LinkageError, which no
+ * `catch (Exception)` sees — so the formatter is fenced here and a bad
+ * pattern degrades to the title-only notification instead of a dead app.
+ */
+private fun formatNotesSafely(raw: String): String =
+    try {
+        UpdateNotes.format(raw)
+    } catch (e: RuntimeException) {
+        Log.e("PackageReplacedReceiver", "release notes could not be formatted", e)
+        ""
+    } catch (e: LinkageError) {
+        Log.e("PackageReplacedReceiver", "release notes formatter failed to load", e)
+        ""
+    }

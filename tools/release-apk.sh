@@ -29,7 +29,11 @@ for f in "$LINEAGE" "$KS"; do
 done
 
 cd "$ANDROID_DIR"
-./gradlew :app:assembleRelease -q
+# Always a clean build. kotlinc inlines BuildConfig.VERSION_NAME at every use
+# site, and an incremental assembleRelease once shipped a dex whose field said
+# 0.20.0 while LoginScreen still carried 0.17.0 and the updater 0.19.0 — the
+# updater would have judged its own release "newer" and reinstalled it forever.
+./gradlew :app:clean :app:assembleRelease -q
 
 UNSIGNED="app/build/outputs/apk/release/app-release-unsigned.apk"
 OUT="app/build/outputs/apk/release/securemsg-release.apk"
@@ -60,4 +64,25 @@ cp -f "$UNSIGNED" "$OUT"
   "$OUT"
 
 "$APKSIGNER" verify --print-certs --min-sdk-version 31 "$OUT"
+
+# Prove the clean build did its job: no version literal other than the one in
+# build.gradle.kts may remain inlined in this app's own classes. (0.11.1 is a
+# design-preview string in Theme.kt, not a version.)
+DEXDUMP="$(dirname "$APKSIGNER")/dexdump"
+VERSION="$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')"
+TMPD="$(mktemp -d)"
+unzip -o -q "$OUT" 'classes*.dex' -d "$TMPD"
+STALE="$("$DEXDUMP" -d "$TMPD"/classes*.dex 2>/dev/null | awk -v want="$VERSION" '
+  /Class descriptor/ { inapp = ($0 ~ /Lcom\/yunjelee\/securemsg\//) }
+  inapp && /const-string/ && match($0, /"0\.[0-9]+\.[0-9]+"/) {
+    v = substr($0, RSTART + 1, RLENGTH - 2)
+    if (v != want && v != "0.11.1") stale[v] = 1
+  }
+  END { for (v in stale) printf "%s ", v }')"
+rm -rf "$TMPD"
+if [ -n "$STALE" ]; then
+  echo "stale inlined version literals in app dex: $STALE (expected only $VERSION)" >&2
+  exit 1
+fi
+echo "dex version literals OK ($VERSION)"
 echo "signed: $OUT"
