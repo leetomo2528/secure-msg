@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,6 +34,27 @@ object HistoryShare {
 
     /** Server allows 1..1000 per offline pull; 500 matches the sync loop. */
     private const val PULL_LIMIT = 500
+
+    /**
+     * A backfill spends one missing-keys probe plus at least one messages-pull
+     * per conversation, and those are exactly what the relay's per-minute sync
+     * budget counts. Unpaced, an account with a few hundred conversations spent
+     * that budget partway down the list; every conversation after it ended in a
+     * 429 the walk reported as a plain failure, and the retry the user was told
+     * to run burned the same budget on the same head of the list, so the tail
+     * was never reachable at all. The pace keeps a normal run under the
+     * tightest budget a deployed relay has enforced (2/s per scope).
+     */
+    private const val CONVERSATION_PACE_MS = 600L
+
+    /**
+     * Wait between retries of a rate-limited call. Retry-After never reaches
+     * the parsed body, so the wait is fixed and repeated; [RATE_LIMIT_RETRIES]
+     * of them outlast the relay's 60 s window, which is what has to slide past
+     * before the budget frees up.
+     */
+    private const val RATE_LIMIT_BACKOFF_MS = 5_000L
+    private const val RATE_LIMIT_RETRIES = 12
 
     data class Outcome(
         val ok: Boolean,
@@ -107,6 +129,7 @@ object HistoryShare {
         onProgress?.invoke(0, cids.size)
         cids.forEachIndexed { index, cid ->
             coroutineContext.ensureActive()
+            if (index > 0) delay(CONVERSATION_PACE_MS)
             val summary = shareConversation(api, cid, targetSid) { row ->
                 rewrapRow(row, pins, creds, target.pubKey)
             }
@@ -148,14 +171,20 @@ object HistoryShare {
      * [rewrap] returns null for a row this device cannot open; those are
      * counted, not retried. Every relay failure ends the conversation with an
      * error instead — a transient HTTP error is not evidence about a key.
+     * A spent sync budget is the one exception: it says nothing about this
+     * conversation, so it is waited out rather than reported.
+     *
+     * [backoffMs] is that wait; only a test shortens it, there being no
+     * virtual-time dispatcher on the unit-test classpath.
      */
     internal suspend fun shareConversation(
         api: RelayApi,
         cid: String,
         targetSid: String,
+        backoffMs: Long = RATE_LIMIT_BACKOFF_MS,
         rewrap: suspend (JSONObject) -> CryptoUtil.EnvelopeKey?,
     ): ConversationSummary {
-        val probe = api.missingKeys(cid, targetSid)
+        val probe = pastRateLimit(backoffMs) { api.missingKeys(cid, targetSid) }
         if (!probe.optBoolean("ok")) {
             return ConversationSummary(0, 0, probe.optString("error", "missing-keys 조회 실패"))
         }
@@ -175,7 +204,7 @@ object HistoryShare {
         // Returns an error string, or null when the batch was accepted.
         suspend fun flush(): String? {
             if (batch.isEmpty()) return null
-            val result = api.shareKeys(cid, targetSid, batch.toList())
+            val result = pastRateLimit(backoffMs) { api.shareKeys(cid, targetSid, batch.toList()) }
             batch.clear()
             if (!result.optBoolean("ok")) return result.optString("error", "share-keys 실패")
             // "skipped" from the server means the target already had that key
@@ -186,7 +215,7 @@ object HistoryShare {
 
         while (true) {
             coroutineContext.ensureActive()
-            val response = api.fetchMessages(cid, cursor, PULL_LIMIT)
+            val response = pastRateLimit(backoffMs) { api.fetchMessages(cid, cursor, PULL_LIMIT) }
             if (!response.optBoolean("ok")) {
                 return ConversationSummary(
                     shared, skipped, response.optString("error", "메시지 조회 실패"),
@@ -221,6 +250,25 @@ object HistoryShare {
         }
         flush()?.let { return ConversationSummary(shared, skipped, it) }
         return ConversationSummary(shared, skipped, null)
+    }
+
+    /**
+     * [call] repeated until the relay stops answering 429, or until the retries
+     * run out and the caller gets the 429 body to report.
+     */
+    private suspend fun pastRateLimit(
+        backoffMs: Long,
+        call: () -> JSONObject,
+    ): JSONObject {
+        var attempts = 0
+        while (true) {
+            coroutineContext.ensureActive()
+            val response = call()
+            if (response.optInt("_http_status") != 429) return response
+            if (attempts >= RATE_LIMIT_RETRIES) return response
+            attempts += 1
+            delay(backoffMs)
+        }
     }
 
     private suspend fun rewrapRow(
@@ -331,7 +379,7 @@ object HistoryShareRunner {
         // directory — legacy TOFU included — may name a device the relay chose,
         // and sharing hands that device every message this one can open.
         val view = DeviceSecurityController(
-            RelayTrustedDeviceApi(api, creds.uid.toLong()), creds, DeviceTrustRepository(db),
+            RelayTrustedDeviceApi(api), creds, DeviceTrustRepository(db),
         ).refresh()
         if (view.serverUnsupported || view.selfPending || view.error != null ||
             view.trustWarning != null

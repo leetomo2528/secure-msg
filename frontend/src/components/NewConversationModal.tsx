@@ -3,7 +3,9 @@ import { useStore } from "../store/useStore";
 import { Segmented } from "./ui";
 
 export default function NewConversationModal() {
-  const { newConversation, newSmsConversation, selectConversation } = useStore();
+  const newConversation = useStore((s) => s.newConversation);
+  const newSmsConversation = useStore((s) => s.newSmsConversation);
+  const selectConversation = useStore((s) => s.selectConversation);
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<"sms" | "chat">("sms");
   const [members, setMembers] = useState("");

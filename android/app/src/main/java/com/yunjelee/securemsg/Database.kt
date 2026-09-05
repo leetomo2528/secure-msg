@@ -3,6 +3,7 @@ package com.yunjelee.securemsg
 import androidx.room.*
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "sms_threads")
@@ -19,6 +20,20 @@ data class SmsThread(
     /** Contact name shared through the relay by one of this account's devices. */
     val syncedContactName: String? = null,
 ) {
+    companion object {
+        /**
+         * Namespace for a conversation this device invented before the relay
+         * assigned one. The prefix is load-bearing well beyond thread lookup —
+         * [ThreadDao.provisionalByPhone], ContactSync's upload filter and
+         * IncomingNotificationPolicy.conversationGroup all read it — so the
+         * format has one producer instead of a literal at every creation site.
+         */
+        const val LOCAL_CID_PREFIX = "local_"
+
+        fun newLocalCid(): String =
+            LOCAL_CID_PREFIX + UUID.randomUUID().toString().replace("-", "")
+    }
+
     val displayName: String
         get() = localContactName?.takeIf { it.isNotBlank() }
             ?: syncedContactName?.takeIf { it.isNotBlank() }
@@ -134,6 +149,12 @@ data class TrustDirectoryState(
     val directoryHash: String,
     val safetyNumber: String,
     val updatedAt: Long,
+    // The accepted security mode has to survive restarts, or a relay that once
+    // served verified_v2 could fall back to legacy TOFU and have its unsigned
+    // pins accepted. Null means the row predates this column: read as "no mode
+    // pinned yet" so the first proof after the upgrade records it. Defaulting to
+    // verified_v2 instead would lock out an account still on legacy TOFU.
+    val securityMode: String? = null,
 )
 
 /** Atomic idempotency claim for relay messages that may trigger carrier SMS. */
@@ -213,7 +234,7 @@ interface ThreadDao {
     @Query("SELECT * FROM sms_threads WHERE cid = :cid")
     suspend fun get(cid: String): SmsThread?
 
-    @Query("SELECT * FROM sms_threads WHERE phoneNumber = :phone ORDER BY CASE WHEN cid LIKE 'local_%' THEN 1 ELSE 0 END, lastSeq DESC LIMIT 1")
+    @Query("SELECT * FROM sms_threads WHERE phoneNumber = :phone ORDER BY CASE WHEN cid LIKE 'local\\_%' ESCAPE '\\' THEN 1 ELSE 0 END, lastSeq DESC LIMIT 1")
     suspend fun getByPhone(phone: String): SmsThread?
 
     @Query("SELECT * FROM sms_threads")
@@ -233,9 +254,6 @@ interface ThreadDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(thread: SmsThread)
-
-    @Update
-    suspend fun update(thread: SmsThread)
 
     @Query("DELETE FROM sms_threads WHERE cid = :cid")
     suspend fun deleteByCid(cid: String)
@@ -273,15 +291,15 @@ interface MessageDao {
     @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE serverKey = :serverKey)")
     suspend fun hasServerKey(serverKey: String): Boolean
 
+    @Query("SELECT * FROM messages WHERE serverKey = :serverKey")
+    suspend fun getByServerKey(serverKey: String): MessageRow?
+
     /** One-shot snapshot of a conversation; the dedupe index a rebuild works against. */
     @Query("SELECT * FROM messages WHERE cid = :cid")
     suspend fun getForCid(cid: String): List<MessageRow>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(msg: MessageRow): Long
-
-    @Query("UPDATE messages SET seq = :seq WHERE id = :id")
-    suspend fun updateSeq(id: Long, seq: Int)
 
     @Query("UPDATE messages SET seq = :seq, serverKey = cid || ':' || :seq, contentType = :contentType, subject = :subject, attachmentsJson = :attachmentsJson WHERE id = :id")
     suspend fun updateRelayResult(
@@ -306,9 +324,6 @@ interface MessageDao {
     @Query("DELETE FROM messages")
     suspend fun clearAll()
 
-    @Query("UPDATE messages SET blocked = :blocked WHERE cid = :cid AND seq = :seq")
-    suspend fun setBlocked(cid: String, seq: Int, blocked: Boolean)
-
     @Query("UPDATE messages SET carrierStatus = :status, carrierError = :error, carrierUpdatedAt = :updatedAt WHERE id = :id")
     suspend fun setCarrierStatusById(
         id: Long,
@@ -316,6 +331,23 @@ interface MessageDao {
         error: String?,
         updatedAt: Long = System.currentTimeMillis(),
     )
+
+    /**
+     * Mirror an outbox/receipt carrier state onto the rendered row.
+     *
+     * Carrier callbacks are not ordered: a late SENT must not pull a row back
+     * from DELIVERED, and a row the relay path has not inserted yet is written
+     * through so the update lands as soon as it exists. Transactional like
+     * [DeviceCacheDao.pinOrReject] because the read and the write are one
+     * decision and a second callback may land between them.
+     */
+    @Transaction
+    suspend fun advanceCarrierStatus(id: Long, status: String, error: String?) {
+        val local = getById(id)
+        if (local == null || CarrierState.canAdvance(local.carrierStatus, status)) {
+            setCarrierStatusById(id, status, error)
+        }
+    }
 
     @Query("UPDATE messages SET carrierStatus = :status, carrierError = :error, carrierUpdatedAt = :updatedAt WHERE serverKey = :cid || ':' || :seq")
     suspend fun setCarrierStatus(
@@ -325,9 +357,6 @@ interface MessageDao {
         error: String?,
         updatedAt: Long = System.currentTimeMillis(),
     )
-
-    @Query("UPDATE messages SET cid = :newCid WHERE cid = :oldCid AND serverKey IS NULL")
-    suspend fun moveProvisionalConversation(oldCid: String, newCid: String)
 
     /**
      * Merge a stale local SMS thread into the currently authoritative server
@@ -363,7 +392,7 @@ interface MessageDao {
      *
      * LIKE, not FTS. An FTS mirror would have to be re-synchronized from each
      * writer above (insert, updateRelayResult, moveConversation,
-     * moveProvisionalConversation, deleteServerDuplicate, setBlocked, clearAll)
+     * deleteServerDuplicate, clearAll)
      * or from triggers Room does not know about, and it would still be wrong
      * for the content: FTS4's tokenizer breaks on spaces, and Korean puts no
      * space at a morpheme boundary, so "검색" would not match "재검색합니다".
@@ -438,9 +467,6 @@ interface BlockedSenderDao {
     @Query("SELECT * FROM blocked_senders")
     suspend fun getAll(): List<BlockedSender>
 
-    @Query("SELECT EXISTS(SELECT 1 FROM blocked_senders WHERE phoneNumber = :phone)")
-    suspend fun contains(phone: String): Boolean
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(sender: BlockedSender)
 
@@ -452,9 +478,6 @@ interface BlockedSenderDao {
 interface ProcessedSmsDao {
     @Query("SELECT EXISTS(SELECT 1 FROM processed_sms WHERE providerEpoch = :providerEpoch AND providerId = :providerId)")
     suspend fun contains(providerEpoch: Long, providerId: Long): Boolean
-
-    @Query("SELECT * FROM processed_sms WHERE providerEpoch = :providerEpoch AND providerId = :providerId")
-    suspend fun get(providerEpoch: Long, providerId: Long): ProcessedSms?
 
     @Query("SELECT * FROM processed_sms WHERE providerId = :providerId ORDER BY providerEpoch DESC")
     suspend fun history(providerId: Long): List<ProcessedSms>
@@ -526,9 +549,6 @@ interface RelayReceiptDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun claim(receipt: RelayReceipt): Long
 
-    @Query("DELETE FROM relay_receipts WHERE cid = :cid AND seq = :seq")
-    suspend fun release(cid: String, seq: Int)
-
     @Query("SELECT * FROM relay_receipts WHERE cid = :cid AND seq = :seq")
     suspend fun get(cid: String, seq: Int): RelayReceipt?
 
@@ -552,7 +572,14 @@ interface RelayReceiptDao {
 
 @Dao
 interface RelayOutboxDao {
-    @Query("SELECT * FROM relay_outbox WHERE (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) ORDER BY createdAt ASC LIMIT :limit")
+    /**
+     * `relayState != 'unsendable'` is what keeps this page moving. It is a
+     * fixed-size oldest-first window, so a row that can only ever be deferred —
+     * an SMS from an alphanumeric sender has no address to relay to — is not
+     * just wasted work: a hundred of them fill the page and the outbox stops
+     * relaying anything newer, in either direction, forever.
+     */
+    @Query("SELECT * FROM relay_outbox WHERE relayState != 'unsendable' AND (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) ORDER BY createdAt ASC LIMIT :limit")
     suspend fun pending(unknownCutoff: Long, limit: Int = 100): List<RelayOutbox>
 
     @Query("SELECT * FROM relay_outbox WHERE mid = :mid LIMIT 1")
@@ -588,8 +615,13 @@ interface RelayOutboxDao {
     @Query("UPDATE relay_outbox SET attempts = attempts + 1, lastError = :error WHERE id = :id")
     suspend fun recordAttempt(id: Long, error: String?)
 
-    @Query("UPDATE relay_outbox SET relayState = 'sent', lastError = NULL WHERE id = :id")
-    suspend fun markSent(id: Long)
+    /**
+     * Retire a row no retry can prepare. relayState is free-form TEXT, so the
+     * new value needs no schema change; the local message and its plaintext
+     * stay, only the relay attempt stops.
+     */
+    @Query("UPDATE relay_outbox SET relayState = 'unsendable', lastError = :error WHERE id = :id")
+    suspend fun markUnsendable(id: Long, error: String)
 
     @Query("UPDATE relay_outbox SET relayState = 'sent', serverSeq = :serverSeq, payload = '', plaintext = '', subject = NULL, attachmentsJson = NULL, lastError = NULL WHERE id = :id")
     suspend fun markRelaySent(id: Long, serverSeq: Int)
@@ -617,9 +649,6 @@ interface RelayOutboxDao {
 interface ProcessedMmsDao {
     @Query("SELECT EXISTS(SELECT 1 FROM processed_mms WHERE providerEpoch = :providerEpoch AND providerId = :providerId)")
     suspend fun contains(providerEpoch: Long, providerId: Long): Boolean
-
-    @Query("SELECT * FROM processed_mms WHERE providerEpoch = :providerEpoch AND providerId = :providerId")
-    suspend fun get(providerEpoch: Long, providerId: Long): ProcessedMms?
 
     @Query("SELECT * FROM processed_mms WHERE providerId = :providerId ORDER BY providerEpoch DESC")
     suspend fun history(providerId: Long): List<ProcessedMms>
@@ -662,9 +691,6 @@ interface ProcessedCarrierEventDao {
     @Query("SELECT EXISTS(SELECT 1 FROM processed_carrier_events WHERE kind = :kind AND eventKey = :eventKey)")
     suspend fun contains(kind: String, eventKey: String): Boolean
 
-    @Query("SELECT * FROM processed_carrier_events WHERE kind = :kind AND eventKey = :eventKey")
-    suspend fun get(kind: String, eventKey: String): ProcessedCarrierEvent?
-
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(row: ProcessedCarrierEvent): Long
 }
@@ -702,7 +728,7 @@ interface CarrierPartResultDao {
         CarrierProviderState::class,
         ProcessedCarrierEvent::class,
     ],
-    version = 12,
+    version = 13,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -739,6 +765,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_9_10,
                     MIGRATION_10_11,
                     MIGRATION_11_12,
+                    MIGRATION_12_13,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -1009,6 +1036,17 @@ abstract class AppDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS index_messages_createdAt " +
                         "ON messages(createdAt)",
                 )
+            }
+        }
+
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Persists the accepted directory security mode so a relay cannot
+                // downgrade verified_v2 back to legacy TOFU across a restart. ALTER
+                // rather than a rebuild because dropping this table would discard
+                // the pin store on a live phone and silently re-TOFU the account;
+                // the added column stays NULL, i.e. "no mode pinned yet".
+                db.execSQL("ALTER TABLE trust_directory_state ADD COLUMN securityMode TEXT")
             }
         }
     }

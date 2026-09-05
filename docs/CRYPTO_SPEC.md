@@ -11,7 +11,7 @@
 | 기기 암호키쌍 (box) | X25519 (`crypto_box_keypair`) | 기기 최초 등록 | 웹: IndexedDB / Android: Keystore AES-256-GCM 암호문(DataStore) | 공개키만 |
 | 기기 서명키쌍 (sign) | Ed25519 (`crypto_sign_keypair`) | 기기 최초 등록 | 위와 동일 | 공개키만 |
 | message key | 대칭 32바이트 (`randombytes_buf`) | 메시지 전송마다 | envelope 안에 수신기기 공개키로 감싸 전달, 발신 기기 메모리에서 폐기 | wrapped 형태만 |
-| JWT (HS256) | 서버 시크릿으로 서명 | 로그인·기기 등록 시 | 웹: 메모리 전용 / Android: Keystore 암호문 | 토큰 자체 |
+| JWT (HS256) | 서버 시크릿으로 서명 | 로그인·기기 등록·토큰 갱신 시 | 웹: 메모리 전용 / Android: Keystore 암호문 | 토큰 자체 |
 
 - 개인키는 어떤 경로로도 서버로 전송되지 않는다. 공개키는 기기 등록 시 1회 업로드되고 DB trigger(`devices_keys_immutable`)로 이후 변경이 불가능하다.
 - Android의 자격증명은 Android Keystore의 비내보내기 AES-256-GCM 키로 봉인되며 AAD로 패키지 무결성을 묶는다. `allowBackup=false`와 백업 제외 규칙으로 클라우드/adb 백업 경로를 차단한다.
@@ -30,15 +30,17 @@
 
 ```
 plaintext ── secretbox(XSalsa20-Poly1305) ──► ct, nonce(24B 랜덤)
-message_key(32B) ── box(X25519-XSalsa20-Poly1305) ──► keys[sid] = { ek, n(24B 랜덤) }
-envelope = { ct, nonce, keys: { device_sid: {ek, n} } }
+message_key(32B) ── box(X25519-XSalsa20-Poly1305) ──► keys[sid] = { ek, n(24B 랜덤), by? }
+envelope = { ct, nonce, keys: { device_sid: {ek, n, by?} } }
 ```
 
 - **AEAD**: `crypto_secretbox_easy` (XSalsa20-Poly1305). MAC이 붙고 1비트 변조 시 복호화 실패(회귀 테스트 `keys.test.ts`).
 - **키 래핑**: 메시지마다 새 message key를 생성하고, 수신·발신 각 기기의 X25519 공개키에 대해 `crypto_box_easy`로 개별 감싼다. 서버와 수신자가 아닌 기기는 message key에 접근할 수 없다.
 - **논스 정책**: `nonce`와 `n`은 매번 24바이트 랜덤 생성. 논스 원장은 사용하지 않는다 — 24바이트 랜덤 논스의 충돌 확률(≈2⁻¹⁰⁰ 이하, 메시지 수 기준)이 무시 가능하고 message key 자체가 메시지마다 새로 생성되어 같은 키·논스 재사용이 구조적으로 발생하지 않는다.
 - **송신자 인증(대체 AAD)**: secretbox는 별도 AAD 파라미터가 없으므로, 송신자 바인딩은 (a) wrapped key의 X25519 DH가 송신 기기 개인키 없이는 생성될 수 없다는 성질과 (b) 수신 클라이언트가 서버 제공 `sender_pub_key` 스냅샷을 **서명된 기기 디렉터리 proof**의 해당 기기 키와 대조한 뒤에만 복호화에 사용하는 `verifiedSenderPublicKey` 검증으로 달성한다. 디렉터리와 불일치하면 `TrustViolationError`로 전체 동기화가 중단(fail-closed)된다.
-- **서버 제약**: 서버는 envelope를 `{ct, nonce, keys}` 구조 검증, 크기 상한(기본 1.5MB), `keys`의 sid 집합이 대화의 승인 기기 집합과 정확히 일치하는지만 확인하고 내용을 보지 않는다.
+- **재래핑 표식 `by`**(v0.14.0): 나중에 등록한 기기에 과거 내역을 넘길 때, 이미 승인된 기기가 자기 키로 message key를 열어 대상 공개키로 다시 감싸고 그 항목에 자기 `sid`를 `by`로 남긴다. 수신 측은 `by`가 있는 항목을 발신자 키가 아니라 **로컬에 고정된 디렉터리에서 찾은 그 wrapper의 공개키**로 연다. `by`를 로컬에서 해석하지 못하면 발신자 키로 폴백하지 않고 복호화를 거부한다 — 서버가 임의의 wrapper를 지목하고 그 공개키까지 제공할 수 있다면, 그것은 서버가 개인키를 쥔 키를 지목하는 것이고 고정 디렉터리가 막으려는 사칭 그 자체다.
+- **키 공유 경로**: `/conversation/<cid>/missing-keys`가 대상이 아직 못 여는 seq를 알려주고, `/conversation/<cid>/share-keys`가 재래핑한 항목을 올린다. 대상은 **호출자 자기 계정의 승인된 다른 기기**여야 하며, 서버는 없는 `sid`만 추가하고 기존 항목은 덮어쓰지 않는다(덮어쓰기는 해당 기기에 대한 서비스 거부가 된다). 항목당 `ek`는 48바이트, `n`은 24바이트로 길이가 고정되고 요청당 200개까지다.
+- **서버 제약**: 서버는 envelope를 `{ct, nonce, keys}` 구조 검증, 크기 상한(기본 1.5MB), `keys`의 sid 집합이 대화의 승인 기기 집합과 정확히 일치하는지만 확인하고 내용을 보지 않는다. 이 정확 일치는 **전송 시점** 검사이고, 그 뒤 share-keys가 같은 envelope에 나중에 등록한 기기의 `sid`를 추가할 수 있다.
 
 ## 4. 순서·재생 방어
 
@@ -51,6 +53,8 @@ envelope = { ct, nonce, keys: { device_sid: {ek, n} } }
 
 - 기기 승인/폐기/보안 업그레이드는 도메인 분리된 정규화 명세문에 대한 Ed25519 서명으로 수행되고, 그 서명이 서버 DB에 인증서로 보관된다. 기기·계정 키 변경은 불가(immutable trigger)하다.
 - JWT에는 `{uid, sid, sv}`가 담긴다. `sv`(세션 버전)는 REST 요청·Socket.IO 연결·이벤트마다 DB 현재값과 대조한다.
+- **슬라이딩 갱신**(v0.12.3): `POST /api/token-refresh`가 아직 유효한 토큰을 새 토큰으로 교체한다. Android 브리지는 릴레이 접속에 성공할 때 6시간에 한 번, 웹은 로그인된 앱 로드마다 호출한다. 유효한 토큰이 이미 가진 권한 이상을 주지 않으며, 세션 버전이 회전됐거나 기기가 폐기됐으면 갱신도 같이 거부된다. TTL은 `SECUREMSG_JWT_TTL`(기본 604800초 = 7일).
+- **세션 절대 상한**(v0.19.0): `exp`는 `session_started_at + SECUREMSG_SESSION_MAX_AGE`(기본 15552000초 = 180일)로 잘린다. 기준 시각은 클라이언트가 돌려주는 `iat`가 아니라 기기 행의 컬럼이다 — 이 상한은 탈취된 토큰을 견디려고 있는 것이므로 나이를 클라이언트가 주장하게 두지 않는다. 상한을 넘으면 `/token-refresh`가 거부하고, 기기는 이미 보관 중인 기기 키로 `/device-login`을 다시 수행한다(같은 `sid`·같은 키쌍, 재승인·이력 손실 없음). `exp`가 잘리므로 상한을 넘은 토큰은 모든 엔드포인트에서 만료로 보이는데, 그 401은 서명을 다시 확인해 `session_expired` 코드로 구분해 준다. 설정은 `SECUREMSG_JWT_TTL <= SECUREMSG_SESSION_MAX_AGE <= 2년`을 만족해야 하며 아니면 기동을 거부한다.
 - 폐기 정책:
   - 로그아웃 → 해당 기기 세션 버전 회전(토큰·소켓 즉시 무효, 기기 키는 보존해 재로그인 재사용).
   - 기기 폐기 → 승인 디렉터리에서 제외, 세션 버전 회전, 보안 epoch 증가, 활성 소켓 종료. 이후 fan-out에서 배제되지만 과거 envelope의 wrapped key는 남으므로 **폐기 기기가 과거에 확보한 평문/암호문을 회수하지는 못 한다**.

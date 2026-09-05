@@ -42,8 +42,6 @@ import {
   clearSessionData,
   clearDeviceForReregistration,
   clearAllData,
-  cacheDevice,
-  cacheDevices,
   putMessage,
   listMessages,
   listAllMessages,
@@ -57,10 +55,12 @@ import {
   removeBlockKeyword,
   listBlockKeywords,
   putBlockKeywordRow,
+  blockKeywordRejection,
   addBlockedSender,
   removeBlockedSender,
   listBlockedSenders,
   putBlockedSenderRow,
+  blockedSenderRejection,
   replaceBlockRules,
   type MessageRow,
   type BlockRow,
@@ -71,8 +71,8 @@ import {
   listTrustedDevices,
   TrustViolationError,
 } from "./db";
-import { applyBlock, matchBlockKeywords } from "./blocklist";
-import { normalizePhone, ownedSmsPhone } from "./conversationPolicy";
+import { matchBlockKeywords } from "./blocklist";
+import { normalizePhone, ownedSmsPhone, SMS_PHONE_RE } from "./conversationPolicy";
 import { sessionCoordinator } from "./sessionCoordinator";
 import {
   decodeRelayContent,
@@ -92,6 +92,8 @@ import {
 export { decodeRelayContent };
 
 const NOTIFY_PREF_KEY = "securemsg-notify";
+
+const SESSION_EXPIRED_ERROR = "로그인이 만료되었거나 이 기기가 폐기되었습니다. 다시 로그인하세요.";
 
 /** Set by loginExistingDevice when the server answered 404/403 — the stored
  * device is gone (revoked) and re-registration with a fresh keypair is safe.
@@ -238,14 +240,7 @@ export const useStore = create<State>((set, get) => ({
     api.onUnauthorized = () => {
       const context = captureSecurityContext();
       if (!canUseCrypto(context)) return;
-      void useStore.getState().logout().then(() => {
-        const state = useStore.getState();
-        if (state.securityGeneration === context.generation + 1 && !state.authed) {
-          useStore.setState({
-            error: "로그인이 만료되었거나 이 기기가 폐기되었습니다. 다시 로그인하세요.",
-          });
-        }
-      });
+      logoutExpiredSession(context);
     };
     try {
       await initCrypto();
@@ -405,21 +400,7 @@ export const useStore = create<State>((set, get) => ({
     const approvalPending = r.trust_state === "pending";
     const registeredSid = r.sid;
     const meta = { username, uid: r.uid!, sid: registeredSid, deviceName, keypair: kp };
-    const installed = await sessionCoordinator.exclusive(async () => {
-      if (get().securityGeneration !== attemptGeneration) return false;
-      await setMeta(meta);
-      await cacheDevice({ sid: registeredSid, user_id: r.uid!, name: deviceName, pub_key: kp.box.pk });
-      if (get().securityGeneration !== attemptGeneration) return false;
-      api.setToken(r.token!);
-      set((state) => ({
-        authed: true, approvalPending, securityLocked: false, error: null, ...meta,
-        securityGeneration: state.securityGeneration + 1,
-      }));
-      return true;
-    });
-    if (!installed) return false;
-    if (!approvalPending) await postLogin(captureSecurityContext());
-    return true;
+    return await installSession(attemptGeneration, meta, r.token, approvalPending);
   },
 
   loginExistingDevice: async (username, password) => {
@@ -452,24 +433,7 @@ export const useStore = create<State>((set, get) => ({
       return false;
     }
     const approvalPending = r.trust_state === "pending";
-    const installed = await sessionCoordinator.exclusive(async () => {
-      if (get().securityGeneration !== attemptGeneration) return false;
-      // A concurrent forget-device cleanup may have removed this row after we
-      // read it but before the remote response arrived. Reinstall it atomically
-      // with the authenticated in-memory session.
-      await setMeta(meta);
-      if (get().securityGeneration !== attemptGeneration) return false;
-      api.setToken(r.token!);
-      set((state) => ({
-        authed: true, approvalPending, securityLocked: false, username: meta.username, uid: meta.uid, sid: meta.sid,
-        deviceName: meta.deviceName, keypair: meta.keypair, error: null,
-        securityGeneration: state.securityGeneration + 1,
-      }));
-      return true;
-    });
-    if (!installed) return false;
-    if (!approvalPending) await postLogin(captureSecurityContext());
-    return true;
+    return await installSession(attemptGeneration, meta, r.token, approvalPending);
   },
 
   refreshPendingApproval: async () => {
@@ -596,7 +560,7 @@ export const useStore = create<State>((set, get) => ({
     if (!sameContext(context)) return null;
     const username = get().username;
     const normalized = normalizePhone(phone);
-    if (!username || !/^\+?[0-9*#]{3,24}$/.test(normalized)) {
+    if (!username || !SMS_PHONE_RE.test(normalized)) {
       set({ error: "유효한 전화번호를 입력하세요" });
       return null;
     }
@@ -621,23 +585,22 @@ export const useStore = create<State>((set, get) => ({
     // A→B→A click sequence land one conversation's messages under another's
     // header. Guard the async result against the still-active conversation.
     set({ activeCid: cid, activeMessages: [] });
-    const rows = await listMessages(cid);
+    await refreshActiveMessages(cid, () => sameContext(context));
     if (!sameContext(context)) return;
-    if (get().activeCid === cid) set({ activeMessages: rows });
     await queueConversationSync(cid, context);
   },
 
   syncConversation: async (cid, suppliedContext) => {
     const context = suppliedContext ?? captureSecurityContext();
     if (!canUseCrypto(context)) return;
-    // 1. Fetch + cache member devices so we can decrypt (need sender pubkeys).
+    // 1. Fetch the member devices: the key directory proof below is verified
+    // against this list, and it names which SIDs are the carrier gateway.
     const mr = await api.convMembers(cid);
     if (!canUseCrypto(context)) return;
     if (!mr.ok || !mr.members) {
       if (sameContext(context)) set({ error: mr.error || "대화 기기 목록을 불러오지 못했습니다" });
       return;
     }
-    const members = mr.members;
     try {
       await verifyConversationKeyDirectory(mr, () => canUseCrypto(context));
       if (!canUseCrypto(context)) return;
@@ -646,10 +609,6 @@ export const useStore = create<State>((set, get) => ({
       return;
     }
     if (!canUseCrypto(context)) return;
-    const cached = await runSessionEffect(context, () => cacheDevices(members.map((m) => ({
-      sid: m.sid, user_id: m.user_id, pub_key: m.pub_key, sig_pub: m.sig_pub,
-    }))));
-    if (!cached) return;
     // History shared by another of our own devices is sealed by THAT device, so
     // it opens with the wrapper's key rather than the sender's. Only a pinned
     // key is accepted: a relay that could name a wrapper and hand over the
@@ -670,6 +629,8 @@ export const useStore = create<State>((set, get) => ({
     const blockedSenders = await listBlockedSenders();
     if (!canUseCrypto(context)) return;
     const senderBlocked = smsPhone != null && matchesBlockedSender(smsPhone, blockedSenders);
+    const blockKeywords = await listBlockKeywords();
+    if (!canUseCrypto(context)) return;
     const gatewaySids = new Set(
       mr.members.filter((m) => m.kind === "android_gateway").map((m) => m.sid),
     );
@@ -756,18 +717,15 @@ export const useStore = create<State>((set, get) => ({
           continue;
         }
         const content = decodeRelayContent(plaintext);
-        let shouldShow = true;
-        if (!await runSessionEffect(context, async () => {
-          shouldShow = await applyBlock(
-            cid,
-            sm.seq,
-            [content.subject, content.text].filter(Boolean).join("\n"),
-          );
-        })) return;
-        if (shouldShow && senderBlocked && gatewaySids.has(sm.sender_sid)) {
-          if (!await runSessionEffect(context, () => setBlocked(cid, sm.seq, true))) return;
-          shouldShow = false;
-        }
+        // Decided here so the putMessage below is the only write of `blocked`.
+        // The two setBlocked transactions this replaced ran before the row
+        // existed — no-ops on a forward sync — and on a rescan wrote a value
+        // that same putMessage overwrote one line later, once per message
+        // inside the session coordinator.
+        const shouldShow = !matchBlockKeywords(
+          [content.subject, content.text].filter(Boolean).join("\n"),
+          blockKeywords,
+        ).blocked && !(senderBlocked && gatewaySids.has(sm.sender_sid));
         if (shouldShow && sm.seq > startCursor && sm.sender_sid !== mySid) {
           notifyBody = content.text || content.subject || "(첨부파일)";
           notifyIsIncoming = true;
@@ -805,10 +763,7 @@ export const useStore = create<State>((set, get) => ({
     }
     // Re-read state: the `me` snapshot predates the pagination loop, and the
     // user may have switched conversations while pages were being pulled.
-    if (canUseCrypto(context) && useStore.getState().activeCid === cid) {
-      const messages = await listMessages(cid);
-      if (canUseCrypto(context) && useStore.getState().activeCid === cid) set({ activeMessages: messages });
-    }
+    await refreshActiveMessages(cid, () => canUseCrypto(context));
     if (canUseCrypto(context) && notifyIsIncoming && notifyBody != null) {
       maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody);
     }
@@ -928,10 +883,7 @@ export const useStore = create<State>((set, get) => ({
       if (!wrote) return false;
       if (!canUseCrypto(context)) return false;
       set({ error: null });
-      if (useStore.getState().activeCid === cid) {
-        const messages = await listMessages(cid);
-        if (canUseCrypto(context) && useStore.getState().activeCid === cid) set({ activeMessages: messages });
-      }
+      await refreshActiveMessages(cid, () => canUseCrypto(context));
       return true;
     } catch (error) {
       if (sameContext(context)) set({ error: errorText(error) });
@@ -963,35 +915,12 @@ export const useStore = create<State>((set, get) => ({
     const list = await api.listBlockRules();
     if (!sameContext(context)) return;
     if (!list.ok || !list.rules) return; // offline: keep local rules as-is
-    const serverKeywords = new Map<string, BlockRule>(
-      list.rules.filter((r) => r.type === "keyword").map((r) => [r.value, r]),
-    );
-    const serverSenders = new Map<string, BlockRule>(
-      list.rules.filter((r) => r.type === "sender").map((r) => [r.value, r]),
-    );
-    const failedKeywords: BlockRow[] = [];
-    for (const row of await listBlockKeywords()) {
-      if (!sameContext(context)) return;
-      if (row.id.startsWith("srv:")) continue;
-      const r = await api.addBlockRule("keyword", row.keyword);
-      if (!sameContext(context)) return;
-      if (r.ok && r.rule) serverKeywords.set(r.rule.value, r.rule);
-      else if (!serverKeywords.has(row.keyword)) failedKeywords.push(row);
-    }
-    const failedSenders: SenderRow[] = [];
-    for (const row of await listBlockedSenders()) {
-      if (!sameContext(context)) return;
-      if (row.id.startsWith("srv:")) continue;
-      const r = await api.addBlockRule("sender", row.sender);
-      if (!sameContext(context)) return;
-      if (r.ok && r.rule) serverSenders.set(r.rule.value, r.rule);
-      else if (!serverSenders.has(row.sender)) failedSenders.push(row);
-    }
+    const keywords = await reconcileRuleKind(KEYWORD_RULES, list.rules, context);
+    if (!keywords) return;
+    const senders = await reconcileRuleKind(SENDER_RULES, list.rules, context);
+    if (!senders) return;
     if (!sameContext(context)) return;
-    await replaceBlockRules(
-      [...serverKeywords.values()].map(ruleToKeywordRow).concat(failedKeywords),
-      [...serverSenders.values()].map(ruleToSenderRow).concat(failedSenders),
-    );
+    await replaceBlockRules(keywords, senders);
     if (!sameContext(context)) return;
     await get().refreshBlocklist();
   },
@@ -1074,6 +1003,16 @@ function postLogin(suppliedContext?: SecurityContext): Promise<void> {
   postLoginJobs.set(context.generation, { context, promise });
   return promise;
 }
+
+/**
+ * Every event runPostLogin wires, named once for the detach that precedes the
+ * wiring: a handler registered below but missing from this list re-registers
+ * on top of itself if runPostLogin ever runs again on a live socket.
+ */
+const SESSION_SOCKET_EVENTS = [
+  "connect", "connect_error", "message_new", "message_status",
+  "blocklist_updated", "conv_updated", "contacts_updated", "device_pending",
+] as const;
 
 async function runPostLogin(context: SecurityContext): Promise<void> {
   const me = useStore.getState();
@@ -1161,15 +1100,7 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   // Wire socket.
   const socket = liveSocket();
   if (!socket || !canUseCrypto(context)) return;
-  socket.off("connect");
-  socket.off("connect_error");
-  socket.off("message_new");
-  socket.off("message_status");
-  socket.off("typing");
-  socket.off("blocklist_updated");
-  socket.off("conv_updated");
-  socket.off("contacts_updated");
-  socket.off("device_pending");
+  for (const event of SESSION_SOCKET_EVENTS) socket.off(event);
   const syncAll = async () => {
     if (!canUseCrypto(context)) return;
     const state = useStore.getState();
@@ -1193,11 +1124,7 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     // Servers >= v0.10.8 prefix refusals with a stable "auth_rejected:" code;
     // the prose match is the fallback for older servers.
     if (/^auth_rejected|auth required|invalid token|device unknown|unauthenticated/i.test(detail)) {
-      void useStore.getState().logout().then(() => {
-        if (useStore.getState().securityGeneration === context.generation + 1 && !useStore.getState().authed) {
-          useStore.setState({ error: "로그인이 만료되었거나 이 기기가 폐기되었습니다. 다시 로그인하세요." });
-        }
-      });
+      logoutExpiredSession(context);
       return;
     }
     useStore.setState({ error: "실시간 서버 연결 실패 — 자동 재시도 중" });
@@ -1230,16 +1157,7 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
       event.carrier_error ?? null,
       event.carrier_updated_at ? event.carrier_updated_at * 1000 : Date.now(),
     ))) return;
-    if (useStore.getState().activeCid === event.cid) {
-      const messages = await listMessages(event.cid);
-      if (canUseCrypto(context) && useStore.getState().activeCid === event.cid) {
-        useStore.setState({ activeMessages: messages });
-      }
-    }
-  });
-  socket.on("typing", (_data: { cid: string; user_id: number; is_typing: boolean }) => {
-    // Surface typing state via a separate lightweight subscription.
-    // no-op; UI can subscribe via socket directly if needed.
+    await refreshActiveMessages(event.cid, () => canUseCrypto(context));
   });
   socket.on("blocklist_updated", async () => {
     if (!canUseCrypto(context)) return;
@@ -1317,17 +1235,25 @@ export async function verifyConversationKeyDirectory(
     membersByUser.set(member.user_id, group);
   }
   if (checkpointByUser.size !== result.directory_checkpoints.length
-    || proofByUser.size !== result.directory_proofs.length
-    || checkpointByUser.size !== membersByUser.size
-    || proofByUser.size !== membersByUser.size) {
+    || proofByUser.size !== result.directory_proofs.length) {
     throw new TrustViolationError("equivocation", "대화 참여자 디렉터리 checkpoint 수가 일치하지 않습니다.");
   }
+  // Membership is an account property: a peer who revoked their last device is
+  // still in the conversation and still gets a checkpoint and a proof, but
+  // contributes no member row. Comparing the two counts made that peer lock
+  // this client out of the thread until they registered again, so require that
+  // every member is covered rather than that the sets are the same size.
+  for (const userId of membersByUser.keys()) {
+    if (!checkpointByUser.has(userId) || !proofByUser.has(userId)) {
+      throw new TrustViolationError("equivocation", `사용자 ${userId}의 키 디렉터리가 누락되었습니다.`);
+    }
+  }
   const snapshots = [];
-  for (const [userId, members] of membersByUser) {
+  for (const [userId, checkpoint] of checkpointByUser) {
     if (!shouldContinue()) return;
-    const checkpoint = checkpointByUser.get(userId);
+    const members = membersByUser.get(userId) ?? [];
     const proof = proofByUser.get(userId);
-    if (!checkpoint || !proof) {
+    if (!proof) {
       throw new TrustViolationError("equivocation", `사용자 ${userId}의 키 디렉터리가 누락되었습니다.`);
     }
     if (proof.security_mode !== "legacy_v1" && proof.security_mode !== "verified_v2") {
@@ -1457,14 +1383,29 @@ async function resetLocalDevice(cleanup: () => Promise<void>): Promise<void> {
   useStore.setState({
     securityGeneration: forgetGeneration,
     ...clearedSessionState(),
-    username: null, blockKeywords: [], pendingNewDevice: null,
+    username: null, blockKeywords: [], blockedSenders: [], pendingNewDevice: null,
   });
   await sessionCoordinator.exclusive(cleanup);
   const state = useStore.getState();
   if (state.securityGeneration !== forgetGeneration || state.authed) return;
   useStore.setState({
     ...clearedSessionState(),
-    username: null, blockKeywords: [],
+    username: null, blockKeywords: [], blockedSenders: [],
+  });
+}
+
+/**
+ * End a session the relay has stopped accepting, from either the REST 401 hook
+ * or the socket handshake refusal. The generation check is what keeps the
+ * notice off a session that signed in again while this logout was in flight:
+ * only the lifetime this logout itself ended may be annotated.
+ */
+function logoutExpiredSession(context: SecurityContext): void {
+  void useStore.getState().logout().then(() => {
+    const state = useStore.getState();
+    if (state.securityGeneration === context.generation + 1 && !state.authed) {
+      useStore.setState({ error: SESSION_EXPIRED_ERROR });
+    }
   });
 }
 
@@ -1506,6 +1447,42 @@ function beginAuthAttempt(): number {
     ...clearedSessionState(),
   });
   return generation;
+}
+
+/**
+ * Close an auth attempt by installing its session.
+ *
+ * Registration and existing-device login share this so the order around the
+ * credential cannot drift apart in one of them: the device row is written
+ * first — a concurrent forget-device cleanup may have dropped it while the
+ * response was in flight, so this doubles as a reinstall — and only then is
+ * the token handed to the API layer, with the generation re-checked on both
+ * sides of the write so an attempt invalidated mid-install stays dead.
+ */
+async function installSession(
+  attemptGeneration: number,
+  meta: { username: string; uid: number; sid: string; deviceName: string; keypair: DeviceKeypair },
+  token: string,
+  approvalPending: boolean,
+): Promise<boolean> {
+  const installed = await sessionCoordinator.exclusive(async () => {
+    if (useStore.getState().securityGeneration !== attemptGeneration) return false;
+    await setMeta(meta);
+    if (useStore.getState().securityGeneration !== attemptGeneration) return false;
+    api.setToken(token);
+    // Listed field by field rather than spread: `meta` is the persisted device
+    // row, and a field added to it must not silently become store state.
+    useStore.setState((state) => ({
+      authed: true, approvalPending, securityLocked: false, error: null,
+      username: meta.username, uid: meta.uid, sid: meta.sid,
+      deviceName: meta.deviceName, keypair: meta.keypair,
+      securityGeneration: state.securityGeneration + 1,
+    }));
+    return true;
+  });
+  if (!installed) return false;
+  if (!approvalPending) await postLogin(captureSecurityContext());
+  return true;
 }
 
 export function sameContext(context: SecurityContext): boolean {
@@ -1591,9 +1568,14 @@ interface BlockRuleKind<Row extends { id: string }> {
   type: BlockRuleType;
   addLocal: (value: string) => Promise<Row>;
   removeLocal: (id: string) => Promise<void>;
-  putServerRow: (rule: BlockRule) => Promise<void>;
+  listLocal: () => Promise<Row[]>;
+  putRow: (row: Row) => Promise<void>;
+  /** A server rule in this family's local row shape. */
+  toRow: (rule: BlockRule) => Row;
   /** The value the relay stores and the other devices apply. */
   sharedValue: (row: Row) => string;
+  /** Why the relay would refuse this value outright, or null. */
+  rejectShared: (value: string) => string | null;
   removeError: string;
 }
 
@@ -1601,8 +1583,11 @@ const KEYWORD_RULES: BlockRuleKind<BlockRow> = {
   type: "keyword",
   addLocal: addBlockKeyword,
   removeLocal: removeBlockKeyword,
-  putServerRow: (rule) => putBlockKeywordRow(ruleToKeywordRow(rule)),
+  listLocal: listBlockKeywords,
+  putRow: putBlockKeywordRow,
+  toRow: ruleToKeywordRow,
   sharedValue: (row) => row.keyword,
+  rejectShared: blockKeywordRejection,
   removeError: "차단 키워드를 삭제하지 못했습니다",
 };
 
@@ -1610,10 +1595,88 @@ const SENDER_RULES: BlockRuleKind<SenderRow> = {
   type: "sender",
   addLocal: addBlockedSender,
   removeLocal: removeBlockedSender,
-  putServerRow: (rule) => putBlockedSenderRow(ruleToSenderRow(rule)),
+  listLocal: listBlockedSenders,
+  putRow: putBlockedSenderRow,
+  toRow: ruleToSenderRow,
   sharedValue: (row) => row.sender,
+  rejectShared: blockedSenderRejection,
   removeError: "차단 번호를 삭제하지 못했습니다",
 };
+
+/**
+ * Values the relay refused outright, keyed `type:value`. syncBlockRules
+ * re-POSTs every local-only row on each reconnect, each blocklist_updated
+ * event and each login; for a value the relay rejects on its own merits that
+ * is one wasted request per pass for the lifetime of the row, and the user is
+ * never told why the rule stays on this browser alone. Scoped to one auth
+ * lifetime, since a rule set belongs to an account.
+ */
+let refusedRuleGeneration = -1;
+const refusedRuleValues = new Set<string>();
+
+function refusedBlockRule(context: SecurityContext, type: BlockRuleType, value: string): boolean {
+  return refusedRuleGeneration === context.generation && refusedRuleValues.has(`${type}:${value}`);
+}
+
+/**
+ * Classify a rejected upload. 400 is the relay refusing the value itself
+ * (shape or length), which no retry can change; a 409 (account rule limit) or
+ * a 429 clears on its own, so those are surfaced but stay retryable, and a
+ * transport failure or 5xx is left silent for the offline case. The local row
+ * is kept either way — it does filter this browser, it just never becomes a
+ * shared rule.
+ */
+function noteBlockRuleRefusal(
+  context: SecurityContext,
+  type: BlockRuleType,
+  value: string,
+  result: { error?: string; status?: number },
+): void {
+  const status = result.status;
+  if (status == null || status < 400 || status >= 500 || status === 429) return;
+  if (status === 400) {
+    if (refusedRuleGeneration !== context.generation) {
+      refusedRuleGeneration = context.generation;
+      refusedRuleValues.clear();
+    }
+    refusedRuleValues.add(`${type}:${value}`);
+  }
+  if (sameContext(context)) {
+    useStore.setState({ error: result.error ?? "차단 규칙을 다른 기기와 공유하지 못했습니다" });
+  }
+}
+
+/**
+ * Reconcile one rule family against the relay: server rows are authoritative,
+ * a local-only row survives until its own upload succeeds. Returns null when
+ * the session moved on mid-loop, so the caller writes nothing.
+ */
+async function reconcileRuleKind<Row extends { id: string }>(
+  kind: BlockRuleKind<Row>,
+  serverRules: BlockRule[],
+  context: SecurityContext,
+): Promise<Row[] | null> {
+  const authoritative = new Map<string, BlockRule>(
+    serverRules.filter((rule) => rule.type === kind.type).map((rule) => [rule.value, rule]),
+  );
+  const failed: Row[] = [];
+  for (const row of await kind.listLocal()) {
+    if (!sameContext(context)) return null;
+    if (row.id.startsWith("srv:")) continue;
+    const value = kind.sharedValue(row);
+    if (!refusedBlockRule(context, kind.type, value)) {
+      const r = await api.addBlockRule(kind.type, value);
+      if (!sameContext(context)) return null;
+      if (r.ok && r.rule) {
+        authoritative.set(r.rule.value, r.rule);
+        continue;
+      }
+      noteBlockRuleRefusal(context, kind.type, value, r);
+    }
+    if (!authoritative.has(value)) failed.push(row);
+  }
+  return [...authoritative.values()].map(kind.toRow).concat(failed);
+}
 
 async function addSharedBlockRule<Row extends { id: string }>(
   kind: BlockRuleKind<Row>,
@@ -1621,6 +1684,15 @@ async function addSharedBlockRule<Row extends { id: string }>(
 ): Promise<void> {
   const context = captureSecurityContext();
   if (!sameContext(context)) return;
+  // Refuse what the relay's own validator refuses (see blockKeywordRejection).
+  // Creating the row anyway would leave a rule the sync re-POSTs and the relay
+  // rejects on every pass, listed next to real account rules; an existing row
+  // in that state is a different case and stays, handled by refusedRuleValues.
+  const rejection = kind.rejectShared(value);
+  if (rejection) {
+    useStore.setState({ error: rejection });
+    return;
+  }
   // Apply locally first (instant UI), then share with the other devices.
   let inserted: Row | null = null;
   const added = await runContextEffect(context, async () => {
@@ -1639,11 +1711,14 @@ async function addSharedBlockRule<Row extends { id: string }>(
     if (!await runContextEffect(context, async () => {
       await kind.removeLocal(localRow.id);
       if (!sameContext(context)) return;
-      await kind.putServerRow(rule);
+      await kind.putRow(kind.toRow(rule));
     })) return;
     if (!sameContext(context)) return;
     await useStore.getState().refreshBlocklist();
-  } // offline/failed: keep the local row; syncBlockRules pushes it later
+    return;
+  }
+  // Offline or transient: keep the local row, syncBlockRules pushes it later.
+  noteBlockRuleRefusal(context, kind.type, kind.sharedValue(localRow), r);
 }
 
 async function removeSharedBlockRule<Row extends { id: string }>(
@@ -1665,6 +1740,20 @@ async function removeSharedBlockRule<Row extends { id: string }>(
   await useStore.getState().refreshBlocklist();
   if (!sameContext(context)) return;
   await runContextEffect(context, () => reapplyBlocklist(() => sameContext(context)));
+}
+
+/**
+ * Re-render the open conversation from IndexedDB after a write. The pane is
+ * reloaded, not patched, so the read has to be guarded on both sides: the user
+ * can switch threads and the session can end while it is in flight, and either
+ * would otherwise land one conversation's rows under another's header.
+ */
+async function refreshActiveMessages(cid: string, stillValid: () => boolean): Promise<void> {
+  if (useStore.getState().activeCid !== cid) return;
+  const rows = await listMessages(cid);
+  if (stillValid() && useStore.getState().activeCid === cid) {
+    useStore.setState({ activeMessages: rows });
+  }
 }
 
 async function reapplyBlocklist(shouldContinue: () => boolean = () => true): Promise<void> {
@@ -1704,15 +1793,9 @@ async function reapplyBlocklist(shouldContinue: () => boolean = () => true): Pro
     }
   }
   const cid = useStore.getState().activeCid;
-  if (cid) {
-    const messagesForActiveConversation = await listMessages(cid);
-    if (shouldContinue() && useStore.getState().activeCid === cid) {
-      useStore.setState({ activeMessages: messagesForActiveConversation });
-    }
-  }
+  if (cid) await refreshActiveMessages(cid, shouldContinue);
 }
 
-/** Compare phone numbers by digits only (handles +82 vs 0082 vs separators). */
 /** Desktop notification for a freshly arrived incoming message. */
 function maybeNotify(title: string, body: string): void {
   const state = useStore.getState();

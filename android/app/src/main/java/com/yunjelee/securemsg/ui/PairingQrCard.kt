@@ -56,13 +56,16 @@ fun encodeQrBitmap(payload: String, size: Int = 512): Bitmap? = runCatching {
         EncodeHintType.CHARACTER_SET to "UTF-8",
     )
     val matrix = QRCodeWriter().encode(payload, BarcodeFormat.QR_CODE, size, size, hints)
-    val bitmap = Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
-    for (x in 0 until matrix.width) {
-        for (y in 0 until matrix.height) {
-            bitmap.setPixel(x, y, if (matrix[x, y]) AndroidColor.BLACK else AndroidColor.WHITE)
+    // This runs inside composition on the main thread, so the whole image goes
+    // over in one createBitmap instead of 262k setPixel JNI hops.
+    val pixels = IntArray(matrix.width * matrix.height)
+    for (y in 0 until matrix.height) {
+        val row = y * matrix.width
+        for (x in 0 until matrix.width) {
+            pixels[row + x] = if (matrix[x, y]) AndroidColor.BLACK else AndroidColor.WHITE
         }
     }
-    bitmap
+    Bitmap.createBitmap(pixels, matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
 }.getOrNull()
 
 @Composable

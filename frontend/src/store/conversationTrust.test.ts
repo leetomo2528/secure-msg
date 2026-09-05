@@ -68,6 +68,62 @@ describe("conversation member key-directory enforcement", () => {
     expect(await listTrustedDevices(9102)).toHaveLength(1);
   });
 
+  it("accepts a conversation member whose devices have all been revoked", async () => {
+    const alice = makeMember(9701, "alice-still-here");
+    const gone = makeMember(9702, "revoked-last-device");
+    // Membership survives the last device: the relay still sends this peer a
+    // checkpoint and a proof, with an empty active directory and no member row.
+    const emptyDirectoryHash = serverDirectoryHash([]);
+    const goneCheckpoint: DirectoryCheckpoint = {
+      user_id: 9702,
+      identity_sig_pub: gone.sig_pub,
+      security_epoch: 1,
+      security_mode: "legacy_v1",
+      directory_hash: emptyDirectoryHash,
+    };
+    const goneProof: DirectoryProof = {
+      ...goneCheckpoint,
+      device_history: [{
+        sid: gone.sid,
+        kind: gone.kind,
+        pub_key: gone.pub_key,
+        sig_pub: gone.sig_pub,
+        fingerprint: deviceFingerprint(gone.pub_key, gone.sig_pub).hash,
+        trust_state: "revoked",
+        challenge: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        approved_by_sid: "legacy_tofu",
+        verification_state: "legacy_unverified",
+      }],
+      approval_certificates: [],
+      revocation_certificates: [],
+      security_upgrade_certificates: [],
+    };
+
+    await expect(verifyConversationKeyDirectory({
+      ok: true,
+      members: [alice],
+      recipient_keyset_hash: recipientKeysetHash([alice]),
+      directory_checkpoints: [checkpoint(9701, alice.sig_pub, 1, [alice]), goneCheckpoint],
+      directory_proofs: [proof(9701, alice.sig_pub, 1, [alice]), goneProof],
+    })).resolves.toBeUndefined();
+
+    expect(await getAccountTrust(9702)).toMatchObject({ security_epoch: 1 });
+    expect(await listTrustedDevices(9702)).toEqual([]);
+    expect(await listTrustedDevices(9701)).toHaveLength(1);
+  });
+
+  it("rejects a member the directory checkpoints do not cover", async () => {
+    const listed = makeMember(9711, "listed-member");
+    const uncovered = makeMember(9712, "uncovered-member");
+    await expect(verifyConversationKeyDirectory({
+      ok: true,
+      members: [listed, uncovered],
+      recipient_keyset_hash: recipientKeysetHash([listed, uncovered]),
+      directory_checkpoints: [checkpoint(9711, listed.sig_pub, 1, [listed])],
+      directory_proofs: [proof(9711, listed.sig_pub, 1, [listed])],
+    })).rejects.toThrow(/9712/);
+  });
+
   it("does not pin an earlier participant when a later proof is invalid", async () => {
     const first = makeMember(9111, "staged-first");
     const second = makeMember(9112, "invalid-second");

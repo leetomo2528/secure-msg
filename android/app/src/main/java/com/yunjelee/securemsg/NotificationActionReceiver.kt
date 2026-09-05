@@ -5,7 +5,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import androidx.core.content.ContextCompat
 import com.yunjelee.securemsg.ui.LastOpened
 
 /**
@@ -46,21 +45,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
             SmsNotifier.notifyReplyPosted(context, tag, null)
             return
         }
-        // Same path as the RESPOND_VIA_MESSAGE contract: the bridge runs
-        // OutgoingSmsDispatcher (carrier send + relay to web + thread insert),
-        // so sending is never reimplemented here.
-        val bridge = Intent(context, SmsBridgeService::class.java)
-            .setAction(SmsBridgeService.ACTION_SEND_LOCAL_SMS)
-            .putExtra(SmsBridgeService.EXTRA_PHONE, phone)
-            .putExtra(SmsBridgeService.EXTRA_BODY, text)
-        try {
-            ContextCompat.startForegroundService(context, bridge)
-        } catch (e: RuntimeException) {
-            // Preserve carrier functionality if an OEM blocks the bridge FGS;
-            // only cross-device relay is deferred/lost.
-            Log.e(TAG, "Bridge start rejected; sending carrier-only", e)
-            SmsSender.send(context, phone, text)
-        }
+        // Same path as the RESPOND_VIA_MESSAGE contract.
+        LocalSmsBridge.send(context, phone, text)
         // Replying implies the conversation was read...
         if (cid != null) LastOpened.set(context, cid, System.currentTimeMillis())
         // ...and ends its alert burst: the next incoming message is news again.
@@ -73,8 +59,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
         if (cid != null || phone.isNotBlank()) {
             SmsNotifier.cancelConversation(context, cid, phone)
         } else {
-            // No conversation key to sweep stragglers by; the posted tag must
-            // still come down rather than stay in the shade after "읽음".
+            // No conversation key to cancel by; the posted tag must still come
+            // down rather than stay in the shade after "읽음".
             SmsNotifier.cancelByTag(context, tag)
         }
     }

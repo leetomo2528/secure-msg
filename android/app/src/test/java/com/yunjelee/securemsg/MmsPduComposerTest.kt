@@ -10,7 +10,6 @@ class MmsPduComposerTest {
     @Test
     fun composeUsesMultipartHeaderAndTwoPartLengths() {
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = null,
             text = "hello",
@@ -29,7 +28,7 @@ class MmsPduComposerTest {
         assertEquals(0x98, pdu[cursor++].u8())
         cursor = skipText(pdu, cursor)
         assertEquals(0x8D, pdu[cursor++].u8())
-        assertEquals(0x83, pdu[cursor++].u8())
+        assertEquals(0x92, pdu[cursor++].u8()) // MMS 1.2 short-integer (0x12 | 0x80)
         assertEquals(0x89, pdu[cursor++].u8())
         assertEquals(1, pdu[cursor++].u8())
         assertEquals(0x81, pdu[cursor++].u8())
@@ -57,7 +56,6 @@ class MmsPduComposerTest {
     @Test
     fun nonAsciiSubjectUsesWspTextEscape() {
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = "사진",
             text = "hi",
@@ -76,7 +74,6 @@ class MmsPduComposerTest {
     @Test
     fun asciiSubjectIsNotEscaped() {
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = "Photo",
             text = "hi",
@@ -95,7 +92,6 @@ class MmsPduComposerTest {
     @Test
     fun textPartDeclaresUtf8CharsetAndBinaryPartDoesNot() {
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = null,
             text = "한글 본문",
@@ -139,7 +135,6 @@ class MmsPduComposerTest {
         // those bytes, so it must not certify their charset.
         val eucKr = byteArrayOf(0xC7.toByte(), 0xD1.toByte(), 0xB1.toByte(), 0xDB.toByte())
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = null,
             text = "hi",
@@ -161,10 +156,31 @@ class MmsPduComposerTest {
     }
 
     @Test
+    fun unassignedMediaTypeIsWrittenAsTextNotAWspToken() {
+        // audio/amr has no assigned WSP token: 0x23/0x24 are the multipart family,
+        // so a short-integer here makes the receiver parse the clip as body parts.
+        val pdu = MmsPduComposer.compose(
+            to = "+821012345678",
+            subject = null,
+            text = "hi",
+            attachments = listOf(
+                RelayAttachment(
+                    name = "voice.amr",
+                    contentType = "audio/amr",
+                    data = RelayContentCodec.encodeBytes(byteArrayOf(1, 2, 3)),
+                    size = 3,
+                ),
+            ),
+        )
+        val value = contentTypeValue(partHeaders(pdu)[1])
+        val expected = "audio/amr".toByteArray(Charsets.US_ASCII) + 0.toByte()
+        assertArrayEquals(expected, value.copyOfRange(0, expected.size))
+    }
+
+    @Test
     fun longPartNameUsesExtendedValueLength() {
         val longName = "a".repeat(40)
         val pdu = MmsPduComposer.compose(
-            from = "insert-address-token",
             to = "+821012345678",
             subject = null,
             text = "hi",

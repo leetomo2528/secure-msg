@@ -32,9 +32,6 @@ object PinnedConversations {
             ?.toSet()
             .orEmpty()
 
-    fun isPinned(context: Context, phone: String): Boolean =
-        PhoneNumberNormalizer.normalize(phone) in load(context)
-
     /** Flips [phone], persists, and returns the new set. */
     fun toggle(context: Context, phone: String): Set<String> {
         val next = toggled(load(context), phone)

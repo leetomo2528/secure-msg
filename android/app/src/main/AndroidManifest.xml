@@ -53,8 +53,14 @@
         android:theme="@style/Theme.SecureMsg"
         tools:targetApi="34">
 
+        <!-- Every screen is Compose over a single fixed light theme with no
+             configuration-qualified resources, so nothing here needs the
+             activity rebuilt — while the 메시지 tab's drafts are plain
+             `remember`, and a rotation, a font-size change or a split-screen
+             resize threw a half-typed SMS away. -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|fontScale|density"
             android:exported="true"
             android:launchMode="singleTask">
             <intent-filter>

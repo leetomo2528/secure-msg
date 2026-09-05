@@ -7,7 +7,6 @@ locally in IndexedDB.
 
 from __future__ import annotations
 
-import re
 import secrets
 import unicodedata
 import base64
@@ -15,14 +14,30 @@ import hashlib
 import json
 
 import store
-from auth import _err, _json_body, _ok, _rate_error, _valid_b64u, auth_required
+from auth import (
+    PHONE_RE,
+    USERNAME_RE,
+    _err,
+    _json_body,
+    _ok,
+    _rate_error,
+    _valid_b64u,
+    auth_required,
+)
 from flask import Blueprint, g, request
 from rate_limit import check as rate_limit
 from sockets import emit_to_conv_members, emit_to_user_devices
 
 bp = Blueprint("conv", __name__, url_prefix="/api")
-USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
-PHONE_RE = re.compile(r"\+?[0-9*#]{3,24}", re.ASCII)
+# JSON has no integer width, but sqlite3 raises OverflowError at bind time for
+# anything past 2**63, which surfaces as a 500 with a traceback rather than a
+# rejected request. Cap at the range a JS client can even represent.
+MAX_SAFE_INT = 2 ** 53
+# One full history sync spends a call per conversation on missing-keys, on
+# messages and (per 200-key batch) on share-keys. At the old budget of 120 an
+# account with more phone threads than that could never finish a sync, and no
+# client backs off on the 429.
+SYNC_SCAN_BUDGET = 600
 
 
 @bp.post("/conversation")
@@ -87,7 +102,8 @@ def create_conversation():
 @auth_required
 def rename_conversation():
     """Body: { cid, name } -> { cid, name }. Members only. Fan-out notifies
-    all member devices to refresh the conversation label."""
+    all member devices to refresh the conversation label. On a self-only phone
+    thread the label lands in `synced_contact_name` and `name` is untouched."""
     body = _json_body()
     if body is None:
         return _err("JSON object required", 400)
@@ -101,11 +117,24 @@ def rename_conversation():
     if not isinstance(raw_name, str):
         return _err("name must be a string", 400)
     name = raw_name.strip()[:100]
-    conv = store.get_conversation_by_cid(cid)
-    if not conv:
-        return _err("conversation not found", 404)
-    if g.auth["uid"] not in store.list_member_user_ids(conv["id"]):
-        return _err("forbidden", 403)
+    conv, error = _member_conversation(cid)
+    if error:
+        return error
+    # On a self-only phone thread `name` is the SMS identity, not a label:
+    # sockets.py's carrier gate, both clients' ownership policy and
+    # get_or_create_single_member_conversation all match on it, so overwriting
+    # it de-owned the gateway and split one number across two cids. A rename
+    # there is a contact label, which is what synced_contact_name holds.
+    # sync_contact_names re-checks self-only ownership inside its own
+    # transaction, so a group merely NAMED like a number still renames.
+    if PHONE_RE.fullmatch(str(conv["name"] or "")):
+        if store.sync_contact_names(g.auth["uid"], [(cid, name)]) is None:
+            emit_to_user_devices(
+                g.auth["uid"],
+                "contacts_updated",
+                {"entries": [{"cid": cid, "contact_name": name}]},
+            )
+            return _ok(cid=cid, name=conv["name"], synced_contact_name=name)
     store.update_conversation_name(conv["id"], name)
     emit_to_conv_members(conv["id"], "conv_updated", {"cid": cid, "name": name})
     return _ok(cid=cid, name=name)
@@ -180,39 +209,7 @@ def sync_contact_names():
 @auth_required
 def list_conversations():
     """Return conversations the current user is in, plus their other members."""
-    # One pass for the conversations and one for every membership in them,
-    # rather than a members query per conversation.
-    with store.read_snapshot() as c:
-        rows = c.execute(
-            "SELECT cv.cid, cv.id AS conv_id, cv.name, cv.synced_contact_name, "
-            "cv.created_at FROM conversation_members m "
-            "JOIN conversations cv ON cv.id = m.conv_id WHERE m.user_id = ? "
-            "ORDER BY cv.created_at DESC, cv.id DESC",
-            (g.auth["uid"],),
-        ).fetchall()
-        member_rows = c.execute(
-            "SELECT peers.conv_id AS conv_id, u.username AS username "
-            "FROM conversation_members mine "
-            "JOIN conversation_members peers ON peers.conv_id = mine.conv_id "
-            "JOIN users u ON u.id = peers.user_id "
-            "WHERE mine.user_id = ?",
-            (g.auth["uid"],),
-        ).fetchall()
-    members_by_conv: dict[int, list[str]] = {}
-    for row in member_rows:
-        members_by_conv.setdefault(int(row["conv_id"]), []).append(row["username"])
-    out = [
-        {
-            "cid": r["cid"],
-            "conv_id": r["conv_id"],
-            "name": r["name"],
-            "synced_contact_name": r["synced_contact_name"],
-            "members": members_by_conv.get(int(r["conv_id"]), []),
-            "created_at": r["created_at"],
-        }
-        for r in rows
-    ]
-    return _ok(conversations=out)
+    return _ok(conversations=store.list_conversations_for_user(g.auth["uid"]))
 
 
 @bp.get("/conversation/<cid>/members")
@@ -272,20 +269,24 @@ def fetch_messages(cid: str):
     """Offline pull: ?since=<seq>&limit=<n>. Returns envelopes strictly after `since`.
     Use this on reconnect to backfill anything missed while offline.
     """
-    conv = store.get_conversation_by_cid(cid)
-    if not conv:
-        return _err("conversation not found", 404)
-    members = store.list_members(conv["id"])
-    if not any(d["user_id"] == g.auth["uid"] for d in members):
-        return _err("forbidden", 403)
-
+    # Parsing the query string costs nothing; resolving the conversation is
+    # two SQLite round-trips. A malformed pull must not pay for them.
     try:
         since = int(request.args.get("since", "0"))
         limit = int(request.args.get("limit", "200"))
     except (TypeError, ValueError):
         return _err("since and limit must be integers", 400)
-    if since < 0 or not (1 <= limit <= 1000):
+    if not (0 <= since <= MAX_SAFE_INT) or not (1 <= limit <= 1000):
         return _err("since must be >= 0 and limit must be 1-1000", 400)
+    conv, error = _member_conversation(cid)
+    if error:
+        return error
+    # A page is up to 1000 envelopes of up to MAX_ENVELOPE_BYTES each, all
+    # materialized in the one gunicorn worker, so concurrent pulls are a
+    # memory lever. Every other expensive read is already budgeted.
+    retry_after = rate_limit("messages-pull", g.auth["sid"], SYNC_SCAN_BUDGET, 60)
+    if retry_after:
+        return _rate_error(retry_after)
     msgs = store.fetch_messages_since(conv["id"], since, limit)
     return _ok(messages=msgs, conv_id=conv["id"], cid=cid)
 
@@ -307,7 +308,7 @@ def missing_keys(cid: str):
     The sharing device drives history backfill from this list, so it only
     re-wraps what is actually missing.
     """
-    retry_after = rate_limit("missing-keys", g.auth["sid"], 120, 60)
+    retry_after = rate_limit("missing-keys", g.auth["sid"], SYNC_SCAN_BUDGET, 60)
     if retry_after:
         return _rate_error(retry_after)
     target_sid = request.args.get("sid", "")
@@ -334,7 +335,7 @@ def share_keys(cid: str):
     body = _json_body()
     if body is None:
         return _err("JSON object required", 400)
-    retry_after = rate_limit("share-keys", g.auth["sid"], 120, 60)
+    retry_after = rate_limit("share-keys", g.auth["sid"], SYNC_SCAN_BUDGET, 60)
     if retry_after:
         return _rate_error(retry_after)
 
@@ -354,7 +355,11 @@ def share_keys(cid: str):
         seq = entry.get("seq")
         ek = entry.get("ek")
         n = entry.get("n")
-        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or not (1 <= seq <= MAX_SAFE_INT)
+        ):
             return _err("seq must be a positive integer", 400)
         if not _valid_b64u(ek, SHARE_EK_BYTES):
             return _err(f"ek must be base64url for {SHARE_EK_BYTES} bytes", 400)
@@ -366,6 +371,25 @@ def share_keys(cid: str):
     return _ok(**result)
 
 
+def _member_conversation(cid: str) -> tuple[dict | None, tuple | None]:
+    """Resolve a conversation the caller's account must already belong to.
+
+    Returns (conversation, None) or (None, error response). Three endpoints
+    asked this one question three different ways, two of them by materializing
+    every approved device of every member — with its pub_key, sig_pub and
+    directory columns — only to test a boolean. The account-level test is the
+    one that survives: auth_required has already refused a caller whose own
+    device is not approved, so the device scan could never have rejected a
+    request this admits.
+    """
+    conv = store.get_conversation_by_cid(cid)
+    if not conv:
+        return None, _err("conversation not found", 404)
+    if not store.is_conversation_member(conv["id"], g.auth["uid"]):
+        return None, _err("forbidden", 403)
+    return conv, None
+
+
 def _share_target(cid: str, target_sid: str):
     """Resolve (conversation, target device) for a key-sharing call.
 
@@ -375,12 +399,9 @@ def _share_target(cid: str, target_sid: str):
     """
     if not isinstance(target_sid, str) or not target_sid:
         return None, None, _err("sid is required", 400)
-    conv = store.get_conversation_by_cid(cid)
-    if not conv:
-        return None, None, _err("conversation not found", 404)
-    members = store.list_members(conv["id"])
-    if not any(d["user_id"] == g.auth["uid"] for d in members):
-        return None, None, _err("forbidden", 403)
+    conv, error = _member_conversation(cid)
+    if error:
+        return None, None, error
     if target_sid == g.auth["sid"]:
         return None, None, _err("target must be another device", 400)
     target = store.get_device_by_sid(target_sid)

@@ -101,7 +101,10 @@ class MmsReceiver : BroadcastReceiver() {
     private fun findContentLocation(intent: Intent): String? {
         val direct = intent.getStringExtra("contentLocation")
             ?: intent.getStringExtra("content-location")
-        if (!direct.isNullOrBlank()) validHttpUrl(direct)?.let { return it }
+        // A platform-supplied location is the already-decoded header; falling
+        // through to the raw PDU scan here would let a sender-controlled field
+        // override it, so give up and let the id-less sweep handle the message.
+        if (!direct.isNullOrBlank()) return validHttpUrl(direct)
         val params = if (Build.VERSION.SDK_INT >= 33) {
             intent.getSerializableExtra("contentTypeParameters", java.util.HashMap::class.java)
         } else {
@@ -111,7 +114,7 @@ class MmsReceiver : BroadcastReceiver() {
         val fromParams = params?.entries?.firstOrNull { (key, _) ->
             key.toString().lowercase().contains("content-location")
         }?.value?.toString()
-        if (!fromParams.isNullOrBlank()) validHttpUrl(fromParams)?.let { return it }
+        if (!fromParams.isNullOrBlank()) return validHttpUrl(fromParams)
         return validHttpUrl(MmsContentLocationParser.find(intent.getByteArrayExtra("data")))
     }
 
@@ -129,27 +132,62 @@ class MmsReceiver : BroadcastReceiver() {
  * bounded URL scan is intentionally tolerant of carrier-specific MMS headers. */
 internal object MmsContentLocationParser {
     private const val MAX_URL_BYTES = 2048
+    private const val CONTENT_LOCATION_FIELD = 0x83
+    private const val TEXT_STRING_QUOTE = 0x7f
+    private val PREFIXES = listOf("https://", "http://")
 
     fun find(data: ByteArray?): String? {
         if (data == null || data.isEmpty()) return null
-        val prefixes = listOf("https://", "http://")
-        for (start in data.indices) {
-            val prefix = prefixes.firstOrNull { candidate ->
-                start + candidate.length <= data.size && candidate.indices.all { offset ->
-                    data[start + offset].toInt().and(0xff) == candidate[offset].code
-                }
-            } ?: continue
-            var end = start + prefix.length
-            val limit = minOf(data.size, start + MAX_URL_BYTES)
-            while (end < limit) {
-                val value = data[end].toInt() and 0xff
-                if (value == 0 || value <= 0x20 || value == 0x7f) break
-                end += 1
-            }
-            if (end > start + prefix.length) {
-                return data.copyOfRange(start, end).toString(Charsets.ISO_8859_1)
-            }
+        return findFieldEncoded(data) ?: findLastAnywhere(data)
+    }
+
+    /** From and Subject are sender-controlled and both precede
+     * X-Mms-Content-Location in OMA field order, so an unanchored scan hands the
+     * download to whoever writes a URL into the subject line. */
+    private fun findFieldEncoded(data: ByteArray): String? {
+        var found: String? = null
+        for (index in data.indices) {
+            if (data[index].toInt().and(0xff) != CONTENT_LOCATION_FIELD) continue
+            var start = index + 1
+            if (start < data.size && data[start].toInt().and(0xff) == TEXT_STRING_QUOTE) start += 1
+            val url = readUrl(data, start)
+            if (url != null) found = url
         }
-        return null
+        return found
+    }
+
+    /** Carriers whose PDU hides the field octet still download; the last match
+     * wins because the fields a sender can write all sit ahead of the real one. */
+    private fun findLastAnywhere(data: ByteArray): String? {
+        var found: String? = null
+        var index = 0
+        while (index < data.size) {
+            val url = readUrl(data, index)
+            if (url == null) {
+                index += 1
+                continue
+            }
+            found = url
+            index += url.length
+        }
+        return found
+    }
+
+    private fun readUrl(data: ByteArray, start: Int): String? {
+        if (start >= data.size) return null
+        val prefix = PREFIXES.firstOrNull { candidate ->
+            start + candidate.length <= data.size && candidate.indices.all { offset ->
+                data[start + offset].toInt().and(0xff) == candidate[offset].code
+            }
+        } ?: return null
+        var end = start + prefix.length
+        val limit = minOf(data.size, start + MAX_URL_BYTES)
+        while (end < limit) {
+            val value = data[end].toInt() and 0xff
+            if (value <= 0x20 || value == 0x7f) break
+            end += 1
+        }
+        if (end <= start + prefix.length) return null
+        return data.copyOfRange(start, end).toString(Charsets.ISO_8859_1)
     }
 }

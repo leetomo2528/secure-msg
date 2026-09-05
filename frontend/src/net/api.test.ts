@@ -164,20 +164,102 @@ describe("Api 401 handling", () => {
   });
 });
 
+type AckFn = (error: Error | null, response?: unknown) => void;
+
+/**
+ * socket.io-client with its connection down, reproducing the one rule that
+ * matters here: an emitted packet is parked in sendBuffer and flushed on the
+ * next reconnect, and only an emit made through `timeout()` is spliced back
+ * out when the timer expires.
+ */
+function bufferingSocket() {
+  const sendBuffer: AckFn[] = [];
+  const emit = vi.fn((_event: string, _payload: unknown, ack: AckFn) => {
+    sendBuffer.push(ack);
+  });
+  const socket = {
+    connected: false,
+    emit,
+    timeout: (ms: number) => ({
+      emit: (event: string, payload: unknown, ack: AckFn) => {
+        emit(event, payload, ack);
+        setTimeout(() => {
+          const index = sendBuffer.indexOf(ack);
+          if (index < 0) return;
+          sendBuffer.splice(index, 1);
+          ack(new Error("operation has timed out"));
+        }, ms);
+      },
+    }),
+  };
+  return { socket: socket as any, emit, sendBuffer };
+}
+
 describe("sendMessage cancellation", () => {
   it("does not emit a retry after the security context is invalidated", async () => {
     vi.useFakeTimers();
     let current = true;
-    const socket = { emit: vi.fn() } as any;
+    const { socket, emit } = bufferingSocket();
 
     const pending = sendMessage(socket, "cid", {} as any, () => current);
-    expect(socket.emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(1);
     current = false;
     await vi.advanceTimersByTimeAsync(10_000);
 
     await expect(pending).resolves.toMatchObject({ ok: false, error: "메시지 전송이 취소되었습니다" });
-    expect(socket.emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
+  });
+
+  it("leaves nothing queued for a later reconnect once it reports a timeout", async () => {
+    vi.useFakeTimers();
+    const { socket, sendBuffer } = bufferingSocket();
+
+    const pending = sendMessage(socket, "cid", {} as any);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // A packet still parked here is delivered when the network returns: the
+    // UI said the send failed, the user re-sent, and the contact got two SMS.
+    await expect(pending).resolves.toMatchObject({ ok: false, timedOut: true });
+    expect(sendBuffer).toEqual([]);
+    vi.useRealTimers();
+  });
+});
+
+describe("request timeouts", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("gives a message page longer than an ordinary request before aborting", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      })));
+    const client = new Api();
+    client.setToken("token");
+
+    const listing = client.listConversations();
+    const page = client.fetchMessages("cid", 0);
+    let pageSettled = false;
+    void page.then(() => { pageSettled = true; });
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    // One MMS-heavy page is tens of MB. Aborting it on the shared budget left
+    // the sync cursor where it was, so the next pass asked for the same page.
+    await expect(listing).resolves.toMatchObject({
+      ok: false, status: 0, error: "서버 응답 시간 초과",
+    });
+    expect(pageSettled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(48_000);
+    await expect(page).resolves.toMatchObject({
+      ok: false, status: 0, error: "서버 응답 시간 초과",
+    });
   });
 });
 

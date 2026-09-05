@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 data class SharedKeyEntry(val seq: Int, val ek: String, val n: String)
 
 class RelayApi(
-    val baseUrl: String,
+    baseUrl: String,
     private val http: OkHttpClient = HTTP,
 ) {
 
@@ -58,9 +58,6 @@ class RelayApi(
         }
         return body
     }
-
-    fun register(username: String, pwHash: String): JSONObject =
-        post("/api/register", JSONObject().put("username", username).put("pw_hash", pwHash))
 
     fun login(username: String, pwHash: String): JSONObject =
         post("/api/login", JSONObject().put("username", username).put("pw_hash", pwHash))
@@ -156,13 +153,6 @@ class RelayApi(
             .put("sid", sid)
             .put("challenge", challenge)
             .put("nonce_new", nonceNew))
-
-    fun revokeDevice(sid: String, parentEpoch: Long, signature: String): JSONObject =
-        post("/api/device-revoke", JSONObject()
-            .put("sid", sid)
-            .put("parent_epoch", parentEpoch)
-            .put("signature", signature)
-            .put("reason", "user_revoked"))
 
     fun rejectPendingDevice(sid: String, challenge: String, parentEpoch: Long): JSONObject =
         post("/api/device-reject-pending", JSONObject()

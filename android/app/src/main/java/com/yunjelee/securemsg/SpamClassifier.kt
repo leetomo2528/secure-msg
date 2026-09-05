@@ -27,19 +27,19 @@ object SpamClassifier {
         "대출", "저금리", "신용", "투자", "코인", "비트코인", "카지노", "성인",
         "loan", "investment", "bitcoin", "casino",
     )
+    /** Also counted in [marketingTerms]: an opt-out footer scores a hit there and its own +1. */
+    private val optOutTerms = listOf("수신거부", "무료거부", "unsubscribe")
     private val marketingTerms = listOf(
         "광고", "무료", "당첨", "이벤트", "할인", "쿠폰", "캐시백", "리워드",
-        "수신거부", "무료거부", "상담", "선착순", "경품", "winner", "prize",
-        "unsubscribe",
-    )
+        "상담", "선착순", "경품", "winner", "prize",
+    ) + optOutTerms
 
     fun classify(sender: String, body: String): Result {
         val normalized = normalize(body)
         val hasUrl = urlPattern.containsMatchIn(normalized)
         val financialHits = financialTerms.count { normalized.contains(it) }
         val marketingHits = marketingTerms.count { normalized.contains(it) }
-        val hasOptOut = normalized.contains("수신거부") || normalized.contains("무료거부") ||
-            normalized.contains("unsubscribe")
+        val hasOptOut = optOutTerms.any { normalized.contains(it) }
         val otpLike = otpPattern.containsMatchIn(normalized)
 
         // OTP messages are common and should not be classified as spam merely

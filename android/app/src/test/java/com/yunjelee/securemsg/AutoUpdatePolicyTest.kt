@@ -158,15 +158,27 @@ class AutoUpdatePolicyTest {
     }
 
     @Test
-    fun staleSubmissionFromThisProcessStaysInFlight() {
-        // This process submitted the session; its callback or confirm tap may
-        // still land and must not be pulled out from under the dialog.
+    fun staleSubmissionIsReclaimedEvenWhenThisProcessSubmittedIt() {
+        // The submitting process is the START_STICKY bridge, so it is still
+        // alive on the very device this recovery exists for: an untapped
+        // confirm must not stay wedged just because the flag is set.
+        assertEquals(
+            Action.CLEAR_WEDGED,
+            decide(
+                pendingState = PendingInstallState.SESSION_SUBMITTED,
+                pendingStale = true,
+                submittedInThisProcess = true,
+            ),
+        )
+        // A visible app still owns the decision: the confirm dialog may be on
+        // screen right now.
         assertEquals(
             Action.SKIP,
             decide(
                 pendingState = PendingInstallState.SESSION_SUBMITTED,
                 pendingStale = true,
                 submittedInThisProcess = true,
+                appVisible = true,
             ),
         )
     }

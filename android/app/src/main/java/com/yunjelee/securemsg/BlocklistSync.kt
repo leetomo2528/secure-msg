@@ -125,7 +125,8 @@ object BlocklistSync {
         )) {
             val key = "keyword|$value"
             val r = api.addBlockRule("keyword", value)
-            if (r.optBoolean("ok")) present.add(key) else failedKeywordPushes += value
+            if (r.optBoolean("ok")) present.add(key)
+            else recordRejectedPush(r, "keyword", failedKeywordPushes, value)
         }
         for (value in pushCandidates(
             senderRows.map { it.phoneNumber },
@@ -136,7 +137,8 @@ object BlocklistSync {
         )) {
             val key = "sender|$value"
             val r = api.addBlockRule("sender", value)
-            if (r.optBoolean("ok")) present.add(key) else failedSenderPushes += value
+            if (r.optBoolean("ok")) present.add(key)
+            else recordRejectedPush(r, "sender", failedSenderPushes, value)
         }
 
         // Re-pull so the cache also contains rules pushed from other devices.
@@ -178,6 +180,22 @@ object BlocklistSync {
         save(context, arr)
         Log.i(TAG, "shared block rules synced: ${arr.length()} rules")
         return true
+    }
+
+    /**
+     * A refused push stays a local-only rule that every later sync re-attempts,
+     * and nothing on screen says so, so the server's reason has to reach the log
+     * — over 120 characters, the account rule cap, or the per-minute limit. The
+     * value itself is user content and stays out of it.
+     */
+    private fun recordRejectedPush(
+        resp: JSONObject,
+        type: String,
+        failed: MutableSet<String>,
+        value: String,
+    ) {
+        Log.w(TAG, "shared block rule push rejected ($type): ${resp.optString("error")}")
+        failed += value
     }
 
     /** Pure: local values missing from the authoritative server set. */

@@ -1,9 +1,6 @@
 package com.yunjelee.securemsg
 
 import androidx.room.withTransaction
-import java.util.UUID
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
  * Durable local boundary for carrier messages.
@@ -22,16 +19,22 @@ class IncomingMessageRepository(
         val newlyCreated: Boolean,
     )
 
-    suspend fun persist(
+    /**
+     * Private because [encoded] has to be the caller's own encoding of [content],
+     * and nothing here can check that: a mismatched pair forks the mid and
+     * re-delivers a message that was already claimed. [persistCarrier] is the one
+     * caller and derives both from the same value.
+     */
+    private suspend fun persist(
         direction: String,
         phoneNumber: String,
         content: RelayContent,
+        encoded: String,
         providerIdentity: ProviderIdentity,
         receivedAt: Long,
     ): Persisted? {
         val phone = PhoneNumberNormalizer.normalize(phoneNumber)
         require(phone.isNotBlank()) { "phone number is blank" }
-        val encoded = RelayContentCodec.encode(content)
         val mid = IncomingMessageIdentity.mid(direction, providerIdentity, phone, receivedAt, encoded)
 
         return db.withTransaction {
@@ -44,21 +47,17 @@ class IncomingMessageRepository(
                 if (alreadyProcessed) return@withTransaction null
             }
             db.relayOutboxDao().getByMid(mid)?.let { existing ->
-                return@withTransaction Persisted(
-                    outbox = existing,
-                    conversation = ConversationTarget(existing.cid, existing.phoneNumber),
-                    newlyCreated = false,
-                )
+                return@withTransaction alreadyClaimed(existing)
             }
 
             val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
-                cid = "local_${UUID.randomUUID().toString().replace("-", "")}",
+                cid = SmsThread.newLocalCid(),
                 phoneNumber = phone,
                 serverName = null,
             ).also { db.threadDao().upsert(it) }
             db.threadDao().touch(thread.cid, receivedAt)
 
-            val attachmentsJson = attachmentsJson(content)
+            val attachmentsJson = RelayContentCodec.attachmentsJson(content)
             val localMessageId = db.messageDao().insert(
                 MessageRow(
                     cid = thread.cid,
@@ -116,9 +115,9 @@ class IncomingMessageRepository(
         // eventKey does not depend on the provider epoch/id. Check the durable
         // tombstone before namespace resolution so a completed broadcast that
         // later gains a provider id cannot rotate or otherwise mutate ledgers.
-        val eventKey = ProviderIdentity.snapshot(
-            kind, 0, null, phoneNumber, receivedAt, encoded,
-        ).eventKey
+        val eventKey = IncomingMessageIdentity.sourceEventKey(
+            kind, PhoneNumberNormalizer.normalize(phoneNumber), receivedAt, encoded,
+        )
         if (db.processedCarrierEventDao().contains(kind, eventKey)) {
             return@withTransaction null
         }
@@ -142,13 +141,9 @@ class IncomingMessageRepository(
                 )
             }
             val aliased = db.relayOutboxDao().getByMid(existing.mid) ?: existing
-            return@withTransaction Persisted(
-                outbox = aliased,
-                conversation = ConversationTarget(aliased.cid, aliased.phoneNumber),
-                newlyCreated = false,
-            )
+            return@withTransaction alreadyClaimed(aliased)
         }
-        persist(direction, phoneNumber, content, identity, receivedAt)
+        persist(direction, phoneNumber, content, encoded, identity, receivedAt)
     }
 
     /** Commits all incoming-event dedupe records before removing retry state. */
@@ -178,20 +173,11 @@ class IncomingMessageRepository(
         db.relayOutboxDao().delete(row.id)
     }
 
-    private fun attachmentsJson(content: RelayContent): String? {
-        if (content.attachments.isEmpty()) return null
-        val rows = JSONArray()
-        content.attachments.forEach {
-            rows.put(
-                JSONObject()
-                    .put("name", it.name)
-                    .put("content_type", it.contentType)
-                    .put("data", it.data)
-                    .put("size", it.size),
-            )
-        }
-        return rows.toString()
-    }
+    private fun alreadyClaimed(row: RelayOutbox) = Persisted(
+        outbox = row,
+        conversation = ConversationTarget(row.cid, row.phoneNumber),
+        newlyCreated = false,
+    )
 }
 
 /** One-shot destination carried from an SMS notification into Compose. */

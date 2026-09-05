@@ -35,7 +35,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -96,10 +95,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.time.Instant
-import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Date
+
+/**
+ * A relay client built without its token fails only at runtime, so the pane
+ * never assembles one by hand.
+ */
+private fun authedRelay(context: Context, token: String) =
+    RelayApi(ServerConfig.url(context)).also { it.token = token }
 
 /** Add a local/shared block rule as one serialized operation (IO). */
 internal suspend fun addBlockRule(context: Context, type: String, value: String) {
@@ -109,7 +114,7 @@ internal suspend fun addBlockRule(context: Context, type: String, value: String)
             BlocklistSync.addLocal(context, type, value)
             return
         }
-        val api = RelayApi(ServerConfig.url(context)).also { it.token = saved.token }
+        val api = authedRelay(context, saved.token)
         BlocklistSync.addShared(context, api, type, value)
     } catch (e: Exception) {
         Log.w("SettingsPane", "block rule push failed", e)
@@ -130,7 +135,7 @@ internal suspend fun removeBlockRuleOnServer(context: Context, type: String, val
             BlocklistSync.removeLocal(context, type, value)
             return true
         }
-        val api = RelayApi(ServerConfig.url(context)).also { it.token = saved.token }
+        val api = authedRelay(context, saved.token)
         BlocklistSync.removeShared(context, api, type, value)
     } catch (e: Exception) {
         Log.w("SettingsPane", "block rule remove failed", e)
@@ -151,8 +156,14 @@ private const val QUARANTINE_PAGE = 20
 /** Device awaiting a history-share confirmation; [label] is what the user sees. */
 private data class HistoryShareTarget(val sid: String, val label: String)
 
-/** Sender rules are validated the same way the dispatcher validates recipients. */
-internal val SenderRulePattern = Regex("^\\+?[0-9*#]{3,24}$")
+/**
+ * Sender rules are validated the same way the dispatcher validates recipients —
+ * an alias, not a copy, so that claim (and the identical one in MessagesPane)
+ * cannot quietly stop being true. The name stays UI-local on purpose: this is a
+ * form-input contract, and the address rule itself belongs with the policy gates
+ * that enforce it, not with the settings screen that happens to reuse it.
+ */
+internal val SenderRulePattern = PhoneNumberNormalizer.SMS_ADDRESS
 
 /**
  * "설정" tab: device security, block keywords, then a row-list (quarantined
@@ -222,9 +233,9 @@ fun SettingsPane(
     var expanded by remember { mutableStateOf<SettingsRow?>(null) }
 
     fun securityController(): DeviceSecurityController {
-        val relay = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }
+        val relay = authedRelay(context, creds.token)
         return DeviceSecurityController(
-            RelayTrustedDeviceApi(relay, creds.uid.toLong()), creds, trustRepo,
+            RelayTrustedDeviceApi(relay), creds, trustRepo,
         )
     }
 
@@ -357,7 +368,7 @@ fun SettingsPane(
             try {
                 val saved = Credentials.load(context)
                     ?: error("다시 로그인한 뒤 동기화해 주세요")
-                val api = RelayApi(ServerConfig.url(context)).also { it.token = saved.token }
+                val api = authedRelay(context, saved.token)
                 val result = ContactSync.sync(context, api)
                 withContext(Dispatchers.Main) {
                     contactStatus = result
@@ -395,7 +406,9 @@ fun SettingsPane(
 
     fun addKeyword() {
         val keyword = newKw.trim()
-        if (keyword.isEmpty()) return
+        // The relay refuses a keyword outside 1..120 characters and BlocklistSync
+        // then re-attempts that push on every later sync, forever.
+        if (keyword.length !in 1..120) return
         scope.launch(Dispatchers.IO) {
             addBlockRule(context, "keyword", keyword)
             withContext(Dispatchers.Main) {
@@ -414,6 +427,13 @@ fun SettingsPane(
                 newBlockedPhone = ""
                 reloadShared()
             }
+        }
+    }
+
+    fun removeRule(type: String, value: String) {
+        scope.launch(Dispatchers.IO) {
+            removeBlockRuleOnServer(context, type, value)
+            withContext(Dispatchers.Main) { reloadShared() }
         }
     }
 
@@ -450,31 +470,19 @@ fun SettingsPane(
     }
 
     historyShareTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { historyShareTarget = null },
-            containerColor = Sm.surface,
-            shape = RoundedCornerShape(16.dp),
-            titleContentColor = Sm.text1,
-            textContentColor = Sm.text3,
-            title = { Text("이전 대화 공유") },
-            text = {
-                Text(
-                    "'${target.label}' 기기가 이 기기에 있는 지난 메시지를 모두 읽을 수 있게 됩니다. " +
-                        "메시지 키를 그 기기의 공개키로 다시 암호화해 전달하며 서버는 평문을 볼 수 없지만, " +
-                        "한 번 공유하면 되돌릴 수 없습니다.",
-                )
+        SmConfirmDialog(
+            title = "이전 대화 공유",
+            body = "'${target.label}' 기기가 이 기기에 있는 지난 메시지를 모두 읽을 수 있게 됩니다. " +
+                "메시지 키를 그 기기의 공개키로 다시 암호화해 전달하며 서버는 평문을 볼 수 없지만, " +
+                "한 번 공유하면 되돌릴 수 없습니다.",
+            confirmLabel = "공유",
+            onConfirm = {
+                historyShareTarget = null
+                shareHistory(target)
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    historyShareTarget = null
-                    shareHistory(target)
-                }) { Text("공유", color = Sm.teal) }
-            },
-            dismissButton = {
-                TextButton(onClick = { historyShareTarget = null }) {
-                    Text("공유하지 않음", color = Sm.text3)
-                }
-            },
+            onDismiss = { historyShareTarget = null },
+            confirmColor = Sm.accent,
+            dismissLabel = "공유하지 않음",
         )
     }
 
@@ -487,65 +495,38 @@ fun SettingsPane(
     }
 
     if (confirmRestore) {
-        AlertDialog(
-            onDismissRequest = { confirmRestore = false },
-            containerColor = Sm.surface,
-            shape = RoundedCornerShape(16.dp),
-            titleContentColor = Sm.text1,
-            textContentColor = Sm.text3,
-            title = { Text("대화 복원") },
-            text = {
-                Text(
-                    "이 휴대폰에 저장된 문자 메시지함을 읽어 주고받은 대화를 다시 만듭니다. " +
-                        "메시지를 보내거나 서버에 올리지 않고, 이미 있는 대화는 건너뛰므로 " +
-                        "여러 번 실행해도 대화가 중복되지 않습니다. " +
-                        "복원되는 것은 SMS뿐이며 MMS(사진·그룹 메시지)는 복원되지 않습니다.",
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmRestore = false
-                    restoreMessage = null
-                    if (!HistoryRestoreRunner.start(context, creds)) {
-                        restoreMessage = "이미 대화를 복원하는 중입니다."
-                    }
-                }) { Text("복원", color = Sm.teal) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmRestore = false }) {
-                    Text("취소", color = Sm.text3)
+        SmConfirmDialog(
+            title = "대화 복원",
+            body = "이 휴대폰에 저장된 문자 메시지함을 읽어 주고받은 대화를 다시 만듭니다. " +
+                "메시지를 보내거나 서버에 올리지 않고, 이미 있는 대화는 건너뛰므로 " +
+                "여러 번 실행해도 대화가 중복되지 않습니다. " +
+                "복원되는 것은 SMS뿐이며 MMS(사진·그룹 메시지)는 복원되지 않습니다.",
+            confirmLabel = "복원",
+            onConfirm = {
+                confirmRestore = false
+                restoreMessage = null
+                if (!HistoryRestoreRunner.start(context, creds)) {
+                    restoreMessage = "이미 대화를 복원하는 중입니다."
                 }
             },
+            onDismiss = { confirmRestore = false },
+            confirmColor = Sm.accent,
         )
     }
 
     if (confirmLogout) {
-        AlertDialog(
-            onDismissRequest = { confirmLogout = false },
-            containerColor = Sm.surface,
-            shape = RoundedCornerShape(16.dp),
-            titleContentColor = Sm.text1,
-            textContentColor = Sm.text3,
-            title = { Text("로그아웃") },
-            text = {
-                Text(
-                    "로그아웃하면 이 기기에 저장된 대화 내용이 모두 삭제됩니다. " +
-                        "서버에서는 되돌릴 수 없습니다. 다시 로그인한 뒤 설정의 '대화 복원'으로 " +
-                        "이 휴대폰의 문자 메시지함에서 SMS 대화를 다시 만들 수 있습니다. " +
-                        "MMS(사진·그룹 메시지)는 복원되지 않습니다.",
-                )
+        SmConfirmDialog(
+            title = "로그아웃",
+            body = "로그아웃하면 이 기기에 저장된 대화 내용이 모두 삭제됩니다. " +
+                "서버에서는 되돌릴 수 없습니다. 다시 로그인한 뒤 설정의 '대화 복원'으로 " +
+                "이 휴대폰의 문자 메시지함에서 SMS 대화를 다시 만들 수 있습니다. " +
+                "MMS(사진·그룹 메시지)는 복원되지 않습니다.",
+            confirmLabel = "로그아웃",
+            onConfirm = {
+                confirmLogout = false
+                onLogout()
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmLogout = false
-                    onLogout()
-                }) { Text("로그아웃", color = Sm.danger) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmLogout = false }) {
-                    Text("취소", color = Sm.text3)
-                }
-            },
+            onDismiss = { confirmLogout = false },
         )
     }
 
@@ -623,8 +604,12 @@ fun SettingsPane(
                     // number derived from it, and a fresh one would make the
                     // two screens disagree — which reads as an attack.
                     val nonce = remember(creds.sid) { CryptoUtil.randomNonceB64u() }
-                    PairingQrCard(
-                        payload = pairingQrPayload(
+                    // The payload is remembered for the same reason: a live
+                    // clock put a new expires_at — and so a freshly encoded
+                    // bitmap — into every recomposition that crossed a second,
+                    // and slid the advertised expiry forward indefinitely.
+                    val payload = remember(creds.sid, challenge, nonce) {
+                        pairingQrPayload(
                             server = ServerConfig.url(context),
                             username = creds.username,
                             sid = creds.sid,
@@ -633,7 +618,10 @@ fun SettingsPane(
                             sigPk = creds.keypair.signPk,
                             nonceNew = nonce,
                             nowSeconds = System.currentTimeMillis() / 1000,
-                        ),
+                        )
+                    }
+                    PairingQrCard(
+                        payload = payload,
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -668,7 +656,7 @@ fun SettingsPane(
                 Caption("새 기기 화면에도 같은 숫자가 떠 있어야 합니다. 다르면 승인하지 말고 취소하세요.")
                 Text(
                     confirmation.second.safetyNumber,
-                    color = Sm.teal, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                    color = Sm.accent, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
                 )
                 SmGradientButton(
                     text = "숫자가 같습니다 · 승인",
@@ -794,24 +782,14 @@ fun SettingsPane(
                         KeywordChip(
                             value = keyword.keyword,
                             shared = false,
-                            onDelete = {
-                                scope.launch(Dispatchers.IO) {
-                                    removeBlockRuleOnServer(context, "keyword", keyword.keyword)
-                                    withContext(Dispatchers.Main) { reloadShared() }
-                                }
-                            },
+                            onDelete = { removeRule("keyword", keyword.keyword) },
                         )
                     }
                     sharedOnlyKeywords.forEach { value ->
                         KeywordChip(
                             value = value,
                             shared = true,
-                            onDelete = {
-                                scope.launch(Dispatchers.IO) {
-                                    removeBlockRuleOnServer(context, "keyword", value)
-                                    withContext(Dispatchers.Main) { reloadShared() }
-                                }
-                            },
+                            onDelete = { removeRule("keyword", value) },
                         )
                     }
                 }
@@ -823,7 +801,7 @@ fun SettingsPane(
         val localSenders = blockedSenders.map { it.phoneNumber }.toSet()
         val sharedOnlySenders = sharedRules.senders.filter { it !in localSenders }
         val syncLabel = remember(contactStatus?.lastSyncedAt) {
-            syncTimeLabel(contactStatus?.lastSyncedAt)
+            contactStatus?.lastSyncedAt?.let { syncTimeLabel(it) } ?: "미동기화"
         }
         Column(Modifier.fillMaxWidth()) {
             SmListRowCard {
@@ -924,7 +902,7 @@ fun SettingsPane(
                     TextButton(onClick = { quarantineShown += QUARANTINE_PAGE }) {
                         Text(
                             "더 보기 (${quarantineHits.size - quarantineShown}건 남음)",
-                            color = Sm.teal,
+                            color = Sm.accent,
                             fontSize = 12.sp,
                         )
                     }
@@ -961,24 +939,14 @@ fun SettingsPane(
                 blockedSenders.forEach { sender ->
                     RuleRow(
                         value = sender.phoneNumber,
-                        onDelete = {
-                            scope.launch(Dispatchers.IO) {
-                                removeBlockRuleOnServer(context, "sender", sender.phoneNumber)
-                                withContext(Dispatchers.Main) { reloadShared() }
-                            }
-                        },
+                        onDelete = { removeRule("sender", sender.phoneNumber) },
                     )
                 }
                 sharedOnlySenders.forEach { value ->
                     RuleRow(
                         value = value,
                         subtitle = "다른 기기에서 추가됨",
-                        onDelete = {
-                            scope.launch(Dispatchers.IO) {
-                                removeBlockRuleOnServer(context, "sender", value)
-                                withContext(Dispatchers.Main) { reloadShared() }
-                            }
-                        },
+                        onDelete = { removeRule("sender", value) },
                     )
                 }
             }
@@ -1267,7 +1235,7 @@ private fun RuleInput(
             .padding(horizontal = 14.dp, vertical = 11.dp),
         singleLine = true,
         textStyle = TextStyle(color = Sm.text1, fontSize = 13.sp),
-        cursorBrush = SolidColor(Sm.teal),
+        cursorBrush = SolidColor(Sm.accent),
         keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = ImeAction.Done),
         keyboardActions = KeyboardActions(onDone = { onDone() }),
         decorationBox = { inner ->
@@ -1286,7 +1254,7 @@ private fun RuleAddButton(text: String, enabled: Boolean, onClick: () -> Unit) {
     Box(
         Modifier
             .clip(shape)
-            .background(if (enabled) Sm.teal else Sm.surfaceAlt)
+            .background(if (enabled) Sm.accent else Sm.surfaceAlt)
             .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .padding(horizontal = 18.dp, vertical = 11.dp),
         contentAlignment = Alignment.Center,
@@ -1399,12 +1367,14 @@ private fun SettingsDetail(visible: Boolean, content: @Composable ColumnScope.()
     }
 }
 
-/** Row value for 연락처 이름 동기화: "오늘 08:12" / "어제 08:12" / "M/d HH:mm". */
-private fun syncTimeLabel(lastSyncedAt: Long?): String {
-    if (lastSyncedAt == null) return "미동기화"
+/**
+ * "오늘 08:12" / "어제 08:12" / "M/d HH:mm" for a contact-sync timestamp, shared
+ * with the 연락처 header meta so the two readings of the same value agree.
+ */
+internal fun syncTimeLabel(lastSyncedAt: Long, now: Long = System.currentTimeMillis()): String {
     val zone = ZoneId.systemDefault()
     val at = Instant.ofEpochMilli(lastSyncedAt).atZone(zone)
-    val today = LocalDate.now(zone)
+    val today = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
     val time = at.format(DateTimeFormatter.ofPattern("HH:mm"))
     return when (at.toLocalDate()) {
         today -> "오늘 $time"

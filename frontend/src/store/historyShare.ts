@@ -28,6 +28,7 @@
  */
 import {
   api,
+  MISSING_KEYS_PAGE_SIZE,
   type ConversationMembersResult,
   type ServerMessage,
   type ShareKeyEntry,
@@ -77,7 +78,12 @@ const CANCELLED = "세션이 변경되어 공유를 중단했습니다.";
  * reported as an incomplete run, not as success.
  */
 const MAX_ROUNDS_PER_CONVERSATION = 64;
-/** The cap above was hit with the relay still listing shareable messages. */
+/**
+ * The relay still lists sequences this run did not share: the round cap was
+ * hit, or a round ended against a window it could not open a single message
+ * in. Either way work is left, and reporting it as success is what let later
+ * history stay unshared with nothing to prompt a re-run.
+ */
 const INCOMPLETE = "메시지가 많아 한 번에 다 공유하지 못했습니다. 다시 실행해 나머지를 공유하세요.";
 
 /**
@@ -129,7 +135,7 @@ export async function shareHistoryWithDevice(
   if (!list.ok || !Array.isArray(list.conversations)) {
     return fail(list.error ?? "대화 목록을 불러오지 못했습니다.");
   }
-  const conversations = list.conversations as Array<{ cid: string }>;
+  const conversations = list.conversations;
   progress.conversationsTotal = conversations.length;
   report();
 
@@ -171,7 +177,16 @@ export async function shareHistoryWithDevice(
         break;
       }
       const wanted = new Set(missing.seqs.filter((seq) => !unshareable.has(seq)));
-      if (wanted.size === 0) break; // only sequences already known to be unopenable
+      // missing-keys answers with the LOWEST unkeyed sequences and takes no
+      // offset, so a FULL window this round cannot open is a wall, not a page:
+      // every later round asks the same question and gets the same answer, and
+      // everything above it stays unreachable. A short window carries no such
+      // remainder — it is the whole truth, and exiting on it is completion.
+      const stuckOnFullWindow = missing.seqs.length >= MISSING_KEYS_PAGE_SIZE;
+      if (wanted.size === 0) {
+        if (stuckOnFullWindow) firstError ??= INCOMPLETE;
+        break; // only sequences already known to be unopenable
+      }
 
       const entries: ShareKeyEntry[] = [];
       const wantedSeqs = [...wanted];
@@ -207,7 +222,10 @@ export async function shareHistoryWithDevice(
         if (page.messages.length < MESSAGE_PAGE_SIZE) break;
       }
 
-      if (entries.length === 0) break; // nothing left this device can open
+      if (entries.length === 0) {
+        if (stuckOnFullWindow) firstError ??= INCOMPLETE;
+        break; // nothing left this device can open
+      }
       const shared = await api.shareKeys(cid, targetSid, entries);
       if (!canUseCrypto(context)) return fail(CANCELLED);
       progress.shared += shared.added ?? 0;

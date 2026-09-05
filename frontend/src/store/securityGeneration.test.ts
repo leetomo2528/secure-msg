@@ -7,7 +7,6 @@ const effects = vi.hoisted(() => ({
   sendMessage: vi.fn(),
   putMessage: vi.fn(),
   setCursor: vi.fn(),
-  applyBlock: vi.fn(),
   pinTrustedDirectory: vi.fn(),
   clearSessionData: vi.fn(),
   clearDeviceForReregistration: vi.fn(),
@@ -74,11 +73,6 @@ vi.mock("./db", async (importOriginal) => {
     removeBlockedSender: effects.removeBlockedSender,
     putBlockedSenderRow: effects.putBlockedSenderRow,
   };
-});
-
-vi.mock("./blocklist", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./blocklist")>();
-  return { ...actual, applyBlock: effects.applyBlock };
 });
 
 import { b64u, generateKeypair, initCrypto } from "../crypto/keys";
@@ -222,7 +216,6 @@ describe("security generation invalidation", () => {
       on: effects.socketOn,
       off: effects.socketOff,
     }));
-    effects.applyBlock.mockResolvedValue(true);
     effects.pinTrustedDirectory.mockResolvedValue(undefined);
     effects.clearSessionData.mockResolvedValue(undefined);
     effects.clearDeviceForReregistration.mockResolvedValue(undefined);
@@ -283,7 +276,6 @@ describe("security generation invalidation", () => {
     await syncing;
 
     expect(effects.decrypt).not.toHaveBeenCalled();
-    expect(effects.applyBlock).not.toHaveBeenCalled();
     expect(effects.putMessage).not.toHaveBeenCalled();
     expect(effects.setCursor).not.toHaveBeenCalled();
     expect(effects.socketEmit).not.toHaveBeenCalledWith("message_delivered", expect.anything());
@@ -435,8 +427,8 @@ describe("security generation invalidation", () => {
     expect(api.keyDirectory).toHaveBeenCalledOnce();
     expect(effects.pinTrustedDirectory).toHaveBeenCalledOnce();
     expect(effects.getSocket).toHaveBeenCalledOnce();
-    expect(effects.socketOff).toHaveBeenCalledTimes(9);
-    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+    expect(effects.socketOff).toHaveBeenCalledTimes(8);
+    expect(effects.socketOn).toHaveBeenCalledTimes(8);
     expect(syncBlockRules).toHaveBeenCalledTimes(2);
     expect(refreshConversations).toHaveBeenCalledTimes(2);
   });
@@ -532,7 +524,7 @@ describe("security generation invalidation", () => {
 
     expect(api.keyDirectory).toHaveBeenCalledTimes(2);
     expect(effects.getSocket).toHaveBeenCalledOnce();
-    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+    expect(effects.socketOn).toHaveBeenCalledTimes(8);
   });
 
   it("finishes a queued logout clear before installing a new session", async () => {
@@ -590,7 +582,11 @@ describe("security generation invalidation", () => {
 
   it("discards a device the relay reports revoked without erasing the trust pins", async () => {
     authenticated(61);
-    useStore.setState({ approvalPending: true });
+    useStore.setState({
+      approvalPending: true,
+      blockKeywords: [{ id: "kw-61", keyword: "spam", created_at: 1 }],
+      blockedSenders: [{ id: "snd-61", sender: "+821011112222", created_at: 1 }],
+    });
     vi.spyOn(api, "deviceApprovalStatus").mockResolvedValue({
       ok: false, status: 401, code: DEVICE_REVOKED, error: "device revoked",
     });
@@ -600,8 +596,11 @@ describe("security generation invalidation", () => {
 
     expect(effects.clearDeviceForReregistration).toHaveBeenCalledOnce();
     expect(effects.clearAllData).not.toHaveBeenCalled();
+    // The cleanup empties both rule stores, so neither list may survive in
+    // memory: they would be the previous account's rules with no backing rows.
     expect(useStore.getState()).toMatchObject({
       authed: false, approvalPending: false, sid: null, keypair: null,
+      blockKeywords: [], blockedSenders: [],
     });
   });
 
@@ -696,7 +695,7 @@ describe("security generation invalidation", () => {
     expect(refreshConversations).toHaveBeenCalled();
     expect(effects.getSocket).toHaveBeenCalledOnce();
     expect(effects.getSocket).toHaveBeenCalledWith("token-slid");
-    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+    expect(effects.socketOn).toHaveBeenCalledTimes(8);
   });
 
   it("stops post-login sync and drops a late renewal when the identity changes", async () => {
@@ -739,7 +738,7 @@ describe("security generation invalidation", () => {
     // socket, so the wiring can happen under the pre-slide credential.
     expect(effects.getSocket).toHaveBeenCalledOnce();
     expect(effects.getSocket).toHaveBeenCalledWith("token-73");
-    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+    expect(effects.socketOn).toHaveBeenCalledTimes(8);
 
     renewal.resolve({ ok: true, token: "token-slid-late" });
     await renewal.promise;
@@ -752,6 +751,6 @@ describe("security generation invalidation", () => {
     vi.spyOn(api, "convMembers").mockResolvedValue({ ok: false, error: "stop" });
     await expect(useStore.getState().send("cid", "hello")).resolves.toBe(false);
     expect(effects.getSocket).toHaveBeenLastCalledWith("token-slid-late");
-    expect(effects.socketOn).toHaveBeenCalledTimes(9);
+    expect(effects.socketOn).toHaveBeenCalledTimes(8);
   });
 });

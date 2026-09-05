@@ -22,23 +22,27 @@ object OutgoingSmsDispatcher {
         text: String,
     ): Boolean {
         val phone = PhoneNumberNormalizer.normalize(phoneNumber)
-        require(Regex("^\\+?[0-9*#]{3,24}$").matches(phone)) { "invalid phone number" }
+        require(PhoneNumberNormalizer.isSmsAddress(phone)) { "invalid phone number" }
         require(text.isNotBlank()) { "SMS body is empty" }
         require(text.length <= 20_000) { "SMS body is too long" }
 
         val db = AppDatabase.get(context)
-        val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
-            cid = "local_${UUID.randomUUID().toString().replace("-", "")}",
-            phoneNumber = phone,
-            serverName = null,
-        ).also { db.threadDao().upsert(it) }
-        db.threadDao().touch(thread.cid, System.currentTimeMillis())
         val content = RelayContentCodec.text(text)
         val contentJson = RelayContentCodec.encode(content)
         val mid = UUID.randomUUID().toString()
         // The presentation row and the durable outbox row must appear or fail
         // together; a crash between them would orphan a relay-only phantom.
-        val (localId, outboxId) = db.withTransaction {
+        // The thread get-or-create belongs inside for the same reason it does in
+        // IncomingMessageRepository: sms_threads is keyed on cid alone, so two
+        // senders racing the first-ever message to a number would otherwise each
+        // insert their own local_ row and split the conversation in two.
+        val (cid, localId, outboxId) = db.withTransaction {
+            val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
+                cid = SmsThread.newLocalCid(),
+                phoneNumber = phone,
+                serverName = null,
+            ).also { db.threadDao().upsert(it) }
+            db.threadDao().touch(thread.cid, System.currentTimeMillis())
             val localId = db.messageDao().insert(
                 MessageRow(
                     cid = thread.cid,
@@ -64,10 +68,10 @@ object OutgoingSmsDispatcher {
                     carrierState = "unknown",
                 ),
             )
-            localId to outboxId
+            Triple(thread.cid, localId, outboxId)
         }
 
-        val dispatched = SmsSender.send(context, phone, text, mid, thread.cid, 0)
+        val dispatched = SmsSender.send(context, phone, text, mid, cid, 0)
         if (!dispatched) {
             db.relayOutboxDao().markCarrierState(
                 outboxId,
@@ -87,10 +91,7 @@ object OutgoingSmsDispatcher {
         db.relayOutboxDao().markCarrierDispatchedIfUnknown(outboxId)
         val current = db.relayOutboxDao().getByMid(mid)
         val state = current?.carrierState ?: "dispatched"
-        val message = db.messageDao().getById(localId)
-        if (message == null || CarrierState.canAdvance(message.carrierStatus, state)) {
-            db.messageDao().setCarrierStatusById(localId, state, current?.lastError)
-        }
+        db.messageDao().advanceCarrierStatus(localId, state, current?.lastError)
         Log.i(TAG, "Queued encrypted relay for carrier SMS mid=$mid")
         return true
     }

@@ -10,7 +10,7 @@
  * `blocked=true` in IndexedDB) when ANY keyword in the list is a substring of
  * the plaintext. Match is case-insensitive, no regex (avoids ReDoS / injection).
  */
-import { listBlockKeywords, setBlocked, type BlockRow } from "./db";
+import { type BlockRow } from "./db";
 
 export interface BlockMatchResult {
   blocked: boolean;
@@ -29,23 +29,4 @@ export function matchBlockKeywords(
     }
   }
   return { blocked: false };
-}
-
-export async function shouldBlock(plaintext: string): Promise<BlockMatchResult> {
-  return matchBlockKeywords(plaintext, await listBlockKeywords());
-}
-
-/**
- * Apply blocklist to a freshly decrypted message. If blocked, persist the
- * `blocked` flag in IndexedDB so the UI hides it on next render. Returns true
- * if the message should be displayed.
- */
-export async function applyBlock(
-  cid: string,
-  seq: number,
-  plaintext: string,
-): Promise<boolean> {
-  const result = await shouldBlock(plaintext);
-  await setBlocked(cid, seq, result.blocked);
-  return !result.blocked;
 }

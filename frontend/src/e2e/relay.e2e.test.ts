@@ -235,8 +235,12 @@ describe("phone ↔ web relay interlock", () => {
     const listed = await fetchJson(`${BASE}/api/conversations`, {
       headers: { Authorization: `Bearer ${gwToken}` },
     });
-    const names = (listed.conversations as Array<{ name: string }>).map((c) => c.name);
-    expect(names).toContain("테스트번호");
+    // Renaming a phone thread is a contact label: `name` stays the SMS
+    // identity the carrier gate and ownership policy match on.
+    const conv = (listed.conversations as Array<{ cid: string; name: string; synced_contact_name?: string | null }>)
+      .find((c) => c.cid === smsCid);
+    expect(conv?.name).toBe(PHONE);
+    expect(conv?.synced_contact_name).toBe("테스트번호");
   }, 60_000);
 
   it("brand-new conversation from the gateway appears in the web sidebar", async () => {

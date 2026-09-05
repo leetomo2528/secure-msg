@@ -87,34 +87,6 @@ def init_schema() -> None:
         # Closing the connection on an exception rolls the whole migration
         # back, avoiding a visible half-migrated trust directory.
         c.execute("BEGIN IMMEDIATE")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS device_login_challenges (
-                challenge_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-                sid TEXT NOT NULL,
-                challenge TEXT NOT NULL,
-                session_version INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                consumed_at INTEGER,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_device_login_challenges_device ON device_login_challenges(device_id, created_at)")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS pairing_sessions (
-                pairing_id     TEXT PRIMARY KEY,
-                user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                subject_sid    TEXT NOT NULL,
-                approver_sid   TEXT NOT NULL,
-                nonce_new      TEXT NOT NULL,
-                nonce_approver TEXT NOT NULL,
-                expires_at     INTEGER NOT NULL,
-                consumed_at    INTEGER,
-                created_at     INTEGER NOT NULL
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_pairing_sessions_subject ON pairing_sessions(subject_sid, created_at)")
         user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)")}
         if "identity_sig_pub" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN identity_sig_pub TEXT NOT NULL DEFAULT ''")
@@ -131,33 +103,6 @@ def init_schema() -> None:
         if "email_verified_at" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN email_verified_at INTEGER")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS email_verification_challenges (
-                challenge_id TEXT PRIMARY KEY,
-                email TEXT NOT NULL,
-                username TEXT NOT NULL,
-                pw_hash TEXT NOT NULL,
-                code_digest TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                consumed_at INTEGER,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_email_verification_email ON email_verification_challenges(email, created_at)")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS password_reset_challenges (
-                challenge_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                email TEXT NOT NULL,
-                code_digest TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                consumed_at INTEGER,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_challenges(user_id, created_at)")
         # Migration: add name column if missing (existing DBs created before this column).
         cols = [
             row[1] for row in c.execute("PRAGMA table_info(conversations)").fetchall()
@@ -427,10 +372,19 @@ def create_user(username: str, pw_hash: str, email: str | None = None, email_ver
         return cur.lastrowid
 
 
+#: The login projection. auth.py returns these rows to clients, so the two
+#: lookups below must never drift apart on which columns they expose.
+_USER_COLUMNS = (
+    "id, username, pw_hash, email, email_verified_at, created_at, "
+    "identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, "
+    "security_mode"
+)
+
+
 def get_user_by_name(username: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, username, pw_hash, email, email_verified_at, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE username = ?",
+            f"SELECT {_USER_COLUMNS} FROM users WHERE username = ?",
             (username,),
         ).fetchone()
         return dict(row) if row else None
@@ -439,7 +393,7 @@ def get_user_by_name(username: str) -> dict[str, Any] | None:
 def get_user_by_email(email: str) -> dict[str, Any] | None:
     with conn_ctx() as c:
         row = c.execute(
-            "SELECT id, username, pw_hash, email, email_verified_at, created_at, identity_sig_pub, security_epoch, directory_hash, trust_enforced_at, security_mode FROM users WHERE email = ?",
+            f"SELECT {_USER_COLUMNS} FROM users WHERE email = ?",
             (email,),
         ).fetchone()
         return dict(row) if row else None
@@ -451,6 +405,11 @@ _CHALLENGE_TABLES = (
     "device_login_challenges",
     "pairing_sessions",
 )
+
+#: Wrong-code budget shared by the email-verification and the password-reset
+#: challenge. Both consume paths have to burn the row at the same count, or the
+#: more generous one sets the real brute-force bound for a six-digit code.
+_MAX_CODE_ATTEMPTS = 5
 
 
 def _prune_challenges_locked(c: sqlite3.Connection, timestamp: int) -> int:
@@ -471,6 +430,14 @@ def _prune_challenges_locked(c: sqlite3.Connection, timestamp: int) -> int:
             (cutoff, timestamp),
         )
         removed += cur.rowcount if cur.rowcount > 0 else 0
+    # The retention window is for debugging, but a registration that was
+    # abandoned and expired still holds the credential /login accepts verbatim.
+    # Rows are kept, the login value is not.
+    c.execute(
+        "UPDATE email_verification_challenges SET pw_hash = '' "
+        "WHERE pw_hash != '' AND (consumed_at IS NOT NULL OR expires_at < ?)",
+        (timestamp,),
+    )
     return removed
 
 
@@ -533,7 +500,7 @@ def create_email_verification_challenge(
         c.execute("BEGIN IMMEDIATE")
         _prune_challenges_locked(c, now())
         c.execute(
-            "UPDATE email_verification_challenges SET consumed_at=COALESCE(consumed_at, created_at) WHERE email=? AND consumed_at IS NULL",
+            "UPDATE email_verification_challenges SET consumed_at=COALESCE(consumed_at, created_at), pw_hash='' WHERE email=? AND consumed_at IS NULL",
             (email,),
         )
         c.execute(
@@ -553,14 +520,16 @@ def consume_email_verification(
             (challenge_id,),
         ).fetchone()
         if (not row or row["consumed_at"] is not None or int(row["expires_at"]) < timestamp
-                or int(row["attempts"]) >= 5 or not hmac.compare_digest(row["code_digest"], code_digest)):
-            if row and row["consumed_at"] is None and int(row["attempts"]) < 5:
+                or int(row["attempts"]) >= _MAX_CODE_ATTEMPTS or not hmac.compare_digest(row["code_digest"], code_digest)):
+            if row and row["consumed_at"] is None and int(row["attempts"]) < _MAX_CODE_ATTEMPTS:
                 c.execute("UPDATE email_verification_challenges SET attempts=attempts+1 WHERE challenge_id=?", (challenge_id,))
                 c.execute("COMMIT")
             else:
                 c.execute("ROLLBACK")
             return None
-        c.execute("UPDATE email_verification_challenges SET consumed_at=? WHERE challenge_id=?", (timestamp, challenge_id))
+        # The caller bcrypts pw_hash from this return value; the column itself
+        # is a plaintext login credential the row has no further use for.
+        c.execute("UPDATE email_verification_challenges SET consumed_at=?, pw_hash='' WHERE challenge_id=?", (timestamp, challenge_id))
         result = {"email": row["email"], "username": row["username"], "pw_hash": row["pw_hash"]}
         c.execute("COMMIT")
         return result
@@ -603,9 +572,9 @@ def consume_password_reset(
             (challenge_id,),
         ).fetchone()
         if (not row or row["consumed_at"] is not None or int(row["expires_at"]) < timestamp
-                or int(row["attempts"]) >= 5 or row["email"] != email
+                or int(row["attempts"]) >= _MAX_CODE_ATTEMPTS or row["email"] != email
                 or not hmac.compare_digest(row["code_digest"], code_digest)):
-            if row and row["consumed_at"] is None and int(row["attempts"]) < 5:
+            if row and row["consumed_at"] is None and int(row["attempts"]) < _MAX_CODE_ATTEMPTS:
                 c.execute("UPDATE password_reset_challenges SET attempts=attempts+1 WHERE challenge_id=?", (challenge_id,))
                 c.execute("COMMIT")
             else:
@@ -941,6 +910,18 @@ def revoke_device(
         if row["trust_state"] != "approved":
             c.execute("ROLLBACK")
             raise ValueError("device is not approved")
+        approved = int(c.execute(
+            "SELECT COUNT(*) AS count FROM devices WHERE user_id = ? AND trust_state = 'approved'",
+            (user_id,),
+        ).fetchone()["count"])
+        if approved <= 1:
+            # There is no way back from zero. add_device only bootstraps into
+            # 'approved' when the account has no device rows at all and the
+            # tombstone stays forever, so the replacement would be pending with
+            # nobody left to approve it; peers that pinned the directory read
+            # the resulting empty device list as an equivocating relay.
+            c.execute("ROLLBACK")
+            raise ValueError("cannot revoke the last approved device")
         current_epoch = int(c.execute(
             "SELECT security_epoch FROM users WHERE id=?", (user_id,)
         ).fetchone()["security_epoch"])
@@ -1408,6 +1389,48 @@ def get_conversation_by_cid(cid: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def list_conversations_for_user(user_id: int) -> list[dict[str, Any]]:
+    """Conversations ``user_id`` belongs to, each with its member usernames.
+
+    The Android gateway decides which threads it owns from the ``members``
+    array of these rows, so the shape is a wire contract; it lives here rather
+    than in the Flask view because a new synced_* column has to be added in
+    one place, next to the rest of the conversation schema knowledge.
+    """
+    # One pass for the conversations and one for every membership in them,
+    # rather than a members query per conversation.
+    with read_snapshot() as c:
+        rows = c.execute(
+            "SELECT cv.cid, cv.id AS conv_id, cv.name, cv.synced_contact_name, "
+            "cv.created_at FROM conversation_members m "
+            "JOIN conversations cv ON cv.id = m.conv_id WHERE m.user_id = ? "
+            "ORDER BY cv.created_at DESC, cv.id DESC",
+            (user_id,),
+        ).fetchall()
+        member_rows = c.execute(
+            "SELECT peers.conv_id AS conv_id, u.username AS username "
+            "FROM conversation_members mine "
+            "JOIN conversation_members peers ON peers.conv_id = mine.conv_id "
+            "JOIN users u ON u.id = peers.user_id "
+            "WHERE mine.user_id = ?",
+            (user_id,),
+        ).fetchall()
+    members_by_conv: dict[int, list[str]] = {}
+    for row in member_rows:
+        members_by_conv.setdefault(int(row["conv_id"]), []).append(row["username"])
+    return [
+        {
+            "cid": r["cid"],
+            "conv_id": r["conv_id"],
+            "name": r["name"],
+            "synced_contact_name": r["synced_contact_name"],
+            "members": members_by_conv.get(int(r["conv_id"]), []),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 # One definition of "the devices this conversation is addressed to". The
 # Socket.IO fan-out and /conversation/<cid>/members must agree on it exactly:
 # the client turns the endpoint's answer into the recipient keyset, and
@@ -1524,13 +1547,47 @@ def message_retry_matches(
     payload: str | dict[str, Any],
     sender_pub_key: str,
 ) -> bool:
-    """Check that a reused client_mid is the same security-bound message."""
+    """Check that a reused client_mid is the same security-bound message.
+
+    Only the parts the sender sealed are compared. [share_message_keys]
+    rewrites `keys` on a stored envelope long after it was sent, so
+    whole-payload equality turned a byte-identical retry of an already
+    delivered message into "message id conflicts with original message" as
+    soon as any new device had backfilled its history — and both clients
+    answer that by minting a fresh mid, which dispatches the SMS twice.
+    """
     try:
-        return (
-            str(existing["cid"]) == cid
-            and str(existing["sender_pub_key"]) == sender_pub_key
-            and canonical_message_payload(existing["payload"])
-            == canonical_message_payload(payload)
+        if str(existing["cid"]) != cid or str(existing["sender_pub_key"]) != sender_pub_key:
+            return False
+        stored = existing["payload"]
+        stored = json.loads(stored) if isinstance(stored, str) else stored
+        retried = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(stored, dict) or not isinstance(retried, dict):
+            return canonical_message_payload(stored) == canonical_message_payload(retried)
+        if canonical_message_payload(
+            {field: value for field, value in stored.items() if field != "keys"}
+        ) != canonical_message_payload(
+            {field: value for field, value in retried.items() if field != "keys"}
+        ):
+            return False
+        stored_keys = stored.get("keys")
+        retried_keys = retried.get("keys")
+        if not isinstance(stored_keys, dict) or not isinstance(retried_keys, dict):
+            return canonical_message_payload(stored_keys) == canonical_message_payload(
+                retried_keys
+            )
+        for sid, entry in retried_keys.items():
+            if sid not in stored_keys or canonical_message_payload(
+                stored_keys[sid]
+            ) != canonical_message_payload(entry):
+                return False
+        # A stored key the retry does not carry is only explainable by the
+        # backfill: SHARE_WRAPPER_FIELD is written by the server, never by a
+        # sender, so anything else is a different message reusing the mid.
+        return all(
+            sid in retried_keys
+            or (isinstance(entry, dict) and SHARE_WRAPPER_FIELD in entry)
+            for sid, entry in stored_keys.items()
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -1873,6 +1930,24 @@ def list_member_user_ids(conv_id: int) -> list[int]:
             (conv_id,),
         ).fetchall()
         return [int(r["user_id"]) for r in rows]
+
+
+def is_conversation_member(conv_id: int, user_id: int) -> bool:
+    """Return whether ``user_id``'s account belongs to the conversation.
+
+    Membership is an account property. The callers that used to answer this
+    boolean by scanning [list_members] were additionally requiring the account
+    to expose at least one approved device, but auth_required and the socket's
+    current_client have already refused any caller whose own device is not
+    approved, so this EXISTS admits and refuses exactly the same requests
+    without materializing every member device and its key material.
+    """
+    with conn_ctx() as c:
+        row = c.execute(
+            "SELECT 1 FROM conversation_members WHERE conv_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        return row is not None
 
 
 def is_self_only_conversation_owner(conv_id: int, user_id: int) -> bool:

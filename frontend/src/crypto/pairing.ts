@@ -63,10 +63,11 @@ export interface SafetyNumberFields {
 
 /**
  * Short human-comparable safety number for one pairing session.
- * SHA-256 over a domain-separated canonical statement, first 150 bits as
- * five 30-bit groups rendered as 6-digit numbers. Both clients (web and
- * Android) must derive byte-identical output; a golden vector is pinned in
- * the unit tests of each platform.
+ * SHA-256 over a domain-separated canonical statement, then the LOW 150 bits
+ * of the 200-bit big-endian prefix (digest bytes 0-24) as five 30-bit groups
+ * rendered as 6-digit numbers — the top 50 bits are discarded. Both clients
+ * (web and Android) must derive byte-identical output; a golden vector is
+ * pinned in the unit tests of each platform.
  */
 export function pairingSafetyNumber(fields: SafetyNumberFields): string {
   const canonical =

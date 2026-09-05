@@ -9,6 +9,7 @@ server. Each device applies rules locally after decryption.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import store
 from auth import _err, _json_body, _ok, _rate_error, auth_required
@@ -19,6 +20,7 @@ from sockets import emit_to_user_devices
 bp = Blueprint("blocklist", __name__, url_prefix="/api")
 
 RULE_TYPES = {"keyword", "sender"}
+MAX_SAFE_INT = 2 ** 53
 # Loose sender address: digits/+/#/* with separators, 3-32 chars after strip.
 SENDER_RE = re.compile(r"[+*#0-9][+*#0-9\-\s]{1,30}[0-9]", re.ASCII)
 
@@ -29,6 +31,12 @@ def _validate(rule_type: object, raw_value: object) -> tuple[str, str] | None:
     if not isinstance(raw_value, str):
         return None
     value = raw_value.strip()
+    # A lone surrogate is not UTF-8 encodable, so sqlite3 raised
+    # UnicodeEncodeError at bind time; that is a ValueError subclass, so
+    # add_rule answered 409 "limit reached" with the raw codec message in it.
+    # Control characters are rejected on the same terms as contact names.
+    if any(unicodedata.category(char) in ("Cc", "Cs") for char in value):
+        return None
     if rule_type == "keyword":
         if not (1 <= len(value) <= 120):
             return None
@@ -79,9 +87,16 @@ def remove_rule():
     retry_after = rate_limit("blocklist-remove", g.auth["sid"], 120, 60)
     if retry_after:
         return _rate_error(retry_after)
+    raw_id = body.get("id")
+    # int(True) is 1 and int(1e19) is past what sqlite3 can bind (OverflowError,
+    # which no handler catches), so neither may reach remove_block_rule.
+    if isinstance(raw_id, bool):
+        return _err("id must be an integer", 400)
     try:
-        rule_id = int(body.get("id"))
-    except (TypeError, ValueError):
+        rule_id = int(raw_id)
+    except (TypeError, ValueError, OverflowError):
+        return _err("id must be an integer", 400)
+    if abs(rule_id) > MAX_SAFE_INT:
         return _err("id must be an integer", 400)
     if not store.remove_block_rule(g.auth["uid"], rule_id):
         return _err("rule not found", 404)

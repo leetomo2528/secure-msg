@@ -1,6 +1,7 @@
 package com.yunjelee.securemsg
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.telephony.TelephonyManager
@@ -14,19 +15,7 @@ class SmsRespondService : Service() {
             val phone = intent.data?.schemeSpecificPart.orEmpty()
             val text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
             if (phone.isNotBlank() && text.isNotBlank()) {
-                val bridge = Intent(this, SmsBridgeService::class.java)
-                    .setAction(SmsBridgeService.ACTION_SEND_LOCAL_SMS)
-                    .putExtra(SmsBridgeService.EXTRA_PHONE, phone)
-                    .putExtra(SmsBridgeService.EXTRA_BODY, text)
-                try {
-                    ContextCompat.startForegroundService(this, bridge)
-                } catch (e: RuntimeException) {
-                    // The platform invoked this service specifically to satisfy a
-                    // quick reply. Preserve carrier functionality if an OEM blocks
-                    // the bridge FGS; only cross-device relay is deferred/lost.
-                    Log.e("SmsRespondService", "Bridge start rejected; sending carrier-only", e)
-                    SmsSender.send(this, phone, text)
-                }
+                LocalSmsBridge.send(this, phone, text)
             }
         }
         stopSelf(startId)
@@ -34,4 +23,28 @@ class SmsRespondService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+}
+
+/**
+ * How an outgoing SMS composed outside the app's own UI reaches the network:
+ * the bridge runs OutgoingSmsDispatcher (carrier send + relay to web + thread
+ * insert), so sending is never reimplemented at a call site.
+ */
+internal object LocalSmsBridge {
+    private const val TAG = "LocalSmsBridge"
+
+    fun send(context: Context, phone: String, text: String) {
+        val bridge = Intent(context, SmsBridgeService::class.java)
+            .setAction(SmsBridgeService.ACTION_SEND_LOCAL_SMS)
+            .putExtra(SmsBridgeService.EXTRA_PHONE, phone)
+            .putExtra(SmsBridgeService.EXTRA_BODY, text)
+        try {
+            ContextCompat.startForegroundService(context, bridge)
+        } catch (e: RuntimeException) {
+            // Preserve carrier functionality if an OEM blocks the bridge FGS;
+            // only cross-device relay is deferred/lost.
+            Log.e(TAG, "Bridge start rejected; sending carrier-only", e)
+            SmsSender.send(context, phone, text)
+        }
+    }
 }

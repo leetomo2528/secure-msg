@@ -14,7 +14,6 @@ import java.io.FileOutputStream
 object MmsSender {
     private const val TAG = "MmsSender"
     private const val AUTHORITY = "com.yunjelee.securemsg.mms"
-    private const val EXTRA_PDU_ID = "pdu_id"
 
     fun send(
         context: Context,
@@ -33,7 +32,6 @@ object MmsSender {
             val dir = File(context.cacheDir, "mms-pdu").apply { mkdirs() }
             val file = File(dir, "$id.pdu")
             val pdu = MmsPduComposer.compose(
-                from = "insert-address-token",
                 to = phoneNumber,
                 subject = content.subject,
                 text = content.text,
@@ -63,7 +61,7 @@ object MmsSender {
                     .putExtra(CarrierStatusReceiver.EXTRA_SEQ, seq)
                     .putExtra(CarrierStatusReceiver.EXTRA_PART, 0)
                     .putExtra(CarrierStatusReceiver.EXTRA_PART_COUNT, 1)
-                    .putExtra(EXTRA_PDU_ID, id),
+                    .putExtra(CarrierStatusReceiver.EXTRA_PDU_ID, id),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             val sms = context.getSystemService(SmsManager::class.java)

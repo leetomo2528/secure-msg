@@ -1,6 +1,5 @@
 package com.yunjelee.securemsg
 
-import android.content.Context
 import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
@@ -250,28 +249,7 @@ data class PendingDeviceApproval(
     )
 }
 
-sealed interface PendingDevicesResult {
-    data class Available(val devices: List<PendingDeviceApproval>) : PendingDevicesResult
-    data object Unsupported : PendingDevicesResult
-    data class Failed(val message: String) : PendingDevicesResult
-}
-
-interface TrustedDeviceApi {
-    fun pendingDevices(): PendingDevicesResult
-    fun approveDevice(
-        device: PendingDeviceApproval,
-        signature: String,
-        pairing: PairingBinding? = null,
-    ): Boolean
-    fun rejectPendingDevice(device: PendingDeviceApproval): Boolean
-    /** Returns (pairing_id, nonce_approver) or null when the relay refuses. */
-    fun openPairingSession(device: PendingDeviceApproval, nonceNew: String): Pair<String, String>?
-}
-
-class RelayTrustedDeviceApi(
-    private val api: RelayApi,
-    private val uid: Long,
-) : TrustedDeviceApi {
+class RelayTrustedDeviceApi(private val api: RelayApi) {
     internal fun loadDeviceResponse(): JSONObject = api.listDevices()
     internal fun loadDirectoryResponse(): JSONObject = api.keyDirectory()
     internal fun pendingStatus(): JSONObject = api.pendingDeviceStatus()
@@ -279,45 +257,15 @@ class RelayTrustedDeviceApi(
     internal fun upgradeLegacy(parentEpoch: Long, signature: String): Boolean =
         api.upgradeLegacySecurity(parentEpoch, signature).optBoolean("ok")
 
-    override fun pendingDevices(): PendingDevicesResult = try {
-        val response = loadDeviceResponse()
-        if (!response.optBoolean("ok")) {
-            if (response.optInt("_http_status") == 404) PendingDevicesResult.Unsupported
-            else PendingDevicesResult.Failed(response.optString("error", "기기 목록 조회 실패"))
-        } else {
-            val devices = response.optJSONArray("devices") ?: JSONArray()
-            val epoch = response.optLong("security_epoch", -1)
-            val pending = (0 until devices.length()).mapNotNull { index ->
-                val obj = devices.optJSONObject(index) ?: return@mapNotNull null
-                if (obj.optString("trust_state") != "pending") return@mapNotNull null
-                val challenge = obj.optString("challenge")
-                if (challenge.isBlank()) return@mapNotNull null
-                PendingDeviceApproval(
-                    uid = obj.optLong("uid", uid),
-                    sid = obj.getString("sid"),
-                    name = obj.optString("name", obj.getString("sid")),
-                    kind = obj.getString("kind"),
-                    pubKey = obj.getString("pub_key"),
-                    sigPub = obj.getString("sig_pub"),
-                    challenge = challenge,
-                    parentEpoch = epoch,
-                    requestedAt = obj.optLong("created_at").takeIf { obj.has("created_at") },
-                )
-            }
-            PendingDevicesResult.Available(pending)
-        }
-    } catch (e: Exception) {
-        PendingDevicesResult.Failed(e.message ?: "기기 목록 조회 실패")
-    }
-
-    override fun approveDevice(
+    fun approveDevice(
         device: PendingDeviceApproval,
         signature: String,
-        pairing: PairingBinding?,
+        pairing: PairingBinding? = null,
     ): Boolean = api.approveDevice(device.sid, device.parentEpoch, signature, pairing)
         .optBoolean("ok")
 
-    override fun openPairingSession(
+    /** Returns (pairing_id, nonce_approver) or null when the relay refuses. */
+    fun openPairingSession(
         device: PendingDeviceApproval,
         nonceNew: String,
     ): Pair<String, String>? {
@@ -329,7 +277,7 @@ class RelayTrustedDeviceApi(
         return pairingId to nonceApprover
     }
 
-    override fun rejectPendingDevice(device: PendingDeviceApproval): Boolean =
+    fun rejectPendingDevice(device: PendingDeviceApproval): Boolean =
         api.rejectPendingDevice(device.sid, device.challenge, device.parentEpoch).optBoolean("ok")
 }
 
@@ -650,6 +598,15 @@ object TrustDirectoryValidator {
             ) return TrustDecision.Reject("trusted key changed for sid ${device.sid}")
         }
         val proof = snapshot.proof ?: return TrustDecision.Reject("directory proof missing")
+        // Once an account has proven verified_v2, a relay serving legacy_v1 is an
+        // attack, not a rollback of its own state: the legacy branch below trusts
+        // every legacy_tofu history entry without a signature, so accepting the
+        // downgrade would pin devices this account never approved. The web store
+        // refuses the same transition (frontend/src/store/db.ts). A null pinned
+        // mode is a pre-migration row and stays permissive on purpose.
+        if (state?.securityMode == "verified_v2" && proof.securityMode != "verified_v2") {
+            return TrustDecision.Reject("verified directory downgraded to legacy mode")
+        }
         val history = proof.deviceHistory.associateBy { it.sid }
         for (pin in pins) {
             val historical = history[pin.sid] ?: return TrustDecision.Reject("pinned device missing from history")
@@ -657,7 +614,7 @@ object TrustDirectoryValidator {
                 historical.kind != pin.kind
             ) return TrustDecision.Reject("pinned history key changed for sid ${pin.sid}")
         }
-        val proofError = verifyDirectoryProof(proof, snapshot, state == null, existing.keys)
+        val proofError = verifyDirectoryProof(proof, snapshot)
         if (proofError != null) return TrustDecision.Reject(proofError)
         return TrustDecision.Accept(hash, state == null)
     }
@@ -666,8 +623,6 @@ object TrustDirectoryValidator {
 internal fun verifyDirectoryProof(
     proof: DirectoryProof,
     snapshot: TrustedDirectorySnapshot,
-    firstUse: Boolean,
-    knownTrustedSids: Set<String> = emptySet(),
     // Takes the ALREADY-canonical statement text, so v1 and v2 approvals share
     // one verifier and unit tests can still inject a stub instead of the
     // native sodium binding.
@@ -691,9 +646,13 @@ internal fun verifyDirectoryProof(
     val activeAtEpoch = mutableSetOf(root.sid)
     if (proof.securityMode == "legacy_v1") {
         // Explicitly unverified TOFU state; UI/service must not claim v2 security.
+        // Migrated devices count as active even when the directory now lists them
+        // revoked: the relay issues the revocation certificate against the state
+        // BEFORE the revocation, so gating on the post-revocation trust_state left
+        // every legacy revocation unanchored and locked the account out.
         proof.deviceHistory.filter { it.approvedBySid == "legacy_tofu" }.forEach {
             trusted += it.sid
-            if (it.trustState == "approved") activeAtEpoch += it.sid
+            activeAtEpoch += it.sid
         }
     } else if (proof.securityMode != "verified_v2") return "unknown security mode"
 
@@ -740,9 +699,7 @@ internal fun verifyDirectoryProof(
                     actor.sid, cert.parentEpoch,
                 )
                 if (cert.statement != runCatching { statement.canonical() }.getOrNull() ||
-                    !CryptoUtil.verifyDetached(
-                        cert.statement.toByteArray(Charsets.UTF_8), cert.signature, actor.sigPub,
-                    )
+                    !verifySignature(cert.statement, cert.signature, actor.sigPub)
                 ) return "revocation certificate signature or statement invalid"
                 activeAtEpoch -= subject.sid
             }
@@ -753,9 +710,7 @@ internal fun verifyDirectoryProof(
                 )
                 if (cert.identitySid != root.sid ||
                     cert.statement != runCatching { statement.canonical() }.getOrNull() ||
-                    !CryptoUtil.verifyDetached(
-                        cert.statement.toByteArray(Charsets.UTF_8), cert.signature, root.sigPub,
-                    )
+                    !verifySignature(cert.statement, cert.signature, root.sigPub)
                 ) return "legacy security upgrade certificate invalid"
             }
         }
@@ -809,16 +764,15 @@ class DeviceTrustRepository(private val db: AppDatabase) {
                 dao.touchPin(d.sid, d.name, now)
             }
         }
+        // Recording the mode is what makes the downgrade check in validate() bite
+        // on the next proof; validate() has already refused a null proof here.
         val state = TrustDirectoryState(
             snapshot.uid, snapshot.identityKey, snapshot.epoch, decision.directoryHash,
             DeviceTrustCrypto.safetyNumber(snapshot.uid, snapshot.identityKey), now,
+            snapshot.proof?.securityMode,
         )
         if (dao.getState(snapshot.uid) == null) dao.insertState(state) else dao.updateState(state)
         decision
-    }
-
-    companion object {
-        fun get(context: Context) = DeviceTrustRepository(AppDatabase.get(context))
     }
 }
 
@@ -837,21 +791,6 @@ private fun requireB64u(field: String, value: String, bytes: Int): ByteArray {
     }
     return decoded
 }
-
-internal fun pendingDeviceFromJson(obj: JSONObject): PendingDeviceApproval = PendingDeviceApproval(
-    uid = obj.getLong("uid"),
-    sid = obj.getString("sid"),
-    name = obj.optString("name", obj.getString("sid")),
-    kind = obj.getString("kind"),
-    pubKey = obj.getString("pub_key"),
-    sigPub = obj.getString("sig_pub"),
-    challenge = obj.getString("challenge"),
-    parentEpoch = obj.getLong("parent_epoch"),
-    requestedAt = obj.optLong("requested_at").takeIf { obj.has("requested_at") },
-)
-
-internal fun pendingDevicesFromJson(array: JSONArray): List<PendingDeviceApproval> =
-    (0 until array.length()).map { pendingDeviceFromJson(array.getJSONObject(it)) }
 
 internal fun directoryProofFromJson(obj: JSONObject): DirectoryProof {
     val historyJson = obj.getJSONArray("device_history")

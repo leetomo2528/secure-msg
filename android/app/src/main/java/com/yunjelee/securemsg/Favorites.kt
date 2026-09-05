@@ -20,9 +20,6 @@ object Favorites {
             ?.toSet()
             .orEmpty()
 
-    fun isFavorite(context: Context, normalizedPhone: String): Boolean =
-        PhoneNumberNormalizer.normalize(normalizedPhone) in load(context)
-
     /** Flips [normalizedPhone], persists, and returns the new set. */
     fun toggle(context: Context, normalizedPhone: String): Set<String> {
         val next = toggled(load(context), normalizedPhone)

@@ -175,12 +175,12 @@ class DeviceTrustTest {
                 approval.canonical(), signature)),
         )
         val snapshot = base.copy(claimedDirectoryHash = hash, proof = proof)
-        assertEquals(null, verifyDirectoryProof(proof, snapshot, false) { _, sig, pk ->
+        assertEquals(null, verifyDirectoryProof(proof, snapshot) { _, sig, pk ->
             sig == signature && pk == bootstrap.sigPub
         })
         assertTrue(verifyDirectoryProof(
             proof.copy(approvalCertificates = proof.approvalCertificates.map { it.copy(statement = it.statement + "x") }),
-            snapshot, false,
+            snapshot,
         ) { _, _, _ -> true }!!.contains("invalid"))
     }
 
@@ -215,18 +215,18 @@ class DeviceTrustTest {
 
         assertEquals(
             "certificate epoch does not match directory epoch",
-            verifyDirectoryProof(proof, snapshot, false) { _, _, _ -> true },
+            verifyDirectoryProof(proof, snapshot) { _, _, _ -> true },
         )
     }
 
     @Test fun rootOnlyVerifiedDirectoryRequiresEpochOne() {
         val accepted = snapshot(1, listOf(descriptor("device_a", one, two)))
-        assertEquals(null, verifyDirectoryProof(accepted.proof!!, accepted, true))
+        assertEquals(null, verifyDirectoryProof(accepted.proof!!, accepted))
 
         val inflated = snapshot(2, accepted.devices)
         assertEquals(
             "root-only verified directory must have security epoch 1",
-            verifyDirectoryProof(inflated.proof!!, inflated, true),
+            verifyDirectoryProof(inflated.proof!!, inflated),
         )
     }
 
@@ -234,7 +234,113 @@ class DeviceTrustTest {
         val legacy = snapshot(
             7, listOf(descriptor("device_a", one, two)), securityMode = "legacy_v1",
         )
-        assertEquals(null, verifyDirectoryProof(legacy.proof!!, legacy, true))
+        assertEquals(null, verifyDirectoryProof(legacy.proof!!, legacy))
+    }
+
+    @Test fun revokedDeviceLeavesTheDirectoryAndItsCertificateIsSignatureChecked() {
+        val (proof, snapshot) = approvedThenRevokedProof()
+        val signatures = (proof.approvalCertificates.map { it.statement to it.signature } +
+            proof.revocationCertificates.map { it.statement to it.signature }).toMap()
+        assertEquals(
+            null,
+            verifyDirectoryProof(proof, snapshot) { statement, signature, signerKey ->
+                signerKey == two && signatures[statement] == signature
+            },
+        )
+        val revocation = proof.revocationCertificates.single().statement
+        assertEquals(
+            "revocation certificate signature or statement invalid",
+            verifyDirectoryProof(proof, snapshot) { statement, _, _ -> statement != revocation },
+        )
+    }
+
+    @Test fun tamperedRevocationStatementIsRejected() {
+        val (proof, snapshot) = approvedThenRevokedProof()
+        val tampered = proof.copy(
+            revocationCertificates = proof.revocationCertificates.map {
+                it.copy(statement = it.statement.replace("parent_epoch=5", "parent_epoch=4"))
+            },
+        )
+        assertEquals(
+            "revocation certificate signature or statement invalid",
+            verifyDirectoryProof(tampered, snapshot) { _, _, _ -> true },
+        )
+    }
+
+    @Test fun legacyUpgradeCertificateMustCarryTheRootIdentity() {
+        val root = descriptor("device_a", one, two)
+        val base = TrustedDirectorySnapshot(42, two, 2, listOf(root))
+        val hash = DeviceTrustCrypto.directoryHash(base)
+        val signature = CryptoUtil.b64u(ByteArray(64) { 2 })
+        val upgrade = SecurityUpgradeCertificate(
+            root.sid, 1, 2,
+            LegacySecurityUpgradeStatement(42, root.sid, root.sigPub, 1).canonical(), signature,
+        )
+        val proof = DirectoryProof(
+            42, two, 2, hash, 1,
+            listOf(
+                DeviceHistoryEntry(
+                    root.sid, root.kind, root.pubKey, root.sigPub,
+                    "approved", zero, "legacy_tofu", null,
+                ),
+            ),
+            emptyList(),
+            securityUpgradeCertificates = listOf(upgrade),
+        )
+        val snapshot = base.copy(claimedDirectoryHash = hash, proof = proof)
+
+        assertEquals(
+            null,
+            verifyDirectoryProof(proof, snapshot) { statement, sig, signerKey ->
+                statement == upgrade.statement && sig == signature && signerKey == root.sigPub
+            },
+        )
+        assertEquals(
+            "legacy security upgrade certificate invalid",
+            verifyDirectoryProof(
+                proof.copy(
+                    securityUpgradeCertificates = listOf(upgrade.copy(identitySid = "device_b")),
+                ),
+                snapshot,
+            ) { _, _, _ -> true },
+        )
+    }
+
+    @Test fun legacyRevocationOfAMigratedDeviceIsAnchored() {
+        // The relay marks every migrated device legacy_tofu and lets any of them
+        // be revoked, so a directory whose peer is already revoked is the normal
+        // shape here; refusing it locked the phone out of a legacy account.
+        val root = descriptor("device_a", one, two)
+        val peer = descriptor("device_b", two, one)
+        val base = TrustedDirectorySnapshot(42, two, 8, listOf(root))
+        val hash = DeviceTrustCrypto.directoryHash(base)
+        val signature = CryptoUtil.b64u(ByteArray(64) { 3 })
+        val proof = DirectoryProof(
+            42, two, 8, hash, 1,
+            listOf(
+                DeviceHistoryEntry(
+                    root.sid, root.kind, root.pubKey, root.sigPub,
+                    "approved", zero, "legacy_tofu", null,
+                ),
+                DeviceHistoryEntry(
+                    peer.sid, peer.kind, peer.pubKey, peer.sigPub,
+                    "revoked", zero, "legacy_tofu", null,
+                ),
+            ),
+            emptyList(),
+            securityMode = "legacy_v1",
+            revocationCertificates = listOf(
+                RevocationCertificate(
+                    peer.sid, root.sid, 7, 8, "user_revoked",
+                    DeviceRevokeStatement(42, peer.sid, peer.pubKey, peer.sigPub, root.sid, 7)
+                        .canonical(),
+                    signature,
+                ),
+            ),
+        )
+        val snapshot = base.copy(claimedDirectoryHash = hash, proof = proof)
+
+        assertEquals(null, verifyDirectoryProof(proof, snapshot) { _, _, _ -> true })
     }
 
     @Test fun rollbackAndSameEpochEquivocationAreRejected() {
@@ -246,6 +352,44 @@ class DeviceTrustTest {
             snapshot(7, accepted.devices + descriptor("device_b", two, one)),
             state,
             emptyList(),
+        )
+    }
+
+    @Test fun legacyModeDowngradeAfterAVerifiedProofIsRejected() {
+        val devices = listOf(descriptor("device_a", one, two))
+        val verified = snapshot(1, devices)
+        assertTrue(TrustDirectoryValidator.validate(verified, null, emptyList()) is TrustDecision.Accept)
+        val state = stateFor(verified)
+        assertEquals("verified_v2", state.securityMode)
+
+        // The relay keeps the keys and only walks the mode back, advancing the
+        // epoch so neither the rollback nor the equivocation rule fires first.
+        assertRejects("downgraded", snapshot(2, devices, securityMode = "legacy_v1"), state, emptyList())
+        assertTrue(TrustDirectoryValidator.validate(verified, state, emptyList()) is TrustDecision.Accept)
+    }
+
+    @Test fun firstProofAfterTheMigrationSetsTheModeItAccepts() {
+        val devices = listOf(descriptor("device_a", one, two))
+        // A row written before securityMode existed carries null. A phone still on
+        // legacy TOFU has to keep working across that upgrade, not lock itself out.
+        val legacy = snapshot(7, devices, securityMode = "legacy_v1")
+        val preMigration = stateFor(legacy).copy(securityMode = null)
+        assertTrue(
+            TrustDirectoryValidator.validate(legacy, preMigration, emptyList()) is TrustDecision.Accept,
+        )
+        assertEquals("legacy_v1", stateFor(legacy).securityMode)
+
+        // The same null row accepts a verified proof, and it is that first
+        // acceptance which starts refusing the downgrade.
+        val verified = snapshot(1, devices)
+        assertTrue(
+            TrustDirectoryValidator.validate(
+                verified, stateFor(verified).copy(securityMode = null), emptyList(),
+            ) is TrustDecision.Accept,
+        )
+        assertRejects(
+            "downgraded", snapshot(2, devices, securityMode = "legacy_v1"),
+            stateFor(verified), emptyList(),
         )
     }
 
@@ -290,9 +434,52 @@ class DeviceTrustTest {
         return base.copy(claimedDirectoryHash = hash, proof = proof)
     }
 
+    /** Root approves a peer at epoch 5, then revokes it at epoch 6. */
+    private fun approvedThenRevokedProof(): Pair<DirectoryProof, TrustedDirectorySnapshot> {
+        val root = descriptor("device_a", one, two)
+        val peer = descriptor("device_b", two, one)
+        val base = TrustedDirectorySnapshot(42, two, 6, listOf(root))
+        val hash = DeviceTrustCrypto.directoryHash(base)
+        val approvalSignature = CryptoUtil.b64u(ByteArray(64))
+        val revokeSignature = CryptoUtil.b64u(ByteArray(64) { 1 })
+        val proof = DirectoryProof(
+            42, two, 6, hash, 1,
+            listOf(
+                DeviceHistoryEntry(
+                    root.sid, root.kind, root.pubKey, root.sigPub,
+                    "approved", zero, root.sid, null,
+                ),
+                DeviceHistoryEntry(
+                    peer.sid, peer.kind, peer.pubKey, peer.sigPub,
+                    "revoked", zero, root.sid, approvalSignature,
+                ),
+            ),
+            listOf(
+                ApprovalCertificate(
+                    peer.sid, root.sid, 4, 5,
+                    DeviceApprovalStatement(
+                        42, peer.sid, peer.pubKey, peer.sigPub, peer.kind, zero, 4,
+                    ).canonical(),
+                    approvalSignature,
+                ),
+            ),
+            revocationCertificates = listOf(
+                RevocationCertificate(
+                    peer.sid, root.sid, 5, 6, "user_revoked",
+                    DeviceRevokeStatement(42, peer.sid, peer.pubKey, peer.sigPub, root.sid, 5)
+                        .canonical(),
+                    revokeSignature,
+                ),
+            ),
+        )
+        return proof to base.copy(claimedDirectoryHash = hash, proof = proof)
+    }
+
+    /** Mirrors the row DeviceTrustRepository.apply writes for an accepted snapshot. */
     private fun stateFor(snapshot: TrustedDirectorySnapshot) = TrustDirectoryState(
         snapshot.uid, snapshot.identityKey, snapshot.epoch,
         DeviceTrustCrypto.directoryHash(snapshot), DeviceTrustCrypto.safetyNumber(snapshot.uid, snapshot.identityKey), 1,
+        snapshot.proof?.securityMode,
     )
 
     private fun pinFor(d: TrustedDeviceDescriptor) = TrustedDevicePin(

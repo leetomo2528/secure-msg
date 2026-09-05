@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.provider.ContactsContract
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -42,8 +41,6 @@ import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.Calendar
-import java.util.Locale
 
 /** One address-book phone entry as the 연락처 tab shows it. */
 internal data class ContactEntry(
@@ -378,59 +375,21 @@ private fun openAppSettings(context: Context) {
 }
 
 /**
- * Address-book read for the list. `ContactSync.readContactPhones` is private
- * to that object, so the query is mirrored here with the same projection and
- * selection — keep the two in step if either changes. The provider returns
- * one row per phone number; a contact linked across accounts can repeat a
- * number, so rows are deduplicated on (name, normalized phone).
+ * Address-book read for the list, over the same rows the name sync maps, so the
+ * list and the sync can never disagree about which contacts exist. The provider
+ * returns one row per phone number; a contact linked across accounts can repeat
+ * a number, so rows are deduplicated on (name, normalized phone).
  */
-private fun readContacts(context: Context): List<ContactEntry> {
-    val projection = arrayOf(
-        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
-        ContactsContract.CommonDataKinds.Phone.NUMBER,
-    )
-    val rows = buildList {
-        context.contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            projection,
-            "${ContactsContract.CommonDataKinds.Phone.NUMBER} IS NOT NULL",
-            null,
-            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY + " COLLATE NOCASE ASC",
-        )?.use { cursor ->
-            val nameIndex = cursor.getColumnIndexOrThrow(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
-            )
-            val numberIndex = cursor.getColumnIndexOrThrow(
-                ContactsContract.CommonDataKinds.Phone.NUMBER,
-            )
-            while (cursor.moveToNext()) {
-                val name = cursor.getString(nameIndex).orEmpty().trim()
-                val number = cursor.getString(numberIndex).orEmpty().trim()
-                val normalized = PhoneNumberNormalizer.normalize(number)
-                if (name.isNotEmpty() && normalized.isNotEmpty()) {
-                    add(ContactEntry(name, number, normalized))
-                }
+private fun readContacts(context: Context): List<ContactEntry> =
+    ContactSync.readContactPhones(context)
+        .mapNotNull { row ->
+            val name = row.displayName.trim()
+            val number = row.phoneNumber.trim()
+            val normalized = PhoneNumberNormalizer.normalize(number)
+            if (name.isEmpty() || normalized.isEmpty()) {
+                null
+            } else {
+                ContactEntry(name, number, normalized)
             }
         }
-    }
-    return rows.distinctBy { it.name to it.normalizedPhone }
-}
-
-/** "오늘 08:12" / "어제 23:40" / "8/3 09:15" for the header meta. */
-private fun syncTimeLabel(at: Long, now: Long = System.currentTimeMillis()): String {
-    val then = Calendar.getInstance().apply { timeInMillis = at }
-    val today = Calendar.getInstance().apply { timeInMillis = now }
-    val time = String.format(
-        Locale.KOREA,
-        "%02d:%02d",
-        then[Calendar.HOUR_OF_DAY],
-        then[Calendar.MINUTE],
-    )
-    fun sameDay(other: Calendar) =
-        then[Calendar.YEAR] == other[Calendar.YEAR] &&
-            then[Calendar.DAY_OF_YEAR] == other[Calendar.DAY_OF_YEAR]
-    if (sameDay(today)) return "오늘 $time"
-    today.add(Calendar.DAY_OF_YEAR, -1)
-    if (sameDay(today)) return "어제 $time"
-    return "${then[Calendar.MONTH] + 1}/${then[Calendar.DAY_OF_MONTH]} $time"
-}
+        .distinctBy { it.name to it.normalizedPhone }

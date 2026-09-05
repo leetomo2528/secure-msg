@@ -67,6 +67,10 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
 
     private val prefs = ctx.getSharedPreferences("update_prefs", Context.MODE_PRIVATE)
 
+    private val updateDir: File get() = File(ctx.filesDir, UPDATE_DIR)
+
+    private val userAgent = "securemsg-android/${BuildConfig.VERSION_NAME}"
+
     fun autoCheckEnabled(): Boolean = prefs.getBoolean(KEY_AUTO_CHECK, true)
 
     fun setAutoCheckEnabled(enabled: Boolean) {
@@ -99,7 +103,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             val req = Request.Builder()
                 .url(RELEASE_URL)
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "securemsg-android/${BuildConfig.VERSION_NAME}")
+                .header("User-Agent", userAgent)
                 .build()
             http.newCall(req).execute().use { resp ->
                 prefs.edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply()
@@ -131,7 +135,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
     /** Stream the APK into private storage, reporting whole-percent progress. */
     suspend fun download(info: UpdateInfo, onProgress: suspend (Int) -> Unit): File =
         withContext(Dispatchers.IO) {
-            val dir = File(ctx.filesDir, "update").apply { mkdirs() }
+            val dir = updateDir.apply { mkdirs() }
             // Per-attempt file names: the unattended tick and a manual download
             // can run concurrently for the same version, and a shared path
             // would let one flow delete or promote the other's half-written
@@ -144,7 +148,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
             try {
                 val req = Request.Builder()
                     .url(info.apkUrl)
-                    .header("User-Agent", "securemsg-android/${BuildConfig.VERSION_NAME}")
+                    .header("User-Agent", userAgent)
                     .build()
                 var downloadedBytes = 0L
                 http.newCall(req).execute().use { resp ->
@@ -197,7 +201,7 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
     fun cleanupDownloads(olderThanMs: Long = 24 * 60 * 60 * 1000L) {
         val cutoff = System.currentTimeMillis() - olderThanMs
         val pendingPath = pendingUpdate()?.file?.absolutePath
-        File(ctx.filesDir, "update").listFiles()
+        updateDir.listFiles()
             ?.filter { it.lastModified() < cutoff && it.absolutePath != pendingPath }
             ?.forEach { it.delete() }
     }
@@ -328,9 +332,8 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
         return try {
             val obj = JSONObject(raw)
             val file = File(obj.getString("file"))
-            val updateDir = File(ctx.filesDir, "update").canonicalFile
             val canonical = file.canonicalFile
-            if (!canonical.isFile || canonical.parentFile != updateDir) return null
+            if (!canonical.isFile || canonical.parentFile != updateDir.canonicalFile) return null
             PendingUpdate(
                 info = UpdateInfo(
                     tag = obj.getString("tag"),
@@ -458,6 +461,14 @@ class AppUpdater(private val ctx: Context, private val http: OkHttpClient) {
         const val CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000L
         private const val KEY_AUTO_CHECK = "auto_check"
         private const val KEY_AUTO_INSTALL = "auto_install"
+
+        /**
+         * pendingUpdate() rejects any entry whose parent is not this exact
+         * directory, so the download target and that check must never drift
+         * apart: a one-sided edit turns every persisted entry into null with
+         * no error anywhere.
+         */
+        private const val UPDATE_DIR = "update"
 
         /**
          * Process-static: set when this process submits an install session —

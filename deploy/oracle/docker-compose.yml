@@ -11,7 +11,11 @@ services:
       # Device tokens slide on every relay connect (Android) / app load (web),
       # so the TTL only has to outlast a gap in use. Revocation does not depend
       # on it: session_version is re-checked against the DB on every request.
-      SECUREMSG_JWT_TTL: ${SECUREMSG_JWT_TTL:-604800}
+      # This default must stay the 90 days production actually runs: a redeploy
+      # that did not carry the host .env fell back to the old 7-day default and
+      # silently expired both phones mid-sync, and SESSION_MAX_AGE below is
+      # sized as exactly two of these lifetimes.
+      SECUREMSG_JWT_TTL: ${SECUREMSG_JWT_TTL:-7776000}
       # Absolute ceiling on one device session regardless of how often it
       # slides. Past it /token-refresh refuses and the device re-runs
       # /device-login with its stored key (one password entry, no re-approval).

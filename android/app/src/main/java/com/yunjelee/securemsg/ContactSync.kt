@@ -28,6 +28,9 @@ object ContactSync {
     private const val KEY_UPLOADED = "uploaded"
     private const val KEY_UPLOAD_FAILED = "upload_failed"
 
+    /** `POST /api/contact-names/sync` refuses a body with more than this many entries. */
+    private const val MAX_ENTRIES_PER_REQUEST = 500
+
     fun hasPermission(context: Context): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) ==
             PackageManager.PERMISSION_GRANTED
@@ -60,28 +63,38 @@ object ContactSync {
         }
 
         val snapshot = mapping.desiredNames.filterNot { it.cid.startsWith("local_") }
-        require(snapshot.size <= 500) {
-            "서버 대화가 500개를 초과해 연락처 이름을 안전하게 동기화할 수 없습니다"
+        // One request over the cap was refused outright, so an account with more
+        // conversations than that threw here — after the local names had already
+        // been written — and could never publish a single name. An empty snapshot
+        // still posts once so an offline sync reports a failure, not a success.
+        val batches = if (snapshot.isEmpty()) {
+            listOf(emptyList<ContactNameUpdate>())
+        } else {
+            snapshot.chunked(MAX_ENTRIES_PER_REQUEST)
         }
-        val entries = JSONArray().apply {
-            snapshot.forEach { desired ->
-                put(
-                    JSONObject()
-                        .put("cid", desired.cid)
-                        .put("contact_name", desired.localContactName ?: JSONObject.NULL),
-                )
+        var uploaded = 0
+        var failed = 0
+        batches.forEach { batch ->
+            val published = batch.map { it.cid to sanitizeContactName(it.localContactName) }
+            val entries = JSONArray().apply {
+                published.forEach { (cid, name) ->
+                    put(
+                        JSONObject()
+                            .put("cid", cid)
+                            .put("contact_name", name ?: JSONObject.NULL),
+                    )
+                }
             }
-        }
-        val response = try {
-            api.syncContactNames(entries)
-        } catch (_: Exception) {
-            JSONObject().put("ok", false)
-        }
-        val uploaded = if (response.optBoolean("ok")) snapshot.size else 0
-        val failed = if (response.optBoolean("ok")) 0 else snapshot.size.coerceAtLeast(1)
-        if (response.optBoolean("ok")) {
-            snapshot.forEach { desired ->
-                dao.updateSyncedContactNameByCid(desired.cid, desired.localContactName)
+            val ok = try {
+                api.syncContactNames(entries).optBoolean("ok")
+            } catch (_: Exception) {
+                false
+            }
+            if (ok) {
+                uploaded += batch.size
+                published.forEach { (cid, name) -> dao.updateSyncedContactNameByCid(cid, name) }
+            } else {
+                failed += batch.size.coerceAtLeast(1)
             }
         }
 
@@ -102,7 +115,21 @@ object ContactSync {
         return status
     }
 
-    private fun readContactPhones(context: Context): List<ContactPhoneRow> {
+    /**
+     * The relay validates a whole batch and rolls it back on the first bad name,
+     * so one address-book label carrying a control character or running past 100
+     * characters would keep every other name off the account's other devices.
+     */
+    internal fun sanitizeContactName(raw: String?): String? {
+        val cleaned = raw?.filterNot { it.isISOControl() }?.trim().orEmpty()
+        if (cleaned.isEmpty()) return null
+        val capped = cleaned.take(100).trimEnd()
+        // take() can cut a surrogate pair in half, and a lone surrogate is not
+        // UTF-8 encodable — the request would fail before the relay ever saw it.
+        return if (capped.lastOrNull()?.isHighSurrogate() == true) capped.dropLast(1) else capped
+    }
+
+    internal fun readContactPhones(context: Context): List<ContactPhoneRow> {
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
             ContactsContract.CommonDataKinds.Phone.NUMBER,

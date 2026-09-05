@@ -102,11 +102,23 @@ object SmsSender {
             .putExtra(CarrierStatusReceiver.EXTRA_PROVIDER_ID, providerId ?: -1L)
             .putExtra(CarrierStatusReceiver.EXTRA_PART, part)
             .putExtra(CarrierStatusReceiver.EXTRA_PART_COUNT, partCount)
+        val mutability = if (action == CarrierStatusReceiver.ACTION_DELIVERED) {
+            // An immutable PendingIntent makes the framework drop the fill-in extras,
+            // and a status report's real TP-Status arrives only in that "pdu" extra:
+            // without it every permanent failure and every interim "still trying"
+            // report reached us as a bare RESULT_OK and was filed as delivered.
+            // Intent.fillIn lets our own extras win and the component, action and
+            // data are already set, so telephony can add the report and nothing
+            // else, into a receiver that stays android:exported="false".
+            PendingIntent.FLAG_MUTABLE
+        } else {
+            PendingIntent.FLAG_IMMUTABLE
+        }
         return PendingIntent.getBroadcast(
             context,
             requestCode,
             intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            PendingIntent.FLAG_UPDATE_CURRENT or mutability,
         )
     }
 }

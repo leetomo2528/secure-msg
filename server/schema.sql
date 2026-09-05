@@ -87,7 +87,11 @@ CREATE INDEX IF NOT EXISTS idx_pairing_sessions_subject
     ON pairing_sessions(subject_sid, created_at);
 
 -- Short-lived email codes. Raw codes are never stored; code_digest is an
--- HMAC keyed by the server JWT secret and the challenge id.
+-- HMAC keyed by the server JWT secret and the challenge id. `pw_hash` is the
+-- client-stretched value /login accepts verbatim, so it is blanked as soon as
+-- the row is consumed, superseded or expired: users.pw_hash is bcrypt-hashed
+-- precisely so reading the database file does not hand out a live credential,
+-- and a row retained for debugging must not undo that.
 CREATE TABLE IF NOT EXISTS email_verification_challenges (
     challenge_id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -202,7 +206,8 @@ END;
 -- Messages: the encrypted envelope. `payload` is a JSON blob:
 --   { "ct":  base64 ciphertext (secretbox over plaintext),
 --     "nonce": base64 nonce,
---     "keys": { "<device_sid>": {"ek": base64 encrypted message_key (box), "n": base64 nonce} } }
+--     "keys": { "<device_sid>": {"ek": base64 encrypted message_key (box), "n": base64 nonce,
+--                                "by": sid that re-wrapped this key (history share only)} } }
 -- Server cannot decrypt; it only stores and fans out to member devices.
 CREATE TABLE IF NOT EXISTS messages (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,15 +219,17 @@ CREATE TABLE IF NOT EXISTS messages (
     client_mid    TEXT,                            -- sender-generated retry/idempotency id
     payload       TEXT    NOT NULL,                -- encrypted envelope JSON
     created_at    INTEGER NOT NULL,
-    carrier_status TEXT   NOT NULL DEFAULT 'none', -- none|queued|dispatched|sent|delivered|failed|unknown
+    carrier_status TEXT   NOT NULL DEFAULT 'none', -- none|queued|dispatched|sent|delivered|failed|delivery_failed|unknown
     carrier_error  TEXT,
     carrier_updated_at INTEGER,
     UNIQUE (conv_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conv_id, seq);
 
--- Delivery cursors: per (device, conversation) last delivered seq.
--- Lets a reconnecting device pull only new messages.
+-- Delivery cursors: per (device, conversation) last delivered seq, written by
+-- the message_delivered ack. Nothing reads it back — both clients keep their
+-- own `since` and pass it to /messages — so this is a delivery record, not the
+-- resume pointer a reconnecting device actually uses.
 CREATE TABLE IF NOT EXISTS delivery_cursors (
     device_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     conv_id       INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

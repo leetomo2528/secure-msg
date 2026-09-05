@@ -75,7 +75,13 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     // Socket.IO client
-    implementation("io.socket:socket.io-client:2.1.0")
+    implementation("io.socket:socket.io-client:2.1.0") {
+        // Drags in org.json 20090211, which the device can never load: the
+        // platform classes sit on the bootclasspath and always win, so the
+        // dexed copy is dead weight. Excluded here so the JSON implementation
+        // the host tests link stays the one pinned below, and only there.
+        exclude(group = "org.json", module = "json")
+    }
 
     // Lazysodium (libsodium wrapper for Android)
     implementation("com.goterl:lazysodium-android:5.2.0") {
@@ -96,8 +102,14 @@ dependencies {
     // QR *encoding* for the other direction: this phone as the new device.
     implementation("com.google.zxing:core:3.5.3")
 
-    // JSON
-    implementation("org.json:json:20240303")
+    // JSON. Test-only on purpose: org.json is on the Android bootclasspath, so
+    // the app resolves JSONObject/JSONArray to the platform classes and this
+    // artifact could only ever be dead weight in the APK. Under
+    // testDebugUnitTest there is no android.jar, so this IS the org.json every
+    // host test runs against — and the two disagree (platform optString over a
+    // JSON null yields the string "null", this one honours the fallback).
+    // Behaviour that turns on that difference needs an instrumented test.
+    testImplementation("org.json:json:20240303")
 
     // OkHttp (REST calls)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
@@ -112,4 +124,5 @@ dependencies {
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.1")
+    androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

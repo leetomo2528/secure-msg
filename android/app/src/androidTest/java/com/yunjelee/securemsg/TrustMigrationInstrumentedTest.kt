@@ -154,6 +154,68 @@ class TrustMigrationInstrumentedTest {
         }
     }
 
+    /**
+     * The v13 column ships to phones that already hold a pinned directory. If
+     * this migration dropped or rebuilt the table the pin store would be gone
+     * and the account would silently re-TOFU, so the test asserts the existing
+     * row survives byte-exact and the new column reads NULL — "no mode pinned
+     * yet", the only value that does not lock out an account still on legacy.
+     */
+    @Test
+    fun migrationTwelveToThirteenKeepsThePinnedDirectoryAndLeavesTheModeUnset() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val name = "trust-migration-${System.nanoTime()}.db"
+        try {
+            val v12 = helper(name, 12, object : SupportSQLiteOpenHelper.Callback(12) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        "CREATE TABLE IF NOT EXISTS trust_directory_state (" +
+                            "accountUid INTEGER NOT NULL PRIMARY KEY," +
+                            "identityKey TEXT NOT NULL," +
+                            "epoch INTEGER NOT NULL," +
+                            "directoryHash TEXT NOT NULL," +
+                            "safetyNumber TEXT NOT NULL," +
+                            "updatedAt INTEGER NOT NULL)",
+                    )
+                    db.execSQL(
+                        "INSERT INTO trust_directory_state VALUES " +
+                            "(8,'identity-key-b64',5,'directory-hash-b64','1234 5678 9012',987)",
+                    )
+                }
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+            })
+            v12.writableDatabase
+            v12.close()
+
+            val v13 = helper(name, 13, object : SupportSQLiteOpenHelper.Callback(13) {
+                override fun onCreate(db: SupportSQLiteDatabase) = Unit
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {
+                    assertEquals(12, oldVersion)
+                    assertEquals(13, newVersion)
+                    AppDatabase.MIGRATION_12_13.migrate(db)
+                }
+            })
+            val db = v13.writableDatabase
+            db.query(
+                "SELECT accountUid,identityKey,epoch,directoryHash,safetyNumber,updatedAt,securityMode " +
+                    "FROM trust_directory_state",
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(8L, cursor.getLong(0))
+                assertEquals("identity-key-b64", cursor.getString(1))
+                assertEquals(5L, cursor.getLong(2))
+                assertEquals("directory-hash-b64", cursor.getString(3))
+                assertEquals("1234 5678 9012", cursor.getString(4))
+                assertEquals(987L, cursor.getLong(5))
+                assertTrue(cursor.isNull(6))
+                assertEquals(1, cursor.count)
+            }
+            v13.close()
+        } finally {
+            context.deleteDatabase(name)
+        }
+    }
+
     private fun helper(
         name: String,
         version: Int,

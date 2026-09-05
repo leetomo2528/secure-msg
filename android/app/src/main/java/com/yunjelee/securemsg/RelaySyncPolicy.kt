@@ -15,7 +15,11 @@ object RelaySyncPolicy {
         senderSid: String,
         payloadIsObject: Boolean,
     ): RowAction = when {
-        rowCid != expectedCid -> RowAction.RETRY_BATCH
+        // GET /conversation/<cid>/messages carries the conversation id on the
+        // response, never on a row. Requiring it per row turned the very first
+        // row of every page into RETRY_BATCH, so the whole relay->carrier path
+        // was a silent no-op; the caller checks the response-level cid instead.
+        rowCid.isNotEmpty() && rowCid != expectedCid -> RowAction.RETRY_BATCH
         seq <= 0 -> RowAction.RETRY_BATCH
         seq <= cursor -> RowAction.SKIP_ALREADY_CONSUMED
         senderSid.isBlank() -> RowAction.RETRY_BATCH

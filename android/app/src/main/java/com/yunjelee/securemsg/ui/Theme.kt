@@ -132,10 +132,11 @@ object Sm {
      */
     val ink = Color(0xFF0F172A)
 
-    /** Primary accent (blue-600). Named `teal` for source compatibility. */
-    val teal = Color(0xFF2563EB)
+    /** Primary accent (blue-600). */
+    val accent = Color(0xFF2563EB)
     val sky = Color(0xFF4F46E5)
-    val cyan = Color(0xFF2563EB)
+    /** Alias: MainActivity's login spinner still names this spelling of [accent]. */
+    val cyan = accent
     val accentDeep = Color(0xFF1D4ED8)
     val success = Color(0xFF046B4E)
     val danger = Color(0xFFB91C1C)
@@ -147,13 +148,11 @@ object Sm {
     val star = Color(0xFFF59E0B)
     /** Indigo tint behind a `sky` icon (message button, attach, device icon box). */
     val accentTint = Color(0xFFECEEFF)
+    /** Blue wash behind the update banner. */
+    val accentSoft = Color(0xFFEFF6FF)
     /** Chevron-right stroke (slate-400): an affordance, not text, so it may sit below AA. */
     val chevron = Color(0xFF94A3B8)
 
-    val gradient = Brush.linearGradient(listOf(teal, teal))
-    val gradientSoft = Brush.linearGradient(
-        listOf(Color(0xFFEFF6FF), Color(0xFFEFF6FF)),
-    )
     val avatarGradient = Brush.linearGradient(
         listOf(Color(0xFF5B4BE7), Color(0xFF4338CA)),
     )
@@ -344,7 +343,7 @@ fun Caption(text: String) {
     Text(text, color = Sm.text4, fontSize = 11.sp, lineHeight = 15.sp)
 }
 
-/** Primary action — teal→sky gradient fill, dark label. */
+/** Primary action — flat accent fill, white label. */
 @Composable
 fun SmGradientButton(
     text: String,
@@ -360,10 +359,7 @@ fun SmGradientButton(
     Box(
         modifier = modifier
             .clip(shape)
-            .background(
-                if (enabled) Sm.gradient
-                else Brush.linearGradient(listOf(Sm.surfaceAlt, Sm.surfaceAlt)),
-            )
+            .background(if (enabled) Sm.accent else Sm.surfaceAlt)
             .border(
                 1.dp,
                 if (enabled) Color.Transparent else Sm.border,
@@ -428,11 +424,11 @@ fun SmTextField(
         visualTransformation = visualTransformation,
         shape = RoundedCornerShape(12.dp),
         colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = Sm.cyan,
+            focusedBorderColor = Sm.accent,
             unfocusedBorderColor = Sm.borderStrong,
-            focusedLabelColor = Sm.cyan,
+            focusedLabelColor = Sm.accent,
             unfocusedLabelColor = Sm.text4,
-            cursorColor = Sm.cyan,
+            cursorColor = Sm.accent,
             focusedTextColor = Sm.text1,
             unfocusedTextColor = Sm.text1,
         ),
@@ -487,39 +483,6 @@ fun SmAvatar(
                 contentAlignment = Alignment.Center,
             ) {
                 SmIcon(SmIconKind.Star, size = 12.dp, tint = Sm.star, strokeWidth = 1.5.dp, fill = true)
-            }
-        }
-    }
-}
-
-/** Pill-style tab switcher. */
-@Composable
-fun SmTabs(selected: Int, labels: List<String>, onSelect: (Int) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Sm.surface)
-            .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
-            .padding(4.dp),
-    ) {
-        labels.forEachIndexed { i, label ->
-            val isSel = i == selected
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(if (isSel) Sm.gradientSoft else Brush.linearGradient(listOf(Color.Transparent, Color.Transparent)))
-                    .clickable { onSelect(i) }
-                    .padding(vertical = 9.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    label,
-                    color = if (isSel) Sm.cyan else Sm.text3,
-                    fontSize = 13.sp,
-                    fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Normal,
-                )
             }
         }
     }
@@ -659,6 +622,11 @@ fun SmIcon(
 /**
  * Icon in a filled [shape] (circle by default). Covers the contact message
  * button, the composer attach button, and the 32dp device box in settings.
+ *
+ * A `contentDescription` belongs in [modifier], not in a wrapper around the
+ * call: it lands on the same node as the [onClick] below, so the merged
+ * semantics tree has one labelled button rather than an unlabelled button
+ * beside a stray text node.
  */
 @Composable
 fun SmIconCircle(
@@ -667,12 +635,13 @@ fun SmIconCircle(
     tint: Color,
     background: Color,
     iconSize: Dp,
+    modifier: Modifier = Modifier,
     strokeWidth: Dp = 1.8.dp,
     onClick: (() -> Unit)? = null,
     shape: Shape = CircleShape,
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(size)
             .clip(shape)
             .background(background)
@@ -765,7 +734,7 @@ fun SmSearchPill(
             modifier = Modifier.weight(1f),
             singleLine = true,
             textStyle = LocalTextStyle.current.copy(color = Sm.text1, fontSize = 13.sp),
-            cursorBrush = SolidColor(Sm.teal),
+            cursorBrush = SolidColor(Sm.accent),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
             decorationBox = { inner ->
                 Box(contentAlignment = Alignment.CenterStart) {
@@ -1115,8 +1084,8 @@ fun SmInsetNotice(title: String, subtitle: String) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
-            .background(Sm.teal.copy(alpha = 0.08f))
-            .border(1.dp, Sm.teal, shape)
+            .background(Sm.accent.copy(alpha = 0.08f))
+            .border(1.dp, Sm.accent, shape)
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
@@ -1194,17 +1163,16 @@ fun SmChatHeader(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.semantics { contentDescription = "뒤로" }) {
-                SmIconCircle(
-                    kind = SmIconKind.ChevronLeft,
-                    size = 36.dp,
-                    tint = Sm.text3,
-                    background = Color.Transparent,
-                    iconSize = 20.dp,
-                    strokeWidth = 2.dp,
-                    onClick = onBack,
-                )
-            }
+            SmIconCircle(
+                kind = SmIconKind.ChevronLeft,
+                size = 36.dp,
+                tint = Sm.text3,
+                background = Color.Transparent,
+                iconSize = 20.dp,
+                modifier = Modifier.semantics { contentDescription = "뒤로" },
+                strokeWidth = 2.dp,
+                onClick = onBack,
+            )
             SmAvatar(name, size = 34)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
@@ -1224,24 +1192,26 @@ fun SmChatHeader(
                     style = tabularFigures(),
                 )
             }
-            Box(Modifier.semantics { contentDescription = "메시지 검색" }) {
-                SmIconCircle(
-                    kind = SmIconKind.Search,
-                    size = 36.dp,
-                    tint = Sm.text3,
-                    background = Color.Transparent,
-                    iconSize = 18.dp,
-                    onClick = onSearch,
-                )
-            }
+            SmIconCircle(
+                kind = SmIconKind.Search,
+                size = 36.dp,
+                tint = Sm.text3,
+                background = Color.Transparent,
+                iconSize = 18.dp,
+                modifier = Modifier.semantics { contentDescription = "메시지 검색" },
+                onClick = onSearch,
+            )
             if (onMore != null) {
-                Box(Modifier.semantics { contentDescription = "더보기" }) {
+                // The Box is the popup anchor for moreMenu(); the label belongs
+                // on the button inside it, not on the anchor.
+                Box {
                     SmIconCircle(
                         kind = SmIconKind.MoreVertical,
                         size = 36.dp,
                         tint = Sm.text3,
                         background = Color.Transparent,
                         iconSize = 18.dp,
+                        modifier = Modifier.semantics { contentDescription = "더보기" },
                         strokeWidth = 2.dp,
                         onClick = onMore,
                     )
@@ -1325,10 +1295,13 @@ fun SmMenuItem(
 }
 
 /**
- * Destructive-action confirmation. material3's dialog draws itself from the
- * (absent) `MaterialTheme`, so every colour it exposes is overridden here —
- * the same overrides the login screen's forget-device dialog carries, kept in
- * one place now that a second caller exists.
+ * The app's only confirmation dialog. material3's dialog draws itself from the
+ * (absent) `MaterialTheme`, so every colour it exposes is overridden here;
+ * five call sites used to carry their own copy of that override set.
+ *
+ * The body is 13sp/19sp rather than material's 14sp `bodyMedium` because the
+ * warnings here are long Korean paragraphs and material3 clips an overlong
+ * dialog body instead of scrolling it.
  */
 @Composable
 fun SmConfirmDialog(
@@ -1396,17 +1369,16 @@ fun SmComposer(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (onAttach != null) {
-                Box(Modifier.semantics { contentDescription = "첨부" }) {
-                    SmIconCircle(
-                        kind = SmIconKind.Paperclip,
-                        size = 40.dp,
-                        tint = Sm.sky,
-                        background = Sm.accentTint,
-                        iconSize = 18.dp,
-                        strokeWidth = 1.7.dp,
-                        onClick = onAttach,
-                    )
-                }
+                SmIconCircle(
+                    kind = SmIconKind.Paperclip,
+                    size = 40.dp,
+                    tint = Sm.sky,
+                    background = Sm.accentTint,
+                    iconSize = 18.dp,
+                    modifier = Modifier.semantics { contentDescription = "첨부" },
+                    strokeWidth = 1.7.dp,
+                    onClick = onAttach,
+                )
             }
             BasicTextField(
                 value = value,
@@ -1414,7 +1386,7 @@ fun SmComposer(
                 modifier = Modifier.weight(1f),
                 maxLines = 5,
                 textStyle = LocalTextStyle.current.copy(color = Sm.text1, fontSize = 14.sp, lineHeight = 20.sp),
-                cursorBrush = SolidColor(Sm.teal),
+                cursorBrush = SolidColor(Sm.accent),
                 decorationBox = { inner ->
                     Box(
                         modifier = Modifier
@@ -1436,10 +1408,10 @@ fun SmComposer(
                         if (filled) Modifier.shadow(8.dp, CircleShape, ambientColor = glow, spotColor = glow)
                         else Modifier.clip(CircleShape),
                     )
-                    .background(
-                        if (filled) Sm.brandGradient
-                        else Brush.linearGradient(listOf(Sm.border, Sm.border)),
-                    )
+                    // Composer recomposes on every keystroke; only the filled
+                    // branch is a real gradient, so the idle one stays a
+                    // SolidColor rather than a fresh one-stop Brush per frame.
+                    .background(if (filled) Sm.brandGradient else SolidColor(Sm.border))
                     .clickable(enabled = ready && !sending, role = Role.Button, onClick = onSend)
                     .semantics { contentDescription = "보내기" },
                 contentAlignment = Alignment.Center,

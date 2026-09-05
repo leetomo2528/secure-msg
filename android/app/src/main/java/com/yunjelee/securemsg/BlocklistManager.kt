@@ -8,7 +8,12 @@ object BlocklistManager {
     data class Decision(
         val blocked: Boolean,
         val reason: String,
-    )
+    ) {
+        companion object {
+            /** Shared "not blocked" verdict; callers that fail open must not re-spell it. */
+            val ALLOW = Decision(false, "")
+        }
+    }
 
     suspend fun evaluate(
         phoneNumber: String,
@@ -31,13 +36,11 @@ object BlocklistManager {
             }
         }
 
-        val lower = Normalizer.normalize(plaintext, Normalizer.Form.NFKC)
-            .lowercase(Locale.ROOT)
+        val lower = fold(plaintext)
         val compact = lower.replace(Regex("\\s+"), "")
         val localKeywords = db.blocklistDao().getAll().map { it.keyword }
         val matched = (localKeywords + shared.keywords).firstOrNull { raw ->
-            val kw = Normalizer.normalize(raw.trim(), Normalizer.Form.NFKC)
-                .lowercase(Locale.ROOT)
+            val kw = fold(raw.trim())
             kw.isNotBlank() && (lower.contains(kw) || compact.contains(kw.replace(Regex("\\s+"), "")))
         }
         if (matched != null) {
@@ -48,7 +51,7 @@ object BlocklistManager {
         if (spam.isSpam) {
             return Decision(true, "자동 스팸: ${spam.reason ?: "의심 패턴"}")
         }
-        return Decision(false, "")
+        return Decision.ALLOW
     }
 
     /** Digit-based match so +82-10-… and 010… forms of the same number hit. */
@@ -76,20 +79,18 @@ object BlocklistManager {
     fun senderBlocked(phoneNumber: String, ruleValues: List<String>): Boolean =
         matchingSenderRules(phoneNumber, ruleValues).isNotEmpty()
 
-    suspend fun shouldBlock(plaintext: String, db: AppDatabase): Boolean {
-        return evaluate("", plaintext, db).blocked
-    }
+    private val zeroWidth = Regex("[\\u200B-\\u200D\\uFEFF]")
 
-    suspend fun applyBlock(
-        cid: String,
-        seq: Int,
-        plaintext: String,
-        db: AppDatabase,
-    ): Boolean {
-        val blocked = shouldBlock(plaintext, db)
-        if (blocked) {
-            db.messageDao().setBlocked(cid, seq, true)
-        }
-        return !blocked
-    }
+    /**
+     * The fold [SpamClassifier] applies, zero-width strip included.
+     *
+     * A keyword rule and the classifier read the same body inside one [evaluate]
+     * call, so they have to agree on what it says: without the strip a zero-width
+     * joiner planted mid-word slipped a user keyword while the classifier's own
+     * term still matched.
+     */
+    private fun fold(value: String): String = Normalizer
+        .normalize(value, Normalizer.Form.NFKC)
+        .lowercase(Locale.ROOT)
+        .replace(zeroWidth, "")
 }

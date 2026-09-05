@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { b64u, initCrypto } from "../crypto/keys";
 import { serverDirectoryHash } from "../crypto/deviceTrust";
-import { api } from "../net/api";
+import { api, type BlocklistResult } from "../net/api";
 import {
   addBlockKeyword,
   addBlockedSender,
@@ -97,6 +97,7 @@ describe("block-rule synchronization", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     api.setToken(null);
+    useStore.setState({ error: null });
   });
 
   it("retains failed local uploads while replacing successful and stale server rows", async () => {
@@ -135,6 +136,38 @@ describe("block-rule synchronization", () => {
     });
     expect(senders.some((row) => row.id === uploadedSender.id)).toBe(false);
     expect(senders.some((row) => row.id === "srv:9002")).toBe(false);
+  });
+
+  it("reports a rule the relay refuses outright and stops re-uploading it", async () => {
+    // The client accepts alphanumeric sender IDs locally; the relay's sender
+    // pattern does not, so this rule can only ever be a local one.
+    const refused = await addBlockedSender("MYBANK");
+
+    api.setToken("active-token");
+    vi.spyOn(api, "listBlockRules").mockResolvedValue({ ok: true, rules: [] });
+    const upload = vi.spyOn(api, "addBlockRule").mockImplementation(async (type, value) => {
+      if (value === refused.sender) {
+        return {
+          ok: false, status: 400, error: "type must be keyword|sender with a valid value",
+        } as BlocklistResult;
+      }
+      return { ok: true, rule: { id: 12, type, value, created_at: 12 } };
+    });
+    const uploadsOfRefused = () =>
+      upload.mock.calls.filter(([, value]) => value === refused.sender).length;
+
+    await useStore.getState().syncBlockRules();
+
+    expect(uploadsOfRefused()).toBe(1);
+    expect(useStore.getState().error).toBe("type must be keyword|sender with a valid value");
+    expect(await listBlockedSenders()).toContainEqual(refused);
+
+    await useStore.getState().syncBlockRules();
+
+    // The refusal is about the value, so a retry only repeats it. The rule
+    // keeps filtering this browser; it just never becomes a shared one.
+    expect(uploadsOfRefused()).toBe(1);
+    expect(await listBlockedSenders()).toContainEqual(refused);
   });
 });
 

@@ -28,6 +28,11 @@ export default function PairingScanner({
   onCancel: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // DeviceManager passes a fresh arrow every render and startPairing re-renders
+  // it mid-scan, so keying the camera effect on onPayload tore the stream down
+  // and re-decoded the same QR into a second pairing session.
+  const onPayloadRef = useRef(onPayload);
+  useEffect(() => { onPayloadRef.current = onPayload; });
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [manual, setManual] = useState("");
   const supportsCamera = barcodeDetector() != null;
@@ -42,22 +47,28 @@ export default function PairingScanner({
     const detector = new Detector({ formats: ["qr_code"] });
 
     const scan = async () => {
+      if (stopped) return;
       const video = videoRef.current;
-      if (stopped || !video || video.readyState < 2) {
+      if (!video || video.readyState < 2) {
         frame = requestAnimationFrame(() => void scan());
         return;
       }
       try {
         const found = await detector.detect(video);
+        // A detect() still in flight when cleanup ran must neither pair nor
+        // re-arm the loop: the user already cancelled, and a frame requested
+        // after cancelAnimationFrame spins for the life of the page.
+        if (stopped) return;
         const value = found[0]?.rawValue;
         if (value) {
           stopped = true;
-          onPayload(value);
+          onPayloadRef.current(value);
           return;
         }
       } catch {
         // A transient decode failure is normal between frames.
       }
+      if (stopped) return;
       frame = requestAnimationFrame(() => void scan());
     };
 
@@ -85,7 +96,7 @@ export default function PairingScanner({
       cancelAnimationFrame(frame);
       stream?.getTracks().forEach((track) => track.stop());
     };
-  }, [supportsCamera, onPayload]);
+  }, [supportsCamera]);
 
   return (
     <div className="space-y-3 rounded-xl bg-fg/[0.04] p-3 animate-rise">

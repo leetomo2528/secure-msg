@@ -14,7 +14,30 @@ from threading import Lock
 from flask import current_app, request
 
 _MAX_KEYS = 10_000
-_buckets: OrderedDict[str, deque[float]] = OrderedDict()
+# A client that rotates the caller-supplied identity — a made-up username per
+# /login — allocated a fresh key per request and walked the whole LRU table
+# out, taking with it every other client's bucket AND its own per-IP mail and
+# bcrypt budgets, which are the only bound on an unauthenticated flood. Past
+# this ceiling one IP's unseen identities share the scope's identity-less
+# bucket instead of evicting anything.
+_MAX_KEYS_PER_IP = 200
+_ip_key_counts: dict[str, int] = {}
+
+
+class _BucketTable(OrderedDict):
+    """LRU table of (client ip, timestamps), keeping the per-IP counts in step.
+
+    Tests reset the limiter by clearing this table directly, and a count left
+    behind would go on folding new identities into the shared bucket for an IP
+    that no longer holds a single key.
+    """
+
+    def clear(self) -> None:
+        super().clear()
+        _ip_key_counts.clear()
+
+
+_buckets: _BucketTable = _BucketTable()
 _lock = Lock()
 
 
@@ -36,19 +59,30 @@ def check(scope: str, identity: str, limit: int, window_seconds: int) -> int | N
     if current_app.testing:
         return None
     now = time.monotonic()
-    key = f"{scope}:{client_ip()}:{identity[:64]}"
+    ip = client_ip()
     cutoff = now - window_seconds
     with _lock:
-        bucket = _buckets.pop(key, deque())
+        key = f"{scope}:{ip}:{identity[:64]}"
+        if key not in _buckets and _ip_key_counts.get(ip, 0) >= _MAX_KEYS_PER_IP:
+            key = f"{scope}:{ip}:"
+        entry = _buckets.pop(key, None)
+        bucket = deque() if entry is None else entry[1]
+        if entry is None:
+            _ip_key_counts[ip] = _ip_key_counts.get(ip, 0) + 1
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
         if len(bucket) >= limit:
-            _buckets[key] = bucket
+            _buckets[key] = (ip, bucket)
             return max(1, math.ceil(bucket[0] + window_seconds - now))
         bucket.append(now)
-        _buckets[key] = bucket
+        _buckets[key] = (ip, bucket)
         while len(_buckets) > _MAX_KEYS:
-            _buckets.popitem(last=False)
+            evicted_ip = _buckets.popitem(last=False)[1][0]
+            remaining = _ip_key_counts.get(evicted_ip, 1) - 1
+            if remaining > 0:
+                _ip_key_counts[evicted_ip] = remaining
+            else:
+                _ip_key_counts.pop(evicted_ip, None)
     return None
 
 

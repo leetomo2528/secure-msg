@@ -110,6 +110,28 @@ object RelayContentCodec {
         )
     }
 
+    /**
+     * The attachment rows as they are stored in `messages.attachmentsJson`.
+     *
+     * Deliberately not [encode]'s array: that one truncates name/content_type
+     * to 120 chars for the wire, and reusing it here would silently rewrite
+     * already rendered local rows under cover of a shared helper.
+     */
+    fun attachmentsJson(content: RelayContent): String? {
+        if (content.attachments.isEmpty()) return null
+        val rows = JSONArray()
+        content.attachments.forEach {
+            rows.put(
+                JSONObject()
+                    .put("name", it.name)
+                    .put("content_type", it.contentType)
+                    .put("data", it.data)
+                    .put("size", it.size),
+            )
+        }
+        return rows.toString()
+    }
+
     fun encodeBytes(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
     fun decodeBytes(value: String): ByteArray = Base64.getUrlDecoder().decode(value)

@@ -29,6 +29,7 @@ import auth
 import jwt
 from auth import approval_statement, revoke_statement, device_login_statement
 import config
+import conversations
 import store
 
 app.config["TESTING"] = True
@@ -810,6 +811,77 @@ class ServerSmokeTest(unittest.TestCase):
             listed.json["conversations"][0]["synced_contact_name"], ""
         )
 
+    def test_conversation_list_row_shape_is_pinned_for_the_gateway(self):
+        """SmsBridgeService decides which threads it owns from this row.
+
+        The phone reads `name` and `members` to test self-only ownership of a
+        number before it will relay for it, so an added or dropped key here
+        changes what the gateway acts on with nothing to catch it on-device.
+        """
+        created = self.create_conversation("+821033334444")
+        listed = self.client.get("/api/conversations", headers=self.headers)
+        self.assertEqual(listed.status_code, 200, listed.json)
+        row = next(
+            r for r in listed.json["conversations"] if r["cid"] == created["cid"]
+        )
+        self.assertEqual(
+            set(row),
+            {
+                "cid",
+                "conv_id",
+                "name",
+                "synced_contact_name",
+                "members",
+                "created_at",
+            },
+        )
+        self.assertEqual(row["conv_id"], created["conv_id"])
+        self.assertEqual(row["name"], "+821033334444")
+        self.assertEqual(row["members"], [self.username])
+
+    def test_conversation_membership_is_answered_at_account_level(self):
+        """Five call sites answered this by scanning every member device.
+
+        That scan also required the account to expose an approved device,
+        which auth_required already guarantees for the caller. Pinned so the
+        two can never disagree for a caller that can actually reach an
+        endpoint.
+        """
+        import store
+
+        conv_id = store.create_conversation("member-check", "+821012340000")
+        user = store.get_user_by_name(self.username)
+        store.add_member(conv_id, user["id"])
+        self.assertTrue(store.is_conversation_member(conv_id, user["id"]))
+        self.assertEqual(
+            store.is_conversation_member(conv_id, user["id"]),
+            any(d["user_id"] == user["id"] for d in store.list_members(conv_id)),
+        )
+        self.assertFalse(
+            store.is_conversation_member(conv_id, user["id"] + 10_000)
+        )
+
+    def test_history_is_refused_to_an_approved_device_of_another_account(self):
+        """A bootstrap device is approved, so only membership can refuse it."""
+        created = self.create_conversation("+821066667777")
+        stranger = "peeker_" + self.username[-6:]
+        self.assertEqual(
+            register_account(self.client, stranger, self.pw_hash).status_code, 200
+        )
+        foreign = self.client.post("/api/device-register", json={
+            "username": stranger, "pw_hash": self.pw_hash,
+            "device_name": "peeker", "pub_key": "K" * 43, "sig_pub": "L" * 43,
+        })
+        self.assertEqual(foreign.json.get("trust_state"), "approved", foreign.json)
+        foreign_headers = {"Authorization": f"Bearer {foreign.json['token']}"}
+        history = self.client.get(
+            f"/api/conversation/{created['cid']}/messages?since=0&limit=20",
+            headers=foreign_headers,
+        )
+        self.assertEqual(history.status_code, 403, history.json)
+        listed = self.client.get("/api/conversations", headers=foreign_headers)
+        self.assertEqual(listed.json["conversations"], [])
+
     def test_existing_database_migrates_synced_contact_name(self):
         import store
 
@@ -1212,6 +1284,77 @@ class ServerSmokeTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 400, response.json)
+
+    def test_history_row_shape_is_pinned_for_the_gateway(self):
+        """The Android relay->carrier path keys on exactly these fields.
+
+        A row carries no `cid` of its own — the gateway has to take it from the
+        envelope of the response — so adding or dropping a key here silently
+        changes what the phone will act on.
+        """
+        created = self.create_conversation()
+        user = store.get_user_by_name(self.username)
+        store.insert_message(
+            created["conv_id"],
+            user["id"],
+            self.sid,
+            json.dumps({
+                "ct": "Y3Q",
+                "nonce": "bm9uY2U",
+                "keys": {self.sid: {"ek": "ZWs", "n": "bg"}},
+            }, separators=(",", ":")),
+        )
+        history = self.client.get(
+            f"/api/conversation/{created['cid']}/messages?since=0&limit=20",
+            headers=self.headers,
+        )
+        self.assertEqual(history.status_code, 200, history.json)
+        self.assertEqual(history.json["cid"], created["cid"])
+        self.assertEqual(history.json["conv_id"], created["conv_id"])
+        self.assertEqual(
+            set(history.json["messages"][0]),
+            {
+                "id",
+                "seq",
+                "conv_id",
+                "sender_id",
+                "sender_sid",
+                "sender_pub_key",
+                "payload",
+                "created_at",
+                "carrier_status",
+                "carrier_error",
+                "carrier_updated_at",
+            },
+        )
+
+    def test_out_of_range_integers_are_rejected_before_sqlite_binds_them(self):
+        """sqlite3 raises OverflowError past 2**63 — a 500 with a traceback."""
+        created = self.create_conversation()
+        huge = 10 ** 19
+        history = self.client.get(
+            f"/api/conversation/{created['cid']}/messages?since={huge}",
+            headers=self.headers,
+        )
+        self.assertEqual(history.status_code, 400, history.json)
+
+        other = self._approved_second_device("overflow")
+        shared = self.client.post(
+            f"/api/conversation/{created['cid']}/share-keys",
+            headers=self.headers,
+            json={
+                "sid": other.json["sid"],
+                "entries": [{"seq": huge, "ek": SHARE_EK, "n": SHARE_NONCE}],
+            },
+        )
+        self.assertEqual(shared.status_code, 400, shared.json)
+
+        # `true` used to bind as rule id 1, deleting whatever that row was.
+        for bogus in (huge, True, float("inf")):
+            removed = self.client.post(
+                "/api/blocklist/remove", headers=self.headers, json={"id": bogus}
+            )
+            self.assertEqual(removed.status_code, 400, removed.json)
 
     def test_username_is_ascii_only(self):
         response = self.client.post(
@@ -2049,6 +2192,12 @@ class ServerSmokeTest(unittest.TestCase):
         self.assertEqual(self.add_rule("keyword", "x" * 121).status_code, 400)
         self.assertEqual(self.add_rule("sender", "not-a-phone").status_code, 400)
 
+    def test_blocklist_rejects_values_sqlite_cannot_encode(self):
+        """A lone surrogate reached sqlite3 and came back as a 409 codec error."""
+        self.assertEqual(self.add_rule("keyword", "\ud800광고").status_code, 400)
+        self.assertEqual(self.add_rule("keyword", "광고\x00차단").status_code, 400)
+        self.assertEqual(self.add_rule("sender", "+8210\t12345678").status_code, 400)
+
     def test_blocklist_is_per_user(self):
         self.add_rule("keyword", "비밀")
         other = register_account(
@@ -2280,7 +2429,13 @@ class ServerSmokeTest(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404, missing.json)
 
-    def test_rename_conversation_updates_and_fans_out(self):
+    def test_renaming_a_phone_thread_labels_it_without_moving_the_identity(self):
+        """`name` on an SMS thread is the carrier identity, not a label.
+
+        Overwriting it stopped the gateway from owning the thread and made the
+        next inbound SMS from the same number open a second conversation, so
+        the label goes where the display chain already looks for it.
+        """
         created = self.create_conversation("+821055556666")
         second = self.register_and_approve_device(
             {
@@ -2299,14 +2454,117 @@ class ServerSmokeTest(unittest.TestCase):
             json={"cid": created["cid"], "name": "엄마"},
         )
         self.assertEqual(renamed.status_code, 200, renamed.json)
+        self.assertEqual(renamed.json["name"], "+821055556666")
 
         listed = self.client.get("/api/conversations", headers=self.headers).json
-        self.assertEqual(listed["conversations"][0]["name"], "엄마")
+        conversation = next(
+            c for c in listed["conversations"] if c["cid"] == created["cid"]
+        )
+        self.assertEqual(conversation["name"], "+821055556666")
+        self.assertEqual(conversation["synced_contact_name"], "엄마")
+
+        received = other_socket.get_received()
+        events = [e for e in received if e["name"] == "contacts_updated"]
+        self.assertEqual(len(events), 1, received)
+        self.assertEqual(
+            events[0]["args"][0]["entries"],
+            [{"cid": created["cid"], "contact_name": "엄마"}],
+        )
+        # conv_updated writes the payload straight into the gateway's own
+        # thread row, so the label must not travel on that event.
+        self.assertEqual([e for e in received if e["name"] == "conv_updated"], [])
+        other_socket.disconnect()
+
+        reopened = self.client.post(
+            "/api/conversation",
+            headers=self.headers,
+            json={"members": [self.username], "name": "+821055556666"},
+        )
+        self.assertEqual(reopened.status_code, 200, reopened.json)
+        self.assertEqual(reopened.json["cid"], created["cid"])
+        self.assertFalse(reopened.json["created"], reopened.json)
+
+    def test_renamed_phone_thread_still_accepts_carrier_status(self):
+        gateway = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "rename-gateway",
+                "device_kind": "android_gateway",
+                "pub_key": "K" * 43,
+                "sig_pub": "L" * 43,
+            },
+        )
+        created = self.create_conversation("+821055554444")
+        gateway_socket = socketio.test_client(
+            app, auth={"token": gateway.json["token"]}
+        )
+        web_socket = socketio.test_client(app, auth={"token": self.token})
+        gateway_socket.get_received()
+        web_socket.get_received()
+        ack = web_socket.emit(
+            "message_send",
+            {
+                "cid": created["cid"],
+                "mid": "rename-carrier-status-1",
+                "payload": {
+                    "ct": "A" * 22,
+                    "nonce": "A" * 32,
+                    "keys": {
+                        self.sid: {"ek": "A" * 64, "n": "A" * 32},
+                        gateway.json["sid"]: {"ek": "B" * 64, "n": "B" * 32},
+                    },
+                },
+            },
+            callback=True,
+        )
+        self.assertTrue(ack["ok"], ack)
+
+        renamed = self.client.post(
+            "/api/conversation/rename",
+            headers=self.headers,
+            json={"cid": created["cid"], "name": "아빠"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.json)
+
+        status = gateway_socket.emit(
+            "carrier_status",
+            {"cid": created["cid"], "seq": ack["seq"], "status": "sent"},
+            callback=True,
+        )
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(status["carrier_status"], "sent")
+        gateway_socket.disconnect()
+        web_socket.disconnect()
+
+    def test_rename_conversation_updates_and_fans_out(self):
+        created = self.create_conversation("팀 노트")
+        second = self.register_and_approve_device(
+            {
+                "username": self.username,
+                "pw_hash": self.pw_hash,
+                "device_name": "second",
+                "pub_key": "G" * 43,
+                "sig_pub": "H" * 43,
+            },
+        )
+        other_socket = socketio.test_client(app, auth={"token": second.json["token"]})
+
+        renamed = self.client.post(
+            "/api/conversation/rename",
+            headers=self.headers,
+            json={"cid": created["cid"], "name": "주간 회의"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.json)
+        self.assertEqual(renamed.json["name"], "주간 회의")
+
+        listed = self.client.get("/api/conversations", headers=self.headers).json
+        self.assertEqual(listed["conversations"][0]["name"], "주간 회의")
 
         events = [e for e in other_socket.get_received() if e["name"] == "conv_updated"]
         self.assertEqual(len(events), 1, events)
         self.assertEqual(events[0]["args"][0]["cid"], created["cid"])
-        self.assertEqual(events[0]["args"][0]["name"], "엄마")
+        self.assertEqual(events[0]["args"][0]["name"], "주간 회의")
         other_socket.disconnect()
 
     def test_rename_forbidden_for_non_member(self):
@@ -2669,7 +2927,9 @@ class ServerSmokeTest(unittest.TestCase):
             )
         self.assertEqual(limited.status_code, 429, limited.json)
         self.assertEqual(limited.headers["Retry-After"], "4")
-        limiter.assert_called_once_with("missing-keys", self.sid, 120, 60)
+        limiter.assert_called_once_with(
+            "missing-keys", self.sid, conversations.SYNC_SCAN_BUDGET, 60
+        )
 
     def test_sharing_cannot_grow_a_stored_envelope_past_the_cap(self):
         """share-keys rewrites a row the send path already size-checked."""

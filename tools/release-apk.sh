@@ -9,6 +9,11 @@
 # is left unsigned and apksigner signs it here.
 #
 # Credentials live in ~/.gradle/gradle.properties, never in the repo.
+#
+# CI only compiles the androidTest source set — it has no emulator. Run
+# `./gradlew :app:connectedDebugAndroidTest` on a real phone before cutting a
+# release: the device-trust chain, its migration and lazysodium's native path
+# are the things a green JVM run is explicitly not evidence for.
 set -euo pipefail
 
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
@@ -66,22 +71,42 @@ cp -f "$UNSIGNED" "$OUT"
 "$APKSIGNER" verify --print-certs --min-sdk-version 31 "$OUT"
 
 # Prove the clean build did its job: no version literal other than the one in
-# build.gradle.kts may remain inlined in this app's own classes. (0.11.1 is a
-# design-preview string in Theme.kt, not a version.)
+# build.gradle.kts may remain inlined in this app's own classes.
 DEXDUMP="$(dirname "$APKSIGNER")/dexdump"
 VERSION="$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')"
+# Theme.kt's design preview draws a mock update row reading "v0.11.1 · 최신";
+# it is a screenshot string, not a version, and the only literal allowed to differ.
+PREVIEW_LITERAL="0.11.1"
 TMPD="$(mktemp -d)"
 unzip -o -q "$OUT" 'classes*.dex' -d "$TMPD"
-STALE="$("$DEXDUMP" -d "$TMPD"/classes*.dex 2>/dev/null | awk -v want="$VERSION" '
+# Most use sites fold the constant into the enclosing template, so the dex holds
+# "v0.17.0" or "securemsg-android/0.19.0" rather than a bare literal — demanding
+# a quote before the digits made this blind to the exact LoginScreen and updater
+# strings the incident above was about. Bounding on non-[0-9.] instead also keeps
+# the leading version family open (0.x was the whole match once) while stopping
+# "127.0.0.1" in LoginScreen from reading as a 127.0.0 release.
+REPORT="$("$DEXDUMP" -d "$TMPD"/classes*.dex 2>/dev/null | awk -v want="$VERSION" -v allow="$PREVIEW_LITERAL" '
   /Class descriptor/ { inapp = ($0 ~ /Lcom\/yunjelee\/securemsg\//) }
-  inapp && /const-string/ && match($0, /"0\.[0-9]+\.[0-9]+"/) {
-    v = substr($0, RSTART + 1, RLENGTH - 2)
-    if (v != want && v != "0.11.1") stale[v] = 1
+  inapp && /const-string/ {
+    s = $0 " "
+    while (match(s, /[^0-9.][0-9]+\.[0-9]+\.[0-9]+[^0-9.]/)) {
+      v = substr(s, RSTART + 1, RLENGTH - 2)
+      if (v == want) found = 1
+      else if (v != allow) stale[v] = 1
+      s = substr(s, RSTART + RLENGTH - 1)
+    }
   }
-  END { for (v in stale) printf "%s ", v }')"
+  END { printf "%d", found + 0; for (v in stale) printf " %s", v }')"
 rm -rf "$TMPD"
+read -r FOUND STALE <<< "$REPORT"
 if [ -n "$STALE" ]; then
   echo "stale inlined version literals in app dex: $STALE (expected only $VERSION)" >&2
+  exit 1
+fi
+# A dexdump that stops emitting the lines this parse depends on produces an
+# empty stale list, i.e. it looks exactly like a clean build from here.
+if [ "$FOUND" != 1 ]; then
+  echo "no $VERSION literal found in app dex: the scan is broken, not the build" >&2
   exit 1
 fi
 echo "dex version literals OK ($VERSION)"

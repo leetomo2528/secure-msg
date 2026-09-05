@@ -70,6 +70,16 @@ function assertKey(value: string, expectedBytes: number, label: string): void {
   }
 }
 
+/**
+ * A pre-v2 device that was already revoked when the account upgraded. It keeps
+ * `legacy_unverified` forever and can never gain an approval certificate, so
+ * the v2 rules that demand both would strand the whole directory over an entry
+ * that is inert: never an approver, never active, never key material.
+ */
+function isRevokedGrandfathered(device: DirectoryProof["device_history"][number]): boolean {
+  return device.approved_by_sid === "legacy_tofu" && device.trust_state !== "approved";
+}
+
 /** Canonical bytes signed by an already-approved device for a pending device. */
 export function canonicalDeviceApproval(fields: DeviceApprovalFields): string {
   assertDecimalInteger(fields.uid, "uid");
@@ -142,9 +152,14 @@ function canonicalApprovalForStatement(
   return canonicalDeviceApprovalV2(fields, pairing);
 }
 
-export function signDeviceApproval(fields: DeviceApprovalFields, signingSecretKey: string): string {
+/** Sign an already-canonical statement. Every signer in this file goes here. */
+function signStatement(statement: string, signingSecretKey: string): string {
   assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
-  return b64u(sodium.crypto_sign_detached(encoder.encode(canonicalDeviceApproval(fields)), unb64u(signingSecretKey)));
+  return b64u(sodium.crypto_sign_detached(encoder.encode(statement), unb64u(signingSecretKey)));
+}
+
+export function signDeviceApproval(fields: DeviceApprovalFields, signingSecretKey: string): string {
+  return signStatement(canonicalDeviceApproval(fields), signingSecretKey);
 }
 
 export function signDeviceApprovalV2(
@@ -152,11 +167,7 @@ export function signDeviceApprovalV2(
   pairing: PairingBinding,
   signingSecretKey: string,
 ): string {
-  assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
-  return b64u(sodium.crypto_sign_detached(
-    encoder.encode(canonicalDeviceApprovalV2(fields, pairing)),
-    unb64u(signingSecretKey),
-  ));
+  return signStatement(canonicalDeviceApprovalV2(fields, pairing), signingSecretKey);
 }
 
 /** Verify a detached Ed25519 signature over an already-canonical statement. */
@@ -197,15 +208,12 @@ export function canonicalDeviceRevoke(fields: DeviceRevokeFields): string {
 }
 
 export function signDeviceRevoke(fields: DeviceRevokeFields, signingSecretKey: string): string {
-  assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
-  return b64u(sodium.crypto_sign_detached(encoder.encode(canonicalDeviceRevoke(fields)), unb64u(signingSecretKey)));
+  return signStatement(canonicalDeviceRevoke(fields), signingSecretKey);
 }
 
 export function verifyDeviceRevoke(fields: DeviceRevokeFields, signature: string, signerPublicKey: string): boolean {
   try {
-    return sodium.crypto_sign_verify_detached(
-      unb64u(signature), encoder.encode(canonicalDeviceRevoke(fields)), unb64u(signerPublicKey),
-    );
+    return verifySignedStatement(canonicalDeviceRevoke(fields), signature, signerPublicKey);
   } catch { return false; }
 }
 
@@ -218,8 +226,7 @@ export function canonicalLegacyUpgrade(fields: LegacyUpgradeFields): string {
 }
 
 export function signLegacyUpgrade(fields: LegacyUpgradeFields, signingSecretKey: string): string {
-  assertKey(signingSecretKey, sodium.crypto_sign_SECRETKEYBYTES, "signing secret key");
-  return b64u(sodium.crypto_sign_detached(encoder.encode(canonicalLegacyUpgrade(fields)), unb64u(signingSecretKey)));
+  return signStatement(canonicalLegacyUpgrade(fields), signingSecretKey);
 }
 
 function hashDomainSeparated(domain: string, body: string): Uint8Array {
@@ -313,7 +320,8 @@ export function verifyDirectoryProof(
     if (device.fingerprint !== deviceFingerprint(device.pub_key, device.sig_pub).hash) {
       throw new Error("device history fingerprint mismatch");
     }
-    if (proof.security_mode === "verified_v2" && device.verification_state !== "verified") {
+    if (proof.security_mode === "verified_v2" && device.verification_state !== "verified"
+      && !isRevokedGrandfathered(device)) {
       throw new Error("verified directory contains an unverified device");
     }
     history.set(device.sid, device);
@@ -326,6 +334,19 @@ export function verifyDirectoryProof(
   }
   const authorized = new Map<string, DirectoryProof["device_history"][number]>([[root.sid, root]]);
   const activeAtEpoch = new Set<string>([root.sid]);
+  if (proof.security_mode === "legacy_v1") {
+    // A migrated account stamps EVERY device `legacy_tofu`, and the relay still
+    // lets any of them approve or revoke, so certificates naming a TOFU actor
+    // are legitimately issued. Anchoring on the root alone rejected those and
+    // locked the account out of every client with no recovery. Revoked entries
+    // are seeded too, so a revocation certificate for one still verifies —
+    // legacy mode has no final-state rule for that to contradict.
+    for (const device of history.values()) {
+      if (device.approved_by_sid !== "legacy_tofu") continue;
+      authorized.set(device.sid, device);
+      activeAtEpoch.add(device.sid);
+    }
+  }
   const certifiedSubjects = new Set<string>();
   const events = [
     ...proof.approval_certificates.map((certificate) => ({ type: "approval" as const, certificate })),
@@ -388,8 +409,9 @@ export function verifyDirectoryProof(
         actorSid: actor.sid,
         parentEpoch: revocation.parent_epoch,
       };
-      if (revocation.statement !== canonicalDeviceRevoke(fields)
-        || !verifyDeviceRevoke(fields, revocation.signature, actor.sig_pub)) {
+      const canonical = canonicalDeviceRevoke(fields);
+      if (revocation.statement !== canonical
+        || !verifySignedStatement(canonical, revocation.signature, actor.sig_pub)) {
         throw new Error("invalid device revocation certificate signature or statement");
       }
       activeAtEpoch.delete(subject.sid);
@@ -403,9 +425,7 @@ export function verifyDirectoryProof(
       };
       if (upgrade.identity_sid !== root.sid
         || upgrade.statement !== canonicalLegacyUpgrade(fields)
-        || !sodium.crypto_sign_verify_detached(
-          unb64u(upgrade.signature), encoder.encode(upgrade.statement), unb64u(root.sig_pub),
-        )) {
+        || !verifySignedStatement(upgrade.statement, upgrade.signature, root.sig_pub)) {
         throw new Error("invalid legacy security upgrade certificate");
       }
     }
@@ -428,7 +448,8 @@ export function verifyDirectoryProof(
   // Grandfathered v1 devices are explicitly TOFU/unverified. Every v2 device
   // must be reachable from the root through a valid approval certificate.
   for (const device of proof.device_history) {
-    if (proof.security_mode === "verified_v2" && device.sid !== root.sid && !authorized.has(device.sid)) {
+    if (proof.security_mode === "verified_v2" && device.sid !== root.sid
+      && !authorized.has(device.sid) && !isRevokedGrandfathered(device)) {
       throw new Error(`device ${device.sid} has no valid approval certificate`);
     }
   }

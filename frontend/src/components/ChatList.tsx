@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import { useStore } from "../store/useStore";
 import { searchMessages, type MessageRow } from "../store/db";
 import { conversationDisplayName } from "../store/helpers";
+import { ownedSmsPhone } from "../store/conversationPolicy";
 
 export default function ChatList() {
   const conversations = useStore((s) => s.conversations);
+  const username = useStore((s) => s.username);
   const activeCid = useStore((s) => s.activeCid);
   const selectConversation = useStore((s) => s.selectConversation);
   const refreshConversations = useStore((s) => s.refreshConversations);
@@ -137,7 +139,7 @@ export default function ChatList() {
                   </span>
                 </div>
                 <div className="mt-0.5 truncate text-[11px] text-tx-4">
-                  {c.name ? "SMS" : `SecureMsg · ${c.members.length}명`}
+                  {ownedSmsPhone(c, username) ? "SMS" : `SecureMsg · ${c.members.length}명`}
                 </div>
               </div>
             </button>

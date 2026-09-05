@@ -96,6 +96,33 @@ import java.util.Locale
 data class ComposeTarget(val phone: String?, val requestId: Long)
 
 /**
+ * A pending `sms:`/`smsto:` link on its way to the composer. [requestId] is the
+ * id of the ConversationTarget MainActivity posted alongside it — the one that
+ * moves the shell to this tab — so consuming one consumes both.
+ */
+internal data class SmsLinkRequest(val phone: String?, val body: String?, val requestId: String)
+
+/**
+ * The link waiting to be opened, held process-wide instead of handed down as a
+ * parameter: this pane is recreated on every tab switch and [MessagesPaneState]
+ * resets with it, so a link that arrives while 연락처/설정 is in front has to
+ * outlive both. Same process-scoped hand-off as [LastOpened]. A second link
+ * replaces the first, because the newest tap is the one being waited on.
+ */
+internal object SmsLinkRequests {
+    var pending by mutableStateOf<SmsLinkRequest?>(null)
+        private set
+
+    fun post(request: SmsLinkRequest) {
+        pending = request
+    }
+
+    fun consume(requestId: String) {
+        if (pending?.requestId == requestId) pending = null
+    }
+}
+
+/**
  * The slice of the 메시지 tab's state the shell reads while composing: whether
  * a conversation or the composer is up decides the wordmark, FAB and bottom
  * nav for the SAME frame, so MainScreen owns it instead of having the pane
@@ -297,8 +324,12 @@ fun ColumnScope.MessagesPane(
         MessageSearch.globalHits(globalRows, threads, threadSearchQuery)
     }
     // Re-read the wall clock whenever the data it labels changes, so "오늘"
-    // cannot stay pinned across midnight for long.
-    val clock = remember(threads, selectedMessages) { DayClock() }
+    // cannot stay pinned across midnight for long — but keep the same instance
+    // while the day has not actually turned: `clock` is a remember key for
+    // buildChatRows below, so a fresh one per emission re-derived the whole
+    // open conversation every time an unrelated thread moved.
+    val dayKey = remember(threads, selectedMessages) { DayClock.currentDay() }
+    val clock = remember(dayKey) { DayClock() }
     val senderRules = remember(blockedSenderRows, sharedRules) {
         senderRuleValues(blockedSenderRows, sharedRules)
     }
@@ -330,6 +361,27 @@ fun ColumnScope.MessagesPane(
         if (exitMs <= 0) return
         dismissing = true
         dismissTick++
+    }
+
+    /**
+     * The counterpart to [closeConversation]: because closing deliberately
+     * leaves the leaving conversation's draft, notice and in-chat search
+     * standing, every path IN has to clear them, and each site that hand-rolled
+     * that list got a different subset of it. [searchQuery] is the list's query
+     * carried into the chat (a tapped body hit), which is why it also decides
+     * whether the search pill comes up.
+     *
+     * Not for the openAfterSend hop: that one keeps [sendNotice] so the send
+     * confirmation survives into the thread it just created.
+     */
+    fun openConversation(thread: SmsThread, searchQuery: String = "") {
+        selectedThread = thread
+        composing = false
+        openAfterSend = null
+        messageSearchQuery = searchQuery
+        messageSearchVisible = searchQuery.isNotEmpty()
+        reply = ""
+        sendNotice = null
     }
 
     fun closeConversation() {
@@ -437,14 +489,11 @@ fun ColumnScope.MessagesPane(
         val resolved = ConversationTargetResolver.resolve(threads, target)
             ?: return@LaunchedEffect
         state.openedWithoutMotion = target.requestId == coldStartRequestId
-        selectedThread = resolved
-        composing = false
-        openAfterSend = null
+        openConversation(resolved)
+        // Only this path clears the list's own query too: it arrives from
+        // outside the pane, so whatever was being searched is not what the
+        // user is now being shown.
         threadSearchQuery = ""
-        messageSearchQuery = ""
-        messageSearchVisible = false
-        reply = ""
-        sendNotice = null
         onConversationTargetConsumed(target.requestId)
     }
 
@@ -471,6 +520,45 @@ fun ColumnScope.MessagesPane(
         messageSearchQuery = ""
         messageSearchVisible = false
         onComposeTargetConsumed()
+    }
+
+    // The system handed the app an sms:/smsto: link through the manifest's
+    // SENDTO filter. Same rule as the composer request above — a number that
+    // already has a conversation opens it — but the lookup goes to the table
+    // rather than [threads]: a link is one of the things that cold-starts this
+    // app, and deciding on the empty list Room has not filled in yet would put
+    // a first-message composer in front of a number the user already chats
+    // with.
+    LaunchedEffect(SmsLinkRequests.pending) {
+        val request = SmsLinkRequests.pending ?: return@LaunchedEffect
+        val existing = request.phone?.let { phone ->
+            withContext(Dispatchers.IO) { db.threadDao().getAll() }
+                // observeAll's ordering, so a number carrying a provisional
+                // `local_` thread beside its authoritative one opens the same
+                // conversation the list would have shown.
+                .sortedByDescending { it.lastActivityAt }
+                .firstOrNull { samePhone(it.phoneNumber, phone) }
+        }
+        if (existing != null) {
+            state.openedWithoutMotion = request.requestId == coldStartRequestId
+            openConversation(existing)
+            reply = request.body.orEmpty()
+        } else {
+            selectedThread = null
+            newPhone = request.phone.orEmpty()
+            newMsg = request.body.orEmpty()
+            composing = true
+            openAfterSend = null
+            reply = ""
+            sendNotice = null
+            messageSearchQuery = ""
+            messageSearchVisible = false
+        }
+        // Arrived from outside the pane, so whatever was being searched is not
+        // what the user is being shown now.
+        threadSearchQuery = ""
+        SmsLinkRequests.consume(request.requestId)
+        onConversationTargetConsumed(request.requestId)
     }
 
     // First send from the composer: move into the thread as soon as it
@@ -940,16 +1028,7 @@ fun ColumnScope.MessagesPane(
                                 // bold, so the badge must not vanish under it.
                                 unreadCount = unreadCount.coerceAtLeast(1),
                                 showPersonIcon = !item.showsPhoneSubtitle,
-                                // Prepared on the way in: closing a
-                                // conversation leaves its own state standing
-                                // for the exit it is still animating.
-                                onClick = {
-                                    selectedThread = item
-                                    messageSearchQuery = ""
-                                    messageSearchVisible = false
-                                    reply = ""
-                                    sendNotice = null
-                                },
+                                onClick = { openConversation(item) },
                                 pinned = pinned,
                                 onLongClick = {
                                     val next = PinnedConversations.toggle(context, item.phoneNumber)
@@ -978,17 +1057,13 @@ fun ColumnScope.MessagesPane(
                                     time = clock.listTime(hit.createdAt),
                                     onClick = {
                                         threads.firstOrNull { it.cid == hit.cid }?.let { target ->
-                                            selectedThread = target
-                                            reply = ""
-                                            sendNotice = null
                                             // Hand the query to the in-conversation
                                             // search instead of scrolling to an id:
                                             // that pane already filters and shows the
                                             // matches, and its predicate is a superset
                                             // of the SQL one, so the tapped message is
                                             // always among them.
-                                            messageSearchQuery = threadSearchQuery.trim()
-                                            messageSearchVisible = true
+                                            openConversation(target, threadSearchQuery.trim())
                                         }
                                     },
                                 )
@@ -1082,7 +1157,7 @@ private fun RecipientField(
                 fontSize = 14.sp,
                 fontFeatureSettings = "tnum",
             ),
-            cursorBrush = SolidColor(Sm.teal),
+            cursorBrush = SolidColor(Sm.accent),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
             decorationBox = { inner ->
                 Box(contentAlignment = Alignment.CenterStart) {
@@ -1388,8 +1463,9 @@ private fun buildChatRows(messages: List<MessageRow>, clock: DayClock): List<Cha
 
 /**
  * Wall-clock labels for the list's time column and the chat's date pills.
- * Cheap to build; callers re-create one when the data it labels changes.
- * Main-thread only (SimpleDateFormat is not thread-safe).
+ * Only `today`/`yesterday` depend on when it was built, so callers re-create
+ * one when the calendar day turns rather than when the data it labels changes.
+ * Main-thread only (SimpleDateFormat and the shared [cal] are not thread-safe).
  */
 private class DayClock(now: Long = System.currentTimeMillis()) {
     private val cal: Calendar = Calendar.getInstance()
@@ -1402,16 +1478,14 @@ private class DayClock(now: Long = System.currentTimeMillis()) {
     private val yesterday: Long = run {
         cal.timeInMillis = now
         cal.add(Calendar.DAY_OF_YEAR, -1)
-        key()
+        key(cal)
     }
 
     /** Calendar day of [at] in the device zone, encoded year × 1000 + day-of-year. */
     fun dayOf(at: Long): Long {
         cal.timeInMillis = at
-        return key()
+        return key(cal)
     }
-
-    private fun key(): Long = cal.get(Calendar.YEAR) * 1000L + cal.get(Calendar.DAY_OF_YEAR)
 
     private fun sameYear(day: Long): Boolean = day / 1000 == today / 1000
 
@@ -1439,6 +1513,18 @@ private class DayClock(now: Long = System.currentTimeMillis()) {
             sameYear(day) -> sameYearPill.format(Date(at))
             else -> otherYearPill.format(Date(at))
         }
+    }
+
+    companion object {
+        /**
+         * [dayOf] the current instant without building an instance. Callers
+         * re-read this to decide whether a new clock is needed at all, so it
+         * must not pay for the formatters that decision would allocate.
+         */
+        fun currentDay(): Long = key(Calendar.getInstance())
+
+        private fun key(cal: Calendar): Long =
+            cal.get(Calendar.YEAR) * 1000L + cal.get(Calendar.DAY_OF_YEAR)
     }
 }
 

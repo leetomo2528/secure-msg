@@ -5,7 +5,6 @@ import io.socket.client.Socket
 import io.socket.emitter.Emitter
 import org.json.JSONObject
 import java.net.URISyntaxException
-import java.util.UUID
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -22,10 +21,9 @@ class RelayClient(val baseUrl: String) {
     var onConvUpdated: ((data: JSONObject) -> Unit)? = null
     var onContactsUpdated: ((data: JSONObject) -> Unit)? = null
     var onDevicePending: ((data: JSONObject) -> Unit)? = null
-    var token: String? = null
+    var onDeviceApproved: ((data: JSONObject) -> Unit)? = null
 
     fun connect(token: String) {
-        this.token = token
         disconnect()
         try {
             val opts = IO.Options()
@@ -78,10 +76,19 @@ class RelayClient(val baseUrl: String) {
                 if (args.isNotEmpty() && args[0] is JSONObject) args[0] as JSONObject else JSONObject(),
             )
         })
+        // A device approved elsewhere is invisible to a gateway whose socket
+        // never drops: nothing else re-reads the key directory on the receive
+        // path, so every envelope from that device was refused as unpinned and
+        // the conversation stalled behind it.
+        socket?.on("device_approved", Emitter.Listener { args ->
+            onDeviceApproved?.invoke(
+                if (args.isNotEmpty() && args[0] is JSONObject) args[0] as JSONObject else JSONObject(),
+            )
+        })
         socket?.connect()
     }
 
-    fun sendMessage(
+    private fun sendMessage(
         cid: String,
         payload: JSONObject,
         messageId: String,
@@ -102,7 +109,7 @@ class RelayClient(val baseUrl: String) {
     suspend fun sendMessageAwait(
         cid: String,
         payload: JSONObject,
-        messageId: String = UUID.randomUUID().toString(),
+        messageId: String,
         timeoutMillis: Long = 10_000,
     ): JSONObject {
         var last = JSONObject().put("ok", false).put("error", "relay acknowledgement timeout")
@@ -123,12 +130,6 @@ class RelayClient(val baseUrl: String) {
 
     fun emitDelivered(cid: String, seq: Int) {
         socket?.emit("message_delivered", JSONObject().put("cid", cid).put("seq", seq))
-    }
-
-    fun emitCarrierStatus(cid: String, seq: Int, status: String, error: String? = null) {
-        val body = JSONObject().put("cid", cid).put("seq", seq).put("status", status)
-        if (!error.isNullOrBlank()) body.put("error", error.take(300))
-        socket?.emit("carrier_status", body)
     }
 
     suspend fun emitCarrierStatusAwait(

@@ -1,10 +1,13 @@
 import "fake-indexeddb/auto";
 import { beforeAll, describe, expect, it } from "vitest";
+import { openDB } from "idb";
 import { initCrypto } from "../crypto/keys";
 import { serverDirectoryHash } from "../crypto/deviceTrust";
 import {
   addBlockKeyword,
   addBlockedSender,
+  blockKeywordRejection,
+  blockedSenderRejection,
   listBlockKeywords,
   listBlockedSenders,
   getCursor,
@@ -40,6 +43,43 @@ function msg(cid: string, seq: number, extra: Partial<MessageRow> = {}): Message
     ...extra,
   };
 }
+
+describe("schema upgrade", () => {
+  /**
+   * Deliberately the first test in this file: db() memoises its connection for
+   * the module's lifetime, so this is the only point at which a profile can
+   * still be staged at the previous version.
+   */
+  it("drops the v4 devices cache and opens the existing profile at v5", async () => {
+    const legacy = await openDB("secure-msg", 4, {
+      upgrade(d) {
+        d.createObjectStore("meta");
+        d.createObjectStore("devices", { keyPath: "sid" }).createIndex("by-user", "user_id");
+        const messages = d.createObjectStore("messages", { keyPath: "id" });
+        messages.createIndex("by-cid", "cid");
+        messages.createIndex("by-cid-seq", ["cid", "seq"]);
+        d.createObjectStore("cursors", { keyPath: "cid" });
+        d.createObjectStore("blocklist", { keyPath: "id" }).createIndex("by-keyword", "keyword");
+        d.createObjectStore("blockedSenders", { keyPath: "id" }).createIndex("by-sender", "sender");
+        d.createObjectStore("accountTrust", { keyPath: "uid" });
+        d.createObjectStore("trustedDevices", { keyPath: "id" }).createIndex("by-account", "uid");
+      },
+    });
+    await legacy.put("devices", { sid: "legacy-device", user_id: 1, pub_key: "legacy-box" });
+    await legacy.put("cursors", { cid: "legacy-thread", last_seq: 7 });
+    legacy.close();
+
+    const upgraded = await db();
+
+    expect(upgraded.version).toBe(5);
+    expect(Array.from(upgraded.objectStoreNames).sort()).toEqual([
+      "accountTrust", "blockedSenders", "blocklist", "cursors",
+      "messages", "meta", "trustedDevices",
+    ]);
+    // Dropping a store must not cost the profile the rest of its content.
+    expect(await getCursor("legacy-thread")).toBe(7);
+  });
+});
 
 describe("message persistence", () => {
   it("dedupes by (cid, seq) and sorts by seq", async () => {
@@ -136,6 +176,14 @@ describe("blocklist keywords", () => {
   it("rejects empty keywords", async () => {
     await expect(addBlockKeyword("   ")).rejects.toThrow();
   });
+
+  it("refuses the keyword shapes the relay would reject", () => {
+    expect(blockKeywordRejection("광고")).toBeNull();
+    expect(blockKeywordRejection("   ")).not.toBeNull();
+    // 61 ligatures pass the editor's 120-character input cap and expand to 122
+    // under NFKC, which is the length the relay measures.
+    expect(blockKeywordRejection("ﬁ".repeat(61))).not.toBeNull();
+  });
 });
 
 describe("blocked senders", () => {
@@ -147,6 +195,16 @@ describe("blocked senders", () => {
     expect((await listBlockedSenders()).filter(
       (row) => row.sender === "+821012345678",
     )).toHaveLength(1);
+  });
+
+  it("refuses the sender shapes the relay would reject", () => {
+    expect(blockedSenderRejection("010-1234-5678")).toBeNull();
+    expect(blockedSenderRejection("*1234#5")).toBeNull();
+    // SENDER_RE ends on a digit, so a service code keeps its trailing '#' and
+    // the relay answers 400 for it on every upload.
+    expect(blockedSenderRejection("1588-1234#")).not.toBeNull();
+    expect(blockedSenderRejection("MYBANK")).not.toBeNull();
+    expect(blockedSenderRejection("15")).not.toBeNull();
   });
 });
 

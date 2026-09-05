@@ -25,6 +25,14 @@ function koreanNationalPart(value: string): string | null {
   return /^(?:2[0-9]{7,8}|50[0-9]{9}|[1-9][0-9]{8,9})$/.test(national) ? national : null;
 }
 
+/**
+ * Conversation names this client accepts as a carrier SMS identity. Creating a
+ * thread the SMS reader then refuses to recognize splits one phone number
+ * across two conversations, so the store shares this shape rather than
+ * restating it.
+ */
+export const SMS_PHONE_RE = /^\+?[0-9*#]{3,24}$/;
+
 /** Only a self-only conversation may be interpreted as a carrier SMS thread. */
 export function ownedSmsPhone(
   conversation: ConversationLike,
@@ -34,5 +42,5 @@ export function ownedSmsPhone(
     return null;
   }
   const phone = normalizePhone(conversation.name);
-  return /^\+?[0-9*#]{3,24}$/.test(phone) ? phone : null;
+  return SMS_PHONE_RE.test(phone) ? phone : null;
 }

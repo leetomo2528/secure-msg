@@ -4,6 +4,7 @@ import { api } from "../net/api";
 import { hashPassword, saltForUser } from "../crypto/keys";
 import BrandMark from "./BrandMark";
 import OnboardingPolicyNotice from "./OnboardingPolicyNotice";
+import { passwordResetInputError } from "./onboardingPolicy";
 import { Segmented } from "./ui";
 
 type Mode = "login" | "register";
@@ -89,16 +90,29 @@ export default function Onboarding() {
       setResetMessage("먼저 인증 메일을 요청하세요.");
       return;
     }
+    const normalizedUsername = resetUsername.trim().toLowerCase();
+    const code = resetCode.trim();
+    const inputError = passwordResetInputError(normalizedUsername, code, resetPassword);
+    if (inputError) {
+      setResetMessage(inputError);
+      return;
+    }
     setResetBusy(true);
     try {
-      const pwHash = await hashPassword(resetPassword, saltForUser(resetUsername.trim().toLowerCase()));
+      const pwHash = await hashPassword(resetPassword, saltForUser(normalizedUsername));
       const result = await api.passwordResetConfirm(
-        resetUsername.trim().toLowerCase(), resetEmail.trim().toLowerCase(), resetChallenge, resetCode.trim(), pwHash,
+        normalizedUsername, resetEmail.trim().toLowerCase(), resetChallenge, code, pwHash,
       );
       setResetMessage(result.ok ? "비밀번호가 변경되었습니다. 로그인해 주세요." : result.error ?? "인증 코드가 올바르지 않습니다.");
       if (result.ok) {
-        setResetOpen(false);
+        // Closing the panel here unmounted the only element that renders
+        // resetMessage, so a reset that had just revoked every device session
+        // looked like nothing happened. Nulling the challenge already collapses
+        // the code and password fields; clearing them keeps a stale code and
+        // the new password out of a second request in the same page session.
         setResetChallenge(null);
+        setResetCode("");
+        setResetPassword("");
         setPassword("");
       }
     } finally {
@@ -265,10 +279,21 @@ export default function Onboarding() {
           </button>
 
           {mode === "login" && resetOpen && (
-            <div className="space-y-3 rounded-xl bg-fg/[0.04] p-4 animate-rise">
+            // This panel sits inside the login form — that form element IS the
+            // card and forms cannot nest — so Enter would otherwise submit a
+            // login with the very password the user came here to reset.
+            <div
+              className="space-y-3 rounded-xl bg-fg/[0.04] p-4 animate-rise"
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                e.preventDefault();
+                void (resetChallenge ? confirmReset() : requestReset());
+              }}
+            >
               <p className="text-[11px] leading-relaxed text-tx-3">가입 때 인증한 이메일로 6자리 코드를 보냅니다.</p>
               <input value={resetUsername} onChange={(e) => setResetUsername(e.target.value)} className="field" placeholder="아이디" />
-              <input type="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} className="field" placeholder="인증 이메일" />
+              {/* Not type="email": a half-typed address is a constraint violation on the enclosing login form and blocks the 로그인 button. */}
+              <input type="text" inputMode="email" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} className="field" placeholder="인증 이메일" />
               {resetChallenge && <input value={resetCode} onChange={(e) => setResetCode(e.target.value)} inputMode="numeric" maxLength={6} className="field" placeholder="6자리 인증 코드" />}
               {resetChallenge && <input type="password" value={resetPassword} onChange={(e) => setResetPassword(e.target.value)} minLength={8} className="field" placeholder="새 비밀번호 (8자 이상)" />}
               {resetMessage && <p className="text-[11px] leading-relaxed text-tx-2">{resetMessage}</p>}

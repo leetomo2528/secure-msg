@@ -10,6 +10,6 @@ object SmsConversationPolicy {
     fun ownedPhone(name: String, members: List<String>, username: String): String? {
         if (members.size != 1 || members.single() != username) return null
         val phone = PhoneNumberNormalizer.normalize(name)
-        return phone.takeIf { Regex("^\\+?[0-9*#]{3,24}$").matches(it) }
+        return phone.takeIf(PhoneNumberNormalizer::isSmsAddress)
     }
 }

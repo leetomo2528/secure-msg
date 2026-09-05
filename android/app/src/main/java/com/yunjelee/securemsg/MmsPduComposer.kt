@@ -18,12 +18,13 @@ object MmsPduComposer {
     private const val MESSAGE_TYPE_SEND_REQ = 0x80
     private const val TRANSACTION_ID = 0x98
     private const val MMS_VERSION = 0x8D
+    // Major version is the high nibble, minor the low one; a bare 3 declares major version 0.
+    private const val MMS_VERSION_1_2 = 0x12
     private const val FROM = 0x89
     private const val TO = 0x97
     private const val SUBJECT = 0x96
     private const val CONTENT_TYPE = 0x84
 
-    private const val FROM_ADDRESS_PRESENT_TOKEN = 0x80
     private const val FROM_INSERT_ADDRESS_TOKEN = 0x81
 
     // PduContentTypes / PduPart well-known WSP tokens.
@@ -32,8 +33,6 @@ object MmsPduComposer {
     private const val IMAGE_GIF = 0x1D
     private const val IMAGE_JPEG = 0x1E
     private const val IMAGE_PNG = 0x20
-    private const val AUDIO_AMR = 0x23
-    private const val VIDEO_3GPP = 0x24
 
     private const val P_CHARSET = 0x81
     private const val P_DEP_NAME = 0x85
@@ -49,7 +48,6 @@ object MmsPduComposer {
     private const val QUOTE = 0x7F
 
     fun compose(
-        from: String,
         to: String,
         subject: String?,
         text: String,
@@ -90,11 +88,11 @@ object MmsPduComposer {
         out.write(TRANSACTION_ID)
         appendText(out, UUID.randomUUID().toString().replace("-", ""))
         out.write(MMS_VERSION)
-        appendShortInteger(out, 0x03) // MMS 1.2
+        appendShortInteger(out, MMS_VERSION_1_2)
 
-        appendFrom(out, from)
+        appendFrom(out)
         out.write(TO)
-        appendAddress(out, to)
+        appendEncodedString(out, addressWithType(to))
 
         if (!subject.isNullOrBlank()) {
             out.write(SUBJECT)
@@ -167,36 +165,28 @@ object MmsPduComposer {
         return sanitized.ifBlank { "attachment" }
     }
 
-    private fun appendFrom(out: ByteArrayOutputStream, from: String) {
+    /** SmsManager lets the MMSC fill the sender in, so From is always the token form. */
+    private fun appendFrom(out: ByteArrayOutputStream) {
         out.write(FROM)
-        if (from == "insert-address-token") {
-            // From = value-length insert-address-token.
-            out.write(1)
-            out.write(FROM_INSERT_ADDRESS_TOKEN)
-            return
-        }
-        val value = ByteArrayOutputStream()
-        value.write(FROM_ADDRESS_PRESENT_TOKEN)
-        appendEncodedString(value, addressWithType(from))
-        appendValueLength(out, value.size())
-        out.write(value.toByteArray())
-    }
-
-    private fun appendAddress(out: ByteArrayOutputStream, address: String) {
-        appendEncodedString(out, addressWithType(address))
+        // From = value-length insert-address-token.
+        out.write(1)
+        out.write(FROM_INSERT_ADDRESS_TOKEN)
     }
 
     private fun addressWithType(address: String): String = "$address/TYPE=PLMN"
 
-    /** Common WSP content-type tokens; string fallback handles OEM-specific types. */
+    /**
+     * Common WSP content-type tokens; string fallback handles OEM-specific types.
+     * audio/amr and video/3gpp are absent because they have no assigned token —
+     * 0x23/0x24 are the multipart family, and a clip labelled as a nested
+     * multipart body makes the receiver parse the media as body parts.
+     */
     private fun contentTypeToken(type: String): Int? {
         return when (type.lowercase()) {
             "text/plain" -> TEXT_PLAIN
             "image/gif" -> IMAGE_GIF
             "image/jpeg", "image/jpg" -> IMAGE_JPEG
             "image/png" -> IMAGE_PNG
-            "audio/amr" -> AUDIO_AMR
-            "video/3gpp" -> VIDEO_3GPP
             else -> null
         }
     }

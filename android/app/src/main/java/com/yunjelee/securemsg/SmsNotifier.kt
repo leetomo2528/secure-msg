@@ -1,6 +1,5 @@
 package com.yunjelee.securemsg
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,14 +8,12 @@ import android.app.Person
 import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import androidx.core.content.ContextCompat
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -202,19 +199,11 @@ object SmsNotifier {
         body: String,
         date: Long,
         cid: String? = null,
-        messageIdentity: String = "$phoneNumber:$date",
+        messageIdentity: String,
         displayName: String? = null,
         liveAlert: Boolean = true,
     ) {
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
-                context, Manifest.permission.POST_NOTIFICATIONS,
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // Without this line a revoked permission is indistinguishable from
-            // "the message never arrived" in a bug report.
-            Log.w(TAG, "POST_NOTIFICATIONS not granted; incoming message not notified")
-            return
-        }
+        if (!NotificationPermission.canPost(context, "incoming message not notified")) return
 
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         ensureChannel(context)
@@ -283,13 +272,7 @@ object SmsNotifier {
      * this is deliberately a plain, loud, tap-to-reopen notification.
      */
     fun notifySessionExpired(context: Context) {
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
-                context, Manifest.permission.POST_NOTIFICATIONS,
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.w(TAG, "session expired but POST_NOTIFICATIONS is not granted")
-            return
-        }
+        if (!NotificationPermission.canPost(context, "session-expired notice not posted")) return
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         ensureChannel(context)
         val intent = Intent(context, MainActivity::class.java)
@@ -326,21 +309,12 @@ object SmsNotifier {
         // news again and must alert.
         lastAlertAt.remove(group)
         manager.cancel(group, MESSAGE_ID)
-        // Per-message notifications posted by an older build (and any group
-        // summary it left behind) are keyed on the message id, not the group.
-        activeNotifications(manager).forEach { posted ->
-            // The foreground notification carries no tag and a different channel.
-            val tag = posted.tag ?: return@forEach
-            if (posted.notification.channelId !in setOf(CHANNEL_ID, CATCHUP_CHANNEL_ID)) return@forEach
-            if (posted.notification.group != group) return@forEach
-            manager.cancel(tag, posted.id)
-        }
     }
 
     /**
      * Drops the notification posted under a raw tag. Fallback for a shade
      * action whose conversation has neither cid nor phone — there is no group
-     * key to sweep by, but the notification must still not outlive "읽음".
+     * key to cancel by, but the notification must still not outlive "읽음".
      */
     fun cancelByTag(context: Context, tag: String) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -365,9 +339,7 @@ object SmsNotifier {
      */
     fun notifyReplyPosted(context: Context, tag: String, replyText: String?) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        val posted = activeNotifications(manager)
-            .firstOrNull { it.tag == tag && it.id == MESSAGE_ID }
-            ?.notification
+        val posted = postedConversation(manager, tag)
             // Dismissed or cancelled since the reply began: no spinner is left
             // to resolve, and reposting would resurrect a read conversation.
             ?: return
@@ -399,13 +371,17 @@ object SmsNotifier {
         date: Long,
     ): Notification.MessagingStyle {
         val style = Notification.MessagingStyle(Person.Builder().setName(SELF_NAME).build())
-        val posted = activeNotifications(manager)
-            .firstOrNull { it.tag == tag && it.id == MESSAGE_ID }
-            ?.notification
+        val posted = postedConversation(manager, tag)
         postedMessages(posted).takeLast(MAX_STYLE_MESSAGES - 1).forEach { style.addMessage(it) }
         style.addMessage(body, date, sender)
         return style
     }
+
+    /** The conversation notification currently posted under [tag], if any. */
+    private fun postedConversation(manager: NotificationManager, tag: String): Notification? =
+        activeNotifications(manager)
+            .firstOrNull { it.tag == tag && it.id == MESSAGE_ID }
+            ?.notification
 
     /**
      * The messages a posted notification still carries. The posted notification

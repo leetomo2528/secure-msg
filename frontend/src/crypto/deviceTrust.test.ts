@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { b64u, generateKeypair, initCrypto } from "./keys";
+import { b64u, generateKeypair, initCrypto, type DeviceKeypair } from "./keys";
+import type { ApprovalCertificate, RevocationCertificate } from "../net/api";
 import {
   accountSafetyNumber,
   canonicalDeviceApproval,
@@ -394,5 +395,196 @@ describe("trusted-device crypto", () => {
       ...proof,
       approval_certificates: [{ ...proof.approval_certificates[0], statement: `${proof.approval_certificates[0].statement}x` }],
     }, active)).toThrow(/certificate/);
+  });
+
+  describe("legacy_v1 and grandfathered TOFU directories", () => {
+    // A migrated account stamps EVERY device `legacy_tofu`, and the relay still
+    // lets any of them approve or revoke, so certificates naming a TOFU actor
+    // are legitimately issued. Rejecting them threw on every login and every
+    // conversation sync, locking the account out of the web client with no
+    // recovery short of DB surgery.
+    const entry = (device: {
+      sid: string;
+      keys: DeviceKeypair;
+      challenge: string;
+      trustState?: "approved" | "revoked";
+      approvedBy?: string;
+      verificationState?: "legacy_unverified" | "verified";
+    }) => ({
+      sid: device.sid,
+      kind: "web" as const,
+      pub_key: device.keys.box.pk,
+      sig_pub: device.keys.sign.pk,
+      fingerprint: deviceFingerprint(device.keys.box.pk, device.keys.sign.pk).hash,
+      trust_state: device.trustState ?? ("approved" as const),
+      challenge: device.challenge,
+      approved_by_sid: device.approvedBy ?? "legacy_tofu",
+      verification_state: device.verificationState ?? ("legacy_unverified" as const),
+    });
+
+    const buildProof = (options: {
+      uid: number;
+      history: Array<ReturnType<typeof entry>>;
+      securityEpoch: number;
+      mode?: "legacy_v1" | "verified_v2";
+      approvals?: ApprovalCertificate[];
+      revocations?: RevocationCertificate[];
+    }) => {
+      const activeHistory = options.history.filter((device) => device.trust_state === "approved");
+      return {
+        proof: {
+          user_id: options.uid,
+          identity_sig_pub: options.history[0].sig_pub,
+          security_epoch: options.securityEpoch,
+          security_mode: options.mode ?? ("legacy_v1" as const),
+          directory_hash: serverDirectoryHash(activeHistory),
+          device_history: options.history,
+          approval_certificates: options.approvals ?? [],
+          revocation_certificates: options.revocations ?? [],
+          security_upgrade_certificates: [],
+        },
+        active: activeHistory.map(({ sid, pub_key, sig_pub, kind }) => ({ sid, pub_key, sig_pub, kind })),
+      };
+    };
+
+    it("accepts a root-only legacy_v1 directory stamped legacy_tofu", () => {
+      const root = generateKeypair();
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 4,
+        history: [entry({ sid: "root", keys: root, challenge: ZERO32 })],
+      });
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("accepts a legacy_v1 peer that carries no approval certificate", () => {
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 4,
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32 }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32 }),
+        ],
+      });
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("accepts the revocation of a TOFU peer, whose history entry is already revoked", () => {
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const fields = {
+        uid: 80, subjectSid: "peer", subjectPubKey: peer.box.pk, subjectSigPub: peer.sign.pk,
+        actorSid: "root", parentEpoch: 1,
+      };
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 2,
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32 }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32, trustState: "revoked" }),
+        ],
+        revocations: [{
+          subject_sid: "peer", actor_sid: "root", parent_epoch: 1, resulting_epoch: 2,
+          reason: "user_revoked", statement: canonicalDeviceRevoke(fields),
+          signature: signDeviceRevoke(fields, root.sign.sk), created_at: 1,
+        }],
+      });
+      expect(active).toHaveLength(1);
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("accepts an approval signed by a TOFU peer rather than by the root", () => {
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const laptop = generateKeypair();
+      const fields = {
+        uid: 80, subjectSid: "laptop", pubKey: laptop.box.pk, sigPub: laptop.sign.pk,
+        kind: "web", challenge: TWO32, parentEpoch: 1,
+      };
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 2,
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32 }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32 }),
+          entry({ sid: "laptop", keys: laptop, challenge: TWO32, approvedBy: "peer" }),
+        ],
+        approvals: [{
+          subject_sid: "laptop", approver_sid: "peer", parent_epoch: 1, resulting_epoch: 2,
+          statement: canonicalDeviceApproval(fields),
+          signature: signDeviceApproval(fields, peer.sign.sk), created_at: 1,
+        }],
+      });
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("rejects a legacy_v1 certificate from an epoch the directory has not reached", () => {
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const fields = {
+        uid: 80, subjectSid: "peer", subjectPubKey: peer.box.pk, subjectSigPub: peer.sign.pk,
+        actorSid: "root", parentEpoch: 2,
+      };
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 2,
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32 }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32, trustState: "revoked" }),
+        ],
+        revocations: [{
+          subject_sid: "peer", actor_sid: "root", parent_epoch: 2, resulting_epoch: 3,
+          reason: "user_revoked", statement: canonicalDeviceRevoke(fields),
+          signature: signDeviceRevoke(fields, root.sign.sk), created_at: 1,
+        }],
+      });
+      expect(() => verifyDirectoryProof(proof, active)).toThrow(/certificate epoch exceeds directory epoch/);
+    });
+
+    it("accepts a verified_v2 directory that still carries a pre-upgrade revoked device", () => {
+      // The upgrade cannot heal an already-revoked device: it stays
+      // legacy_unverified with no certificate, forever.
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const { proof, active } = buildProof({
+        uid: 80,
+        securityEpoch: 1,
+        mode: "verified_v2",
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32, verificationState: "verified" }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32, trustState: "revoked" }),
+        ],
+      });
+      expect(() => verifyDirectoryProof(proof, active)).not.toThrow();
+    });
+
+    it("still rejects an ACTIVE TOFU device in a verified_v2 directory", () => {
+      const root = generateKeypair();
+      const peer = generateKeypair();
+      const unverified = buildProof({
+        uid: 80,
+        securityEpoch: 1,
+        mode: "verified_v2",
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32, verificationState: "verified" }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32 }),
+        ],
+      });
+      expect(() => verifyDirectoryProof(unverified.proof, unverified.active)).toThrow(/unverified device/);
+
+      const relabelled = buildProof({
+        uid: 80,
+        securityEpoch: 1,
+        mode: "verified_v2",
+        history: [
+          entry({ sid: "root", keys: root, challenge: ZERO32, verificationState: "verified" }),
+          entry({ sid: "peer", keys: peer, challenge: ONE32, verificationState: "verified" }),
+        ],
+      });
+      expect(() => verifyDirectoryProof(relabelled.proof, relabelled.active))
+        .toThrow(/no valid approval certificate/);
+    });
   });
 });

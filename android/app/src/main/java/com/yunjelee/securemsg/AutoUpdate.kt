@@ -22,11 +22,11 @@ object AutoUpdatePolicy {
         COMMIT_READY,
 
         /**
-         * A wedged terminal entry (FAILED, or a SESSION_SUBMITTED whose
-         * submitting process is gone) has sat unattended past the recovery
-         * age: drop it so the next due tick can retry from scratch. Without
-         * this an unattended device — the feature's stated purpose — never
-         * updates again after one Play Protect block or untapped confirm.
+         * A wedged terminal entry (FAILED, or a SESSION_SUBMITTED that never
+         * resolved) has sat unattended past the recovery age: drop it so the
+         * next due tick can retry from scratch. Without this an unattended
+         * device — the feature's stated purpose — never updates again after
+         * one Play Protect block or untapped confirm.
          */
         CLEAR_WEDGED,
 
@@ -63,17 +63,16 @@ object AutoUpdatePolicy {
             // future tick forever.
             PendingInstallState.FAILED ->
                 if (pendingStale && !appVisible) Action.CLEAR_WEDGED else Action.SKIP
-            // SESSION_SUBMITTED with the submitting process dead is a confirm
-            // that is never coming back on its own (MainActivity's restore
-            // does this same conversion, but never runs on an unattended
-            // phone). A live submission — this process set the flag — may
-            // still land and must not be pulled out from under its dialog.
+            // A SESSION_SUBMITTED still here after the recovery age is a
+            // confirm nobody tapped. submittedInThisProcess deliberately does
+            // not gate this: the submitting process is the START_STICKY
+            // bridge that lives for days, so keying the reclaim on it wedged
+            // the updater on exactly the unattended device this recovery
+            // exists for. installViaSession abandons every prior session
+            // before re-committing, so the retry cannot collide with the
+            // entry dropped here.
             PendingInstallState.SESSION_SUBMITTED ->
-                if (pendingStale && !appVisible && !submittedInThisProcess) {
-                    Action.CLEAR_WEDGED
-                } else {
-                    Action.SKIP
-                }
+                if (pendingStale && !appVisible) Action.CLEAR_WEDGED else Action.SKIP
             // AWAITING_PERMISSION/FALLBACK_LAUNCHED: manual-flow states the
             // user created while present; only the user resolves them.
             else -> Action.SKIP

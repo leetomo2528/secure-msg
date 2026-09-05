@@ -18,7 +18,11 @@ COPY . .
 # An empty named volume inherits this ownership when Docker initializes it;
 # one that already holds data keeps whatever the host dir has (see README).
 RUN mkdir -p /data && chown securemsg:securemsg /data
+# SECUREMSG_DB has to default into /data as well: config.py otherwise resolves
+# it under root-owned /app, and init_schema() runs during gunicorn worker boot,
+# so a caller that omits the variable gets a crash loop instead of an error.
 ENV SECUREMSG_ENV=production \
+    SECUREMSG_DB=/data/securemsg.db \
     PYTHONDONTWRITEBYTECODE=1
 EXPOSE 5000
 USER securemsg

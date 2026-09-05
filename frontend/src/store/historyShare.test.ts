@@ -344,6 +344,26 @@ describe("history key sharing", () => {
     expect(shareKeys).toHaveBeenCalledTimes(64);
   });
 
+  it("does not report success when the whole missing-keys window is unopenable", async () => {
+    const a = account(9011);
+    const cid = "conv-share-wall";
+    await pinTrustedDirectory(pinnedSnapshot(a));
+    signedIn(a);
+    // The relay answers with the LOWEST unkeyed sequences and takes no offset.
+    // This device can open none of the 500 it is handed, so the window never
+    // moves and seqs 501-510 — which it CAN open — stay unreachable behind it.
+    // Calling that a successful run is what left them unshared for good.
+    const { shareKeys } = await relayFixture(a, cid, {
+      total: 510, unopenableThrough: 500, window: 500,
+    });
+
+    const outcome = await shareHistoryWithDevice(a.targetSid);
+
+    expect(outcome).toMatchObject({ ok: false, shared: 0 });
+    expect(outcome.error).toContain("다시 실행");
+    expect(shareKeys).not.toHaveBeenCalled();
+  });
+
   it("skips a message re-wrapped by a device this browser has not pinned", async () => {
     const a = account(9003);
     const cid = "conv-share-unpinned-wrapper";

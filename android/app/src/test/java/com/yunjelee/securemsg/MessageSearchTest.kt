@@ -115,6 +115,32 @@ class MessageSearchTest {
     }
 
     @Test
+    fun `snippet flattens the unicode spaces a Korean body actually carries`() {
+        // java.util.regex's \s is ASCII-only, Android's ICU \s covers \p{Z}, so
+        // flatten() alone does not agree across the two engines. What does is
+        // the Kotlin trim() behind it — Character.isWhitespace/isSpaceChar are
+        // Unicode-driven on both — so the fixture keeps U+3000 and U+00A0 at
+        // the edges, where a full-width IME space and a carrier's nbsp land.
+        val snippet = MessageSearch.snippet("\u3000첫 줄\n둘째 줄 약속\u00A0", "약속")
+
+        assertEquals("첫 줄 둘째 줄 약속", snippet.text)
+        assertEquals("약속", snippet.text.substring(snippet.matchStart, snippet.matchEnd))
+    }
+
+    @Test
+    fun `a query of nothing but unicode spaces is blank`() {
+        val threads = listOf(thread("cid", localName = "윤제"))
+        val messages = listOf(message(1, "공개"))
+
+        assertEquals(threads, MessageSearch.filterThreads(threads, "\u3000\u00A0"))
+        assertEquals(messages, MessageSearch.filterMessages(messages, "\u00A0"))
+        assertEquals(
+            emptyList<MessageHit>(),
+            MessageSearch.globalHits(messages, threads, " \u3000\t\u00A0 "),
+        )
+    }
+
+    @Test
     fun `snippet without an occurrence renders a head and marks no match`() {
         val snippet = MessageSearch.snippet("본문에는 없는 말", "제목")
 

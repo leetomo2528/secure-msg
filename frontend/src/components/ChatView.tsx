@@ -1,20 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
 import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
-import type { MessageRow } from "../store/db";
 import { Avatar } from "./ChatList";
 import {
   conversationDisplayName,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
 } from "../store/helpers";
+import { ownedSmsPhone } from "../store/conversationPolicy";
+import { buildConversationExport, downloadText } from "../store/exportConversation";
 
 export default function ChatView({ cid }: { cid: string }) {
   const activeMessages = useStore((s) => s.activeMessages);
   const conversations = useStore((s) => s.conversations);
   const sendContent = useStore((s) => s.sendContent);
   const sid = useStore((s) => s.sid);
+  const username = useStore((s) => s.username);
   const [text, setText] = useState("");
   const [subject, setSubject] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
@@ -23,6 +25,9 @@ export default function ChatView({ cid }: { cid: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const conversation = conversations.find((item) => item.cid === cid);
   const title = conversationDisplayName(conversation);
+  // Merely having a `name` is not the SMS test: a renamed group chat has one
+  // and nothing routes it through the carrier.
+  const isSms = Boolean(conversation && ownedSmsPhone(conversation, username));
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [exportMenu, setExportMenu] = useState(false);
@@ -40,57 +45,10 @@ export default function ChatView({ cid }: { cid: string }) {
     await renameConversation(cid, next);
   };
 
-  const download = (filename: string, mime: string, content: string) => {
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.click();
-    // Some browsers (notably Safari/iOS PWA) abort the download if the URL is
-    // revoked before the download actually starts.
-    setTimeout(() => URL.revokeObjectURL(url), 1_000);
-  };
-
   const exportMessages = (format: "csv" | "json") => {
     setExportMenu(false);
-    const rows = activeMessages.filter((m) => !m.blocked);
-    const stamp = new Date().toISOString().slice(0, 10);
-    // Keep unicode letters/digits (Korean names) in the filename.
-    const base = `securemsg-${title.replace(/[^\p{L}\p{N}_+\-]/gu, "_")}-${stamp}`;
-    if (format === "json") {
-      const payload = rows.map((m: MessageRow) => ({
-        seq: m.seq,
-        mine: m.sender_sid === sid,
-        text: m.plaintext,
-        subject: m.subject ?? undefined,
-        content_type: m.content_type ?? "text",
-        carrier_status: m.carrier_status,
-        created_at: new Date(m.created_at).toISOString(),
-      }));
-      download(`${base}.json`, "application/json", JSON.stringify({
-        conversation: title, exported_at: new Date().toISOString(), count: payload.length,
-        messages: payload,
-      }, null, 2));
-      return;
-    }
-    // Quote-escape cells, and neutralize spreadsheet formula injection: SMS
-    // text is attacker-controlled, so a leading =+-@ (or tab/CR) would execute
-    // as a formula when the export is opened in Excel/Sheets.
-    const esc = (v: string) => `"${(/^[=+\-@\t\r]/.test(v) ? `'${v}` : v).replace(/"/g, '""')}"`;
-    const lines = [
-      ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
-      ...rows.map((m: MessageRow) => [
-        String(m.seq),
-        m.sender_sid === sid ? "sent" : "received",
-        esc(m.subject ?? ""),
-        esc(m.plaintext),
-        m.carrier_status ?? "",
-        new Date(m.created_at).toISOString(),
-      ].join(",")),
-    ];
-    // BOM so Excel reads UTF-8 (Korean) correctly.
-    download(`${base}.csv`, "text/csv;charset=utf-8", "\uFEFF" + lines.join("\n"));
+    const file = buildConversationExport(activeMessages, sid, title, format);
+    downloadText(file.filename, file.mime, file.body);
   };
 
   useEffect(() => {
@@ -137,10 +95,20 @@ export default function ChatView({ cid }: { cid: string }) {
         setAttachmentError(`첨부파일 전체 크기는 ${MAX_ATTACHMENT_BYTES / 1024}KB까지 가능합니다`);
         return;
       }
+      let bytes: ArrayBuffer;
+      try {
+        bytes = await file.arrayBuffer();
+      } catch {
+        // Picking and reading are separate operations, and an Android/iOS
+        // content URI can be revoked in between. Rejecting here left the
+        // handler with an unhandled rejection and the picker looking inert.
+        setAttachmentError(`'${file.name}' 파일을 읽지 못했습니다`);
+        break;
+      }
       next.push({
         name: file.name.slice(0, 120) || "attachment",
         content_type: file.type || "application/octet-stream",
-        data: b64u(new Uint8Array(await file.arrayBuffer())),
+        data: b64u(new Uint8Array(bytes)),
         size: file.size,
       });
     }
@@ -180,7 +148,7 @@ export default function ChatView({ cid }: { cid: string }) {
             <div className="truncate text-sm font-semibold text-tx-1">{title}</div>
           )}
           <div className="text-[10px] text-tx-4">
-            {conversation?.name ? "SMS · Android 게이트웨이" : "E2E 암호화"}
+            {isSms ? "SMS · Android 게이트웨이" : "E2E 암호화"}
           </div>
         </div>
         <div className="ml-auto flex items-center gap-1">
@@ -364,7 +332,10 @@ function dataUrl(attachment: MessageAttachment): string {
 }
 
 function AttachmentPreview({ attachment, mine }: { attachment: MessageAttachment; mine: boolean }) {
-  const url = dataUrl(attachment);
+  // ChatView re-renders on every composer keystroke, and rebuilding this
+  // re-pads up to 512 KiB of base64 per attachment and hands the browser a
+  // fresh `src` each time.
+  const url = useMemo(() => dataUrl(attachment), [attachment]);
   // Render inline images only for a fixed safe whitelist. A generic MIME
   // pattern would let remote-controlled content pick exotic image types.
   if (/^image\/(png|jpe?g|gif|webp|bmp)$/i.test(attachment.content_type)) {

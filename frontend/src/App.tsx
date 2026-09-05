@@ -74,7 +74,10 @@ export default function App() {
         className={`${activeCid ? "block" : "hidden md:block"} overflow-hidden min-h-0`}
         style={{ paddingTop: "var(--safe-top)", paddingBottom: "var(--safe-bottom)" }}
       >
-        {activeCid ? <ChatView cid={activeCid} /> : <EmptyChat />}
+        {/* Keyed so a half-typed draft and its attachments cannot survive into
+            the next conversation: sending them would deliver an MMS to a
+            different carrier number. */}
+        {activeCid ? <ChatView key={activeCid} cid={activeCid} /> : <EmptyChat />}
       </main>
     </div>
   );

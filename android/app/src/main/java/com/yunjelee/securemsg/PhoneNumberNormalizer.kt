@@ -2,6 +2,25 @@ package com.yunjelee.securemsg
 
 object PhoneNumberNormalizer {
     /**
+     * The one shape a normalized value must have to reach the carrier.
+     *
+     * This decides four things that must never disagree: whether a relay
+     * conversation may drive the gateway, whether an inbound sender can ever be
+     * relayed, whether an outgoing SMS may be dispatched, and what 설정 accepts
+     * as a sender rule. Each gate used to spell the pattern out for itself, so
+     * tightening one (rejecting `#`, allowing a longer international number)
+     * would have left the security gate on the old rule.
+     *
+     * Written with explicit ASCII classes, never `\d`/`\w`: Android's regex
+     * engine is ICU and those classes are Unicode there but ASCII in the unit
+     * tests, so a shorthand would accept Eastern Arabic digits on a device
+     * while every test still passed.
+     */
+    val SMS_ADDRESS = Regex("^\\+?[0-9*#]{3,24}$")
+
+    fun isSmsAddress(value: String): Boolean = SMS_ADDRESS.matches(value)
+
+    /**
      * Returns the stable address used for SMS conversation identity.
      *
      * Korean numbers are stored in E.164-like form so a carrier sender such as

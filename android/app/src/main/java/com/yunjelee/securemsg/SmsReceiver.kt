@@ -53,13 +53,13 @@ class SmsReceiver : BroadcastReceiver() {
                     null
                 }
                 val decision = try {
-                    if (db == null) BlocklistManager.Decision(false, "")
+                    if (db == null) BlocklistManager.Decision.ALLOW
                     else BlocklistManager.evaluate(sender, body, db)
                 } catch (e: Exception) {
                     // A database/classifier failure must not make the default
                     // SMS app silently destroy the only delivered copy.
                     Log.e("SmsReceiver", "classification failed; accepting SMS", e)
-                    BlocklistManager.Decision(false, "")
+                    BlocklistManager.Decision.ALLOW
                 }
 
                 if (decision.blocked && db != null) {
@@ -83,7 +83,6 @@ class SmsReceiver : BroadcastReceiver() {
                             "SMS quarantined from ${PhoneNumberNormalizer.redact(sender)}: " +
                                 decision.reason,
                         )
-                        pending.setResultCode(android.app.Activity.RESULT_OK)
                         return@launch
                     }
                 }
@@ -137,11 +136,13 @@ class SmsReceiver : BroadcastReceiver() {
                     }
                     ContextCompat.startForegroundService(context, serviceIntent)
                 }
-                pending.setResultCode(android.app.Activity.RESULT_OK)
             } catch (e: Exception) {
                 Log.e("SmsReceiver", "failed to process SMS_DELIVER", e)
-                pending.setResultCode(android.app.Activity.RESULT_OK)
             } finally {
+                // Set here rather than per exit path: the early returns above
+                // drop a malformed SMS_DELIVER, and leaving the ordered result
+                // unset on those paths is not a signal we mean to send.
+                pending.setResultCode(android.app.Activity.RESULT_OK)
                 pending.finish()
             }
         }

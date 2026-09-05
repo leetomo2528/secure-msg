@@ -37,8 +37,9 @@ object HistoryRestorePlan {
      * for one carries 0, so the negative range is free by construction. One
      * sentinel is enough because nothing orders or addresses a message by seq:
      * a conversation sorts on createdAt, carrier status is addressed through
-     * serverKey, and the only `(cid, seq)` writer — BlocklistManager.applyBlock
-     * — is always handed a relay sequence.
+     * serverKey, and no query writes by `(cid, seq)` at all — `blocked` is
+     * decided before the row is inserted (SmsReceiver, SmsBridgeService), never
+     * patched afterwards.
      */
     const val RESTORED_SEQ = -1
 

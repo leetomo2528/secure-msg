@@ -1,11 +1,17 @@
 package com.yunjelee.securemsg
 
 import android.content.Context
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.util.Log
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.yunjelee.securemsg.ui.LastOpened
+import javax.crypto.AEADBadTagException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -15,7 +21,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "securemsg")
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "securemsg",
+    // A half-written preferences file throws CorruptionException from every
+    // read — including the ones outside fromPreferences' recovery — so without
+    // a handler the activity crash-loops until the user clears app data, which
+    // also destroys the keypair every stored envelope is sealed to.
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
 object Credentials {
     private val K_USERNAME = stringPreferencesKey("username")
@@ -88,10 +101,20 @@ object Credentials {
             p[K_SECRET_ENVELOPE]?.let { encrypted ->
                 CredentialSecretCodec.decode(cipher.decrypt(encrypted))
             } ?: legacySecrets(p)?.also { migrateLegacySecrets(ctx, it) }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // Tampering, truncated data, backup without its hardware key, or key invalidation must
             // never crash startup. Remove the unusable identity so UI and service require login.
-            clearBrokenCredentials(ctx)
+            //
+            // Only when the failure is permanent, though: BootReceiver and the post-update
+            // restart both reach here while the Keystore provider can still be unavailable, and
+            // wiping over a transient throw would delete the box secret key every relay envelope
+            // addressed to this phone is sealed to, silently dropping the device out of the
+            // account. Returning null already keeps startup alive without destroying anything.
+            if (isPermanentCredentialFailure(e)) {
+                clearBrokenCredentials(ctx)
+            } else {
+                Log.w("Credentials", "Credential envelope temporarily unreadable", e)
+            }
             return null
         } ?: return null
         return SavedCredentials(
@@ -158,16 +181,45 @@ object Credentials {
         }
     }
 
+    /**
+     * A retry can never open the envelope again: the ciphertext failed its tag, the
+     * envelope/codec framing is not what this build writes, or the hardware key is gone
+     * or invalidated. Every other throw (KeyStoreException, ProviderException, IOException,
+     * UnrecoverableKeyException) can be the provider being momentarily unavailable.
+     */
+    private fun isPermanentCredentialFailure(e: Exception): Boolean = when (e) {
+        is KeyPermanentlyInvalidatedException -> true
+        is AEADBadTagException -> true
+        is IllegalArgumentException -> true
+        is IllegalStateException -> true
+        else -> false
+    }
+
     private suspend fun clearBrokenCredentials(ctx: Context) {
         ctx.dataStore.edit { it.clear() }
         runCatching(cipher::deleteKey)
-        clearAccountScopedData(ctx)
+        wipeAccountData(ctx)
     }
 
     private suspend fun clearAccountScopedData(ctx: Context) = withContext(Dispatchers.IO) {
         AppDatabase.get(ctx).clearAllTables()
         BlocklistSync.clear(ctx)
         ContactSync.clearStatus(ctx)
+    }
+
+    /**
+     * Everything on this phone that belongs to the account being removed, for the paths that
+     * remove the identity itself. On top of [clearAccountScopedData] this covers the
+     * device-local prefs that are really per-account: a different account signing in here must
+     * not inherit the previous one's stars, pins or read positions. One owner, because a list
+     * that lives in two places drifts — the forget-device button and broken-credential
+     * recovery used to clear different sets.
+     */
+    suspend fun wipeAccountData(ctx: Context) = withContext(Dispatchers.IO) {
+        clearAccountScopedData(ctx)
+        Favorites.clear(ctx)
+        PinnedConversations.clear(ctx)
+        LastOpened.clear(ctx)
     }
 
     private fun removeLegacySecrets(p: androidx.datastore.preferences.core.MutablePreferences) {

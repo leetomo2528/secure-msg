@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.role.RoleManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -28,10 +29,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import com.yunjelee.securemsg.ui.LastOpened
 import com.yunjelee.securemsg.ui.LoginScreen
 import com.yunjelee.securemsg.ui.MainScreen
 import com.yunjelee.securemsg.ui.Sm
+import com.yunjelee.securemsg.ui.SmsLinkRequest
+import com.yunjelee.securemsg.ui.SmsLinkRequests
 import com.yunjelee.securemsg.ui.UpdateFlow
 import com.yunjelee.securemsg.ui.UpdateUiState
 import java.io.File
@@ -70,7 +72,6 @@ class MainActivity : ComponentActivity() {
     private var updateMessage by mutableStateOf<String?>(null)
     private var autoUpdateEnabled by mutableStateOf(true)
     private var autoInstallEnabled by mutableStateOf(true)
-    private var pendingInstallFile: File? = null
 
     private val permsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -113,14 +114,7 @@ class MainActivity : ComponentActivity() {
             requestSmsRole()
             return
         }
-        val perms = mutableListOf(
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.RECEIVE_SMS,
-            Manifest.permission.RECEIVE_MMS,
-            Manifest.permission.RECEIVE_WAP_PUSH,
-            Manifest.permission.READ_SMS,
-        )
-        permsLauncher.launch(perms.toTypedArray())
+        permsLauncher.launch(BridgeGate.SMS_PERMISSIONS.toTypedArray())
     }
 
     private fun requestNotificationPermission() {
@@ -183,17 +177,20 @@ class MainActivity : ComponentActivity() {
         if (pending?.state == PendingInstallState.AWAITING_PERMISSION &&
             updater.canInstallPackages()
         ) {
-            pendingInstallFile = pending.file
             startInstall(pending.info, pending.file)
         }
-        // A READY entry the background tick downloaded while this activity was
-        // already alive: onCreate's restore never re-runs on a warm reopen, so
-        // surface the 지금 설치 banner here — but never over a live flow's state.
-        if (pending?.state == PendingInstallState.READY &&
+        // A READY or FAILED entry the background tick produced while this
+        // activity was already alive: onCreate's restore never re-runs on a warm
+        // reopen, and the InstallEvents collector drops a status that lands while
+        // the banner is Idle, so a silently blocked commit would wedge every
+        // update check for a day with nothing on screen explaining why. Surface
+        // it here — but never over a live flow's state.
+        if (pending != null &&
+            (pending.state == PendingInstallState.READY ||
+                pending.state == PendingInstallState.FAILED) &&
             (updateState is UpdateUiState.Idle || updateState is UpdateUiState.Checking ||
                 updateState is UpdateUiState.Available || updateState is UpdateUiState.Failed)
         ) {
-            pendingInstallFile = pending.file
             updateState = pendingUiState(pending)
         }
         // Returning from the legacy installer (or a confirm dialog) via recents
@@ -203,26 +200,10 @@ class MainActivity : ComponentActivity() {
         // its own callback.
         if (pending != null &&
             (pending.state == PendingInstallState.SESSION_SUBMITTED ||
-                pending.state == PendingInstallState.FALLBACK_LAUNCHED)
+                pending.state == PendingInstallState.FALLBACK_LAUNCHED) &&
+            consumeIfInstalled(pending)
         ) {
-            val packageUpdatedAt = try {
-                packageManager.getPackageInfo(packageName, 0).lastUpdateTime
-            } catch (_: PackageManager.NameNotFoundException) {
-                0L
-            }
-            if (UpdateValidation.installedTargetSatisfied(
-                    pending.info.versionName,
-                    BuildConfig.VERSION_NAME,
-                    packageUpdatedAt,
-                    pending.file.lastModified(),
-                )
-            ) {
-                pending.file.delete()
-                updater.clearPendingUpdate()
-                InstallResultReceiver.cancelConfirmNotification(this)
-                pendingInstallFile = null
-                updateState = UpdateUiState.Idle
-            }
+            updateState = UpdateUiState.Idle
         }
     }
 
@@ -290,7 +271,6 @@ class MainActivity : ComponentActivity() {
             )
         ) {
             val submitted = checkNotNull(existing)
-            pendingInstallFile = submitted.file
             updateState = UpdateUiState.SessionSubmitted(submitted.info, submitted.file)
             return
         }
@@ -301,7 +281,6 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             file.delete()
             updater.clearPendingUpdate()
-            pendingInstallFile = null
             val detail = e.message ?: "APK 검증 실패"
             updateMessage = "업데이트 검증 실패: $detail"
             updateState = UpdateUiState.Failed(updateMessage!!, info)
@@ -320,7 +299,6 @@ class MainActivity : ComponentActivity() {
             PendingInstallState.READY,
             callbackToken,
         )
-        pendingInstallFile = file
         updateState = UpdateUiState.Ready(info, file)
         if (updater.canInstallPackages()) {
             updater.setPendingInstallState(PendingInstallState.SESSION_SUBMITTED)
@@ -457,7 +435,6 @@ class MainActivity : ComponentActivity() {
                         // Downloading banner the user started afterwards.
                         pending?.state == PendingInstallState.FAILED &&
                             isInstallFlowState(updateState) -> {
-                            pendingInstallFile = pending.file
                             updateState = pendingUiState(pending)
                             updateMessage = null
                         }
@@ -466,7 +443,6 @@ class MainActivity : ComponentActivity() {
                         // emission cannot reset an unrelated Available/
                         // Downloading banner to Idle.
                         pending == null && isInstallFlowState(updateState) -> {
-                            pendingInstallFile = null
                             updateState = UpdateUiState.Idle
                         }
                     }
@@ -484,25 +460,9 @@ class MainActivity : ComponentActivity() {
 
     private fun restorePendingUpdate() {
         val pending = updater.pendingUpdate() ?: return
-        val packageUpdatedAt = try {
-            packageManager.getPackageInfo(packageName, 0).lastUpdateTime
-        } catch (_: PackageManager.NameNotFoundException) {
-            0L
-        }
         val handedOff = pending.state == PendingInstallState.SESSION_SUBMITTED ||
             pending.state == PendingInstallState.FALLBACK_LAUNCHED
-        if (handedOff &&
-            UpdateValidation.installedTargetSatisfied(
-                pending.info.versionName,
-                BuildConfig.VERSION_NAME,
-                packageUpdatedAt,
-                pending.file.lastModified(),
-            )
-        ) {
-            pending.file.delete()
-            updater.clearPendingUpdate()
-            InstallResultReceiver.cancelConfirmNotification(this)
-            pendingInstallFile = null
+        if (handedOff && consumeIfInstalled(pending)) {
             updateState = UpdateUiState.Idle
             return
         }
@@ -518,14 +478,39 @@ class MainActivity : ComponentActivity() {
             // to a failure the user can act on.
             val detail = "시스템 설치가 확인되지 않았습니다. 재시도하거나 닫은 뒤 다시 업데이트할 수 있습니다."
             updater.setPendingInstallFailure(detail)
-            pendingInstallFile = pending.file
             updateState = UpdateUiState.InstallBlocked(pending.info, pending.file, detail)
             return
         }
         // A live SESSION_SUBMITTED lands here after a recreation and re-arms
         // the confirm watchdog through the SessionSubmitted state it restores.
-        pendingInstallFile = pending.file
         updateState = pendingUiState(pending)
+    }
+
+    /**
+     * Retires [pending] and its APK when the running build already satisfies the
+     * version it was downloaded for. Which timestamps decide that is a rule a
+     * future change will move, so cold-start restore and the recents-return path
+     * in onResume share one copy rather than each carrying their own.
+     */
+    private fun consumeIfInstalled(pending: PendingUpdate): Boolean {
+        val packageUpdatedAt = try {
+            packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+        } catch (_: PackageManager.NameNotFoundException) {
+            0L
+        }
+        if (!UpdateValidation.installedTargetSatisfied(
+                pending.info.versionName,
+                BuildConfig.VERSION_NAME,
+                packageUpdatedAt,
+                pending.file.lastModified(),
+            )
+        ) {
+            return false
+        }
+        pending.file.delete()
+        updater.clearPendingUpdate()
+        InstallResultReceiver.cancelConfirmNotification(this)
+        return true
     }
 
     /** The banner a persisted pending update renders as. Shared by cold-start
@@ -551,18 +536,7 @@ class MainActivity : ComponentActivity() {
             UpdateUiState.SessionSubmitted(pending.info, pending.file)
     }
 
-    private fun hasSmsPerms(): Boolean {
-        return listOf(
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.RECEIVE_SMS,
-            Manifest.permission.RECEIVE_MMS,
-            Manifest.permission.RECEIVE_WAP_PUSH,
-            Manifest.permission.READ_SMS,
-        ).all { permission ->
-            ContextCompat.checkSelfPermission(this, permission) ==
-                PackageManager.PERMISSION_GRANTED
-        }
-    }
+    private fun hasSmsPerms(): Boolean = BridgeGate.hasSmsPermissions(this)
 
     private fun hasNotificationPermission(): Boolean {
         return Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(
@@ -625,16 +599,14 @@ class MainActivity : ComponentActivity() {
                 onForgetLocalDevice = {
                     lifecycleScope.launch(Dispatchers.IO) {
                         stopService(Intent(this@MainActivity, SmsBridgeService::class.java))
+                        // Before anything is cleared, exactly as logout does: a
+                        // rebuild is process-scoped and this button is not gated
+                        // on it, so a run still walking conversations would
+                        // insert the previous account's plaintext history back
+                        // behind the wipe. Joining is what makes the wipe last.
+                        HistoryRestoreRunner.cancelAndAwait()
                         Credentials.clear(this@MainActivity)
-                        BlocklistSync.clear(this@MainActivity)
-                        ContactSync.clearStatus(this@MainActivity)
-                        // Device-local prefs that are really per-account: a
-                        // different account signing in here must not inherit
-                        // the previous one's stars, pins or read positions.
-                        Favorites.clear(this@MainActivity)
-                        PinnedConversations.clear(this@MainActivity)
-                        LastOpened.clear(this@MainActivity)
-                        AppDatabase.get(this@MainActivity).clearAllTables()
+                        Credentials.wipeAccountData(this@MainActivity)
                         withContext(Dispatchers.Main) { localDeviceUsername = null }
                     }
                 },
@@ -688,26 +660,30 @@ class MainActivity : ComponentActivity() {
                         InstallResultReceiver.cancelConfirmNotification(this)
                         val pending = updater.pendingUpdate()
                         if (pending != null) {
-                            pendingInstallFile = pending.file
                             updateState = pendingUiState(pending)
                         } else {
-                            pendingInstallFile = null
                             updateState = UpdateUiState.Idle
                         }
                     },
                     onCloseInstallBlocked = {
+                        // Discard the ~55MB APK with the entry that points at
+                        // it: nothing else will, short of cleanupDownloads'
+                        // 24h sweep on some later cold start.
+                        updater.pendingUpdate()?.file?.delete()
                         updater.clearPendingUpdate()
                         // A confirm notification for a flow that no longer
                         // exists would linger in the shade indefinitely.
                         InstallResultReceiver.cancelConfirmNotification(this)
-                        pendingInstallFile = null
                         updateState = UpdateUiState.Idle
                     },
                     onDismiss = { info ->
                         updater.dismiss(info.tag)
+                        // Dismissal deliberately leaves the unattended tick
+                        // running, so without this each window re-downloads the
+                        // same release under a new name and the orphans stack up.
+                        updater.pendingUpdate()?.file?.delete()
                         updater.clearPendingUpdate()
                         InstallResultReceiver.cancelConfirmNotification(this)
-                        pendingInstallFile = null
                         updateState = UpdateUiState.Idle
                     },
                 ),
@@ -781,20 +757,17 @@ class MainActivity : ComponentActivity() {
     private fun startBridgeService() {
         // remoteMessaging foreground services are rejected by Android when the
         // app has not yet received the SMS role/runtime permissions. Login must
-        // still work in that state so the user can grant them from MainScreen.
-        if (!isDefaultSmsApp() || !hasSmsPerms()) return
-        val svc = Intent(this, SmsBridgeService::class.java).apply {
-            action = SmsBridgeService.ACTION_START_BRIDGE
-        }
-        try {
-            startForegroundService(svc)
-        } catch (e: RuntimeException) {
+        // still work in that state so the user can grant them from MainScreen,
+        // so [BridgeGate.start] returning without doing anything is normal here.
+        BridgeGate.start(this) { e ->
             Log.e("MainActivity", "Bridge service start rejected", e)
         }
     }
 
     private fun handleConversationIntent(intent: Intent?) {
-        if (intent?.action != SmsNotifier.ACTION_OPEN_CONVERSATION) return
+        if (intent == null) return
+        if (handleSmsLinkIntent(intent)) return
+        if (intent.action != SmsNotifier.ACTION_OPEN_CONVERSATION) return
         val phone = PhoneNumberNormalizer.normalize(
             intent.getStringExtra(SmsNotifier.EXTRA_PHONE).orEmpty(),
         )
@@ -811,6 +784,32 @@ class MainActivity : ComponentActivity() {
         // Importing the provider and flushing an already-persisted outbox are safe
         // to repeat on a cold start and on every singleTask onNewIntent delivery.
         startBridgeService()
+    }
+
+    /**
+     * The manifest's SENDTO filter is what lets this app hold the default-SMS
+     * role, and its target used to be dropped on the floor: tapping a
+     * phone-number link, "메시지" on a contact, or any share-to-SMS launched
+     * SecureMsg — or, being singleTask, brought it forward on whichever screen
+     * it was last left on — with no composer and no recipient.
+     *
+     * Returns true when [intent] was one of those links, so the notification
+     * branch above is left to notifications alone.
+     */
+    private fun handleSmsLinkIntent(intent: Intent): Boolean {
+        val link = SmsLink.parse(intent) ?: return false
+        val requestId = UUID.randomUUID().toString()
+        SmsLinkRequests.post(SmsLinkRequest(link.phone, link.body, requestId))
+        // The pane can only act on the request while it is composed, and a link
+        // tapped with 연락처/설정 in front would otherwise sit there until the
+        // user found the 메시지 tab. This moves the shell to that tab and
+        // nothing more: with no cid and no number, ConversationTargetResolver
+        // never matches it, and the pane consumes it with the request.
+        conversationTarget = ConversationTarget(null, "", requestId)
+        // The composer's send needs the bridge for exactly the reason the
+        // notification path does, and both are safe to repeat.
+        startBridgeService()
+        return true
     }
 
     /** Debug-only: inject a fake incoming SMS through the real receive
@@ -911,3 +910,62 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
+/**
+ * The `sms:` / `smsto:` link the system hands this activity through the
+ * manifest's SENDTO filter.
+ *
+ * Those URIs are opaque, so `Uri.getQueryParameter` returns null on them and
+ * the `?body=` half has to be cut off by hand. The cut is made on the ENCODED
+ * scheme-specific part, because a `%3F` inside the body is not a separator and
+ * decoding first would turn it into one. Decoding is `Uri.decode` and never
+ * URLDecoder, which reads `+` as a space and would eat the country code off
+ * `smsto:+8210…`.
+ */
+private object SmsLink {
+    private val SCHEMES = setOf("sms", "smsto", "mms", "mmsto")
+
+    /** The ceiling the 메시지 draft fields already enforce on typing. */
+    private const val BODY_MAX = 20_000
+
+    fun parse(intent: Intent): SmsLinkTarget? {
+        if (intent.action != Intent.ACTION_SENDTO && intent.action != Intent.ACTION_VIEW) {
+            return null
+        }
+        val data = intent.data ?: return null
+        val scheme = data.scheme?.lowercase() ?: return null
+        if (scheme !in SCHEMES) return null
+        val ssp = data.encodedSchemeSpecificPart.orEmpty()
+        val phone = ssp.substringBefore('?')
+            // A link may address several people; this app composes to one, and
+            // taking the first is the only reading that cannot quietly send to
+            // a number the user never saw on screen.
+            .split(',', ';')
+            .map { Uri.decode(it).trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.let { PhoneNumberNormalizer.normalize(it) }
+            // The same address gate the dispatcher and the blocklist run on.
+            // Anything it rejects opens an empty composer instead of prefilling
+            // a recipient no send could ever accept.
+            ?.takeIf { PhoneNumberNormalizer.isSmsAddress(it) }
+        val query = ssp.substringAfter('?', "")
+        val body = queryValue(query, "body")
+            ?: queryValue(query, "sms_body")
+            ?: intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+            ?: intent.getStringExtra("sms_body")
+        // The body is whatever app built the link, so it is trimmed to what the
+        // composer would have accepted from the keyboard rather than handed
+        // straight to a draft field that caps its own input.
+        return SmsLinkTarget(phone, body?.take(BODY_MAX)?.takeIf { it.isNotBlank() })
+    }
+
+    private fun queryValue(query: String, key: String): String? = query
+        .split('&')
+        .firstOrNull { it.substringBefore('=') == key }
+        ?.substringAfter('=', "")
+        ?.let { Uri.decode(it) }
+}
+
+/** One parsed link. [phone] is null when the URI named no usable recipient. */
+private data class SmsLinkTarget(val phone: String?, val body: String?)

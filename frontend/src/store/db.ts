@@ -5,14 +5,16 @@
  * the at-rest boundary; message plaintext and private keys are not additionally
  * encrypted by this application:
  *   - meta: { username, uid, sid, deviceName, keypair, pubKey }  (current device)
- *   - devices: { sid -> { name, pub_key, user_id } }  (cache of known devices)
  *   - messages: { [cid+seq] -> { id, seq, cid, sender_sid, plaintext, created_at } }
  *   - cursors: { cid -> last_seq }
  *   - blocklist: { id, keyword, created_at }  (substring filter, applied after decrypt)
+ *   - blockedSenders: { id, sender, created_at }  (same filter, by carrier sender)
+ *   - accountTrust / trustedDevices: the pinned key directory (see pinTrustedDirectories)
  */
-import { openDB, type DBSchema, type IDBPDatabase } from "idb";
+import { openDB, unwrap, type DBSchema, type IDBPDatabase } from "idb";
 import type { DeviceKeypair } from "../crypto/keys";
 import { serverDirectoryHash } from "../crypto/deviceTrust";
+import { isSecurityMode, type SecurityMode } from "../net/api";
 import { normalizePhone } from "./conversationPolicy";
 
 interface MetaRow {
@@ -26,21 +28,12 @@ interface MetaRow {
   };
 }
 
-export interface DeviceRow {
-  sid: string;
-  user_id: number;
-  /** Only ever set for the account's own devices; peers never expose a label. */
-  name?: string;
-  pub_key: string;
-  sig_pub?: string;
-}
-
 export interface AccountTrustRow {
   uid: number;
   identity_sig_pub: string;
   security_epoch: number;
   directory_hash: string;
-  security_mode: "legacy_v1" | "verified_v2";
+  security_mode: SecurityMode;
   updated_at: number;
 }
 
@@ -69,7 +62,7 @@ export interface TrustedDirectorySnapshot {
   identity_sig_pub: string;
   security_epoch: number;
   directory_hash: string;
-  security_mode: "legacy_v1" | "verified_v2";
+  security_mode: SecurityMode;
   devices: Array<{
     sid: string;
     pub_key: string;
@@ -139,7 +132,6 @@ export interface SenderRow {
 
 interface SecureMsgDB extends DBSchema {
   meta: { key: "current"; value: MetaRow };
-  devices: { key: string; value: DeviceRow; indexes: { "by-user": number } };
   messages: {
     key: string; // `${cid}:${seq}`
     value: MessageRow;
@@ -155,13 +147,13 @@ interface SecureMsgDB extends DBSchema {
 let _db: Promise<IDBPDatabase<SecureMsgDB>> | null = null;
 
 export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
-  if (!_db) {
-    _db = openDB<SecureMsgDB>("secure-msg", 4, {
+  if (_db) return _db;
+  let abandoned = false;
+  const opening = new Promise<IDBPDatabase<SecureMsgDB>>((resolve, reject) => {
+    openDB<SecureMsgDB>("secure-msg", 5, {
       upgrade(d, oldVersion, _newVersion, transaction) {
         if (oldVersion < 1) {
           d.createObjectStore("meta");
-          const devices = d.createObjectStore("devices", { keyPath: "sid" });
-          devices.createIndex("by-user", "user_id");
           const messages = d.createObjectStore("messages", { keyPath: "id" });
           // We use a synthetic key `cid:seq` to dedupe. Store id = `${cid}:${seq}`.
           messages.createIndex("by-cid", "cid");
@@ -187,16 +179,59 @@ export function db(): Promise<IDBPDatabase<SecureMsgDB>> {
           void accountTrust.openCursor().then(function migrate(cursor): Promise<void> | void {
             if (!cursor) return;
             const row = cursor.value as AccountTrustRow;
-            if (row.security_mode !== "legacy_v1" && row.security_mode !== "verified_v2") {
+            if (!isSecurityMode(row.security_mode)) {
               cursor.update({ ...row, security_mode: "legacy_v1" });
             }
             return cursor.continue().then(migrate);
           });
         }
+        if (oldVersion >= 1 && oldVersion < 5) {
+          // The `devices` cache lost its last reader when sender keys moved to
+          // the pinned trust directory, so v5 drops it. Unwrapped because the
+          // store is gone from SecureMsgDB, and guarded by contains() because a
+          // failed deleteObjectStore would leave the profile stuck below v5
+          // with no way to open the database again.
+          const legacy = unwrap(d);
+          if (legacy.objectStoreNames.contains("devices")) legacy.deleteObjectStore("devices");
+        }
       },
-    });
-  }
-  return _db;
+      /**
+       * Another tab is still on the previous build and holds its connection, so
+       * this upgrade can never start. Left alone the open promise never settles
+       * and init() sits on the loading screen with no error at all, so give up
+       * and let the next call try again once that tab is gone.
+       */
+      blocked() {
+        abandoned = true;
+        reject(new Error("다른 탭에서 앱이 열려 있어 저장소를 열 수 없습니다. 다른 탭을 닫고 새로고침하세요."));
+      },
+      /** The mirror image: this connection is what a newer build in another
+       * tab is waiting on. Yield it rather than strand that tab. */
+      blocking() {
+        const open = _db;
+        _db = null;
+        void open?.then((connection) => connection.close(), () => {});
+      },
+      /** The browser dropped the connection (storage eviction, crash recovery);
+       * the memoised promise no longer refers to a live one. */
+      terminated() {
+        _db = null;
+      },
+    }).then((connection) => {
+      if (abandoned) {
+        connection.close();
+        return;
+      }
+      resolve(connection);
+    }, reject);
+  });
+  // A transient open failure (quota, UnknownError) must not be memoised, or
+  // every later call rejects until the page is reloaded.
+  _db = opening;
+  void opening.catch(() => {
+    if (_db === opening) _db = null;
+  });
+  return opening;
 }
 
 // ----- meta -------------------------------------------------------------
@@ -216,17 +251,11 @@ export async function getMeta(): Promise<MetaRow["value"] | null> {
   return row?.value ?? null;
 }
 
-export async function clearMeta(): Promise<void> {
-  const d = await db();
-  await d.delete("meta", "current");
-}
-
 /** Clear account content while retaining this browser's device keypair. */
 export async function clearSessionData(): Promise<void> {
   const d = await db();
-  const tx = d.transaction(["devices", "messages", "cursors"], "readwrite");
+  const tx = d.transaction(["messages", "cursors"], "readwrite");
   await Promise.all([
-    tx.objectStore("devices").clear(),
     tx.objectStore("messages").clear(),
     tx.objectStore("cursors").clear(),
   ]);
@@ -243,12 +272,11 @@ export async function clearSessionData(): Promise<void> {
 export async function clearDeviceForReregistration(): Promise<void> {
   const d = await db();
   const tx = d.transaction(
-    ["meta", "devices", "messages", "cursors", "blocklist", "blockedSenders"],
+    ["meta", "messages", "cursors", "blocklist", "blockedSenders"],
     "readwrite",
   );
   await Promise.all([
     tx.objectStore("meta").clear(),
-    tx.objectStore("devices").clear(),
     tx.objectStore("messages").clear(),
     tx.objectStore("cursors").clear(),
     tx.objectStore("blocklist").clear(),
@@ -261,12 +289,11 @@ export async function clearDeviceForReregistration(): Promise<void> {
 export async function clearAllData(): Promise<void> {
   const d = await db();
   const tx = d.transaction(
-    ["meta", "devices", "messages", "cursors", "blocklist", "blockedSenders", "accountTrust", "trustedDevices"],
+    ["meta", "messages", "cursors", "blocklist", "blockedSenders", "accountTrust", "trustedDevices"],
     "readwrite",
   );
   await Promise.all([
     tx.objectStore("meta").clear(),
-    tx.objectStore("devices").clear(),
     tx.objectStore("messages").clear(),
     tx.objectStore("cursors").clear(),
     tx.objectStore("blocklist").clear(),
@@ -274,25 +301,6 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore("accountTrust").clear(),
     tx.objectStore("trustedDevices").clear(),
   ]);
-  await tx.done;
-}
-
-// ----- devices ----------------------------------------------------------
-
-export async function cacheDevice(row: DeviceRow): Promise<void> {
-  const d = await db();
-  await d.put("devices", row);
-}
-
-export async function getDevice(sid: string): Promise<DeviceRow | null> {
-  const d = await db();
-  return (await d.get("devices", sid)) ?? null;
-}
-
-export async function cacheDevices(rows: DeviceRow[]): Promise<void> {
-  const d = await db();
-  const tx = d.transaction("devices", "readwrite");
-  await Promise.all(rows.map((r) => tx.store.put(r)));
   await tx.done;
 }
 
@@ -327,7 +335,7 @@ export async function pinTrustedDirectories(
     snapshotUids.add(snapshot.uid);
     if (!Number.isSafeInteger(snapshot.security_epoch) || snapshot.security_epoch < 0) throw new Error("invalid security epoch");
     if (!snapshot.identity_sig_pub || !snapshot.directory_hash) throw new Error("incomplete directory snapshot");
-    if (snapshot.security_mode !== "legacy_v1" && snapshot.security_mode !== "verified_v2") throw new Error("invalid security mode");
+    if (!isSecurityMode(snapshot.security_mode)) throw new Error("invalid security mode");
 
     const seen = new Set<string>();
     for (const candidate of snapshot.devices) {
@@ -466,17 +474,8 @@ export async function putMessage(m: MessageRow): Promise<void> {
   // between our read and write, or it would be silently overwritten.
   const tx = d.transaction("messages", "readwrite");
   const existing = await tx.store.get(key);
-  const existingStatus = existing?.carrier_status ?? "none";
-  const incomingStatus = m.carrier_status ?? "none";
-  // Lifecycle order is authoritative across sources. Client optimistic rows use
-  // the browser clock while relay timestamps have second precision, so wall
-  // clock comparison must only break ties within the same lifecycle state.
-  const keepNewerCarrierState = existing && (
-    !canAdvanceCarrierStatus(existingStatus, incomingStatus)
-    || (
-      existingStatus === incomingStatus
-      && (existing.carrier_updated_at ?? 0) > (m.carrier_updated_at ?? 0)
-    )
+  const keepNewerCarrierState = existing && !carrierStateSupersedes(
+    existing, m.carrier_status ?? "none", m.carrier_updated_at ?? null,
   );
   await tx.store.put({
     ...m,
@@ -525,14 +524,7 @@ export async function setCarrierStatus(
   if (!existing) {
     return;
   }
-  const currentStatus = existing.carrier_status ?? "none";
-  if (!canAdvanceCarrierStatus(currentStatus, status)) {
-    return;
-  }
-  // Different producers do not share a precise clock. Only use timestamps to
-  // reject stale repetitions of the same state; forward lifecycle progress is
-  // valid even if its timestamp is slightly older.
-  if (currentStatus === status && (existing.carrier_updated_at ?? 0) > (updatedAt ?? 0)) {
+  if (!carrierStateSupersedes(existing, status, updatedAt)) {
     return;
   }
   await tx.store.put({
@@ -599,11 +591,74 @@ export function canAdvanceCarrierStatus(current: string, next: string): boolean 
   return (CARRIER_ORDER[next] ?? -1) >= (CARRIER_ORDER[current] ?? 0);
 }
 
+/**
+ * Whether an incoming carrier state replaces the stored one. putMessage and
+ * setCarrierStatus race each other by design, which is why they share a
+ * transaction; two hand-written copies of this rule could drift apart and
+ * reintroduce exactly the overwrite that transaction was added to prevent.
+ *
+ * Lifecycle order is authoritative across sources. Producers do not share a
+ * precise clock — client optimistic rows use the browser clock while relay
+ * timestamps have second precision — so a timestamp only breaks ties within
+ * one state, never blocks forward progress.
+ */
+function carrierStateSupersedes(
+  existing: Pick<MessageRow, "carrier_status" | "carrier_updated_at">,
+  status: string,
+  updatedAt: number | null,
+): boolean {
+  const current = existing.carrier_status ?? "none";
+  if (!canAdvanceCarrierStatus(current, status)) return false;
+  return !(current === status && (existing.carrier_updated_at ?? 0) > (updatedAt ?? 0));
+}
+
 // ----- blocklist --------------------------------------------------------
+
+/**
+ * The rule values the relay itself accepts, mirrored from `_validate` and
+ * `SENDER_RE` in server/blocklist.py. A value outside them is refused by the
+ * relay on every single upload, so the rule would end up filtering this
+ * browser alone while the list presents it as an account rule — and the
+ * Android gateway, which receives carrier SMS before any of this, would never
+ * apply it.
+ *
+ * The sender classes are written out rather than `\s`: SENDER_RE is compiled
+ * with re.ASCII, and the relay rejects Cc/Cs characters before that pattern
+ * runs, so a plain space is the only separator both sides accept. The 3-32
+ * length bound falls out of the pattern itself.
+ */
+const RELAY_SENDER_RE = /^[+*#0-9][+*#0-9\- ]{1,30}[0-9]$/;
+const RELAY_KEYWORD_MAX = 120;
+const RELAY_REJECTED_CHARS = /[\p{Cc}\p{Cs}]/u;
+
+function normalizeBlockKeyword(keyword: string): string {
+  return keyword.trim().normalize("NFKC").toLowerCase();
+}
+
+/** Why the relay would refuse this keyword as an account rule, or null. */
+export function blockKeywordRejection(keyword: string): string | null {
+  const normalized = normalizeBlockKeyword(keyword);
+  if (!normalized) return "차단 키워드를 입력하세요";
+  // NFKC can expand a string, so the editor's 120-character input cap is not
+  // the bound the relay ends up applying.
+  if (normalized.length > RELAY_KEYWORD_MAX) return `차단 키워드는 ${RELAY_KEYWORD_MAX}자 이하여야 합니다`;
+  if (RELAY_REJECTED_CHARS.test(normalized)) return "차단 키워드에 사용할 수 없는 문자가 있습니다";
+  return null;
+}
+
+/** Why the relay would refuse this sender as an account rule, or null. */
+export function blockedSenderRejection(sender: string): string | null {
+  const normalized = normalizePhone(sender);
+  if (!normalized) return "차단할 발신번호를 입력하세요";
+  if (!RELAY_SENDER_RE.test(normalized)) {
+    return "차단 발신번호는 숫자로 끝나는 3~32자여야 합니다 (+, *, #, -, 공백만 사용 가능)";
+  }
+  return null;
+}
 
 export async function addBlockKeyword(keyword: string): Promise<BlockRow> {
   const d = await db();
-  const normalized = keyword.trim().normalize("NFKC").toLowerCase();
+  const normalized = normalizeBlockKeyword(keyword);
   if (!normalized) throw new Error("keyword is empty");
   const tx = d.transaction("blocklist", "readwrite");
   const existing = await tx.store.index("by-keyword").get(normalized);
@@ -635,11 +690,6 @@ export async function listBlockKeywords(): Promise<BlockRow[]> {
 export async function putBlockKeywordRow(row: BlockRow): Promise<void> {
   const d = await db();
   await d.put("blocklist", row);
-}
-
-export async function clearBlockKeywords(): Promise<void> {
-  const d = await db();
-  await d.clear("blocklist");
 }
 
 // ----- blocked senders (shared, synced via server) -----------------------
@@ -676,11 +726,6 @@ export async function listBlockedSenders(): Promise<SenderRow[]> {
 export async function putBlockedSenderRow(row: SenderRow): Promise<void> {
   const d = await db();
   await d.put("blockedSenders", row);
-}
-
-export async function clearBlockedSenders(): Promise<void> {
-  const d = await db();
-  await d.clear("blockedSenders");
 }
 
 /** Atomically replace both account block-rule stores after reconciliation. */

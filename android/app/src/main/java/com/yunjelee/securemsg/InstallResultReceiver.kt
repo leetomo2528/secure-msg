@@ -1,6 +1,5 @@
 package com.yunjelee.securemsg
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,10 +8,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
-import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -134,15 +131,7 @@ class InstallResultReceiver : BroadcastReceiver() {
         }
 
     private fun postConfirmNotification(context: Context, version: String, confirmation: Intent) {
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
-                context, Manifest.permission.POST_NOTIFICATIONS,
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // Without this line a revoked permission is indistinguishable from
-            // "the confirm dialog never appeared" in a bug report.
-            Log.w(TAG, "POST_NOTIFICATIONS not granted; confirm only reachable in-app")
-            return
-        }
+        if (!NotificationPermission.canPost(context, "confirm only reachable in-app")) return
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         manager.createNotificationChannel(
             NotificationChannel(

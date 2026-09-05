@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   isCompleteKeyDirectory,
@@ -15,8 +15,9 @@ import {
   signLegacyUpgrade,
   verifyDirectoryProof,
 } from "../crypto/deviceTrust";
-import { parsePairingQr, pairingSafetyNumber } from "../crypto/pairing";
+import { pairingSafetyNumber } from "../crypto/pairing";
 import PairingScanner from "./PairingScanner";
+import { checkPairingPayload } from "./pairingChecks";
 import { pinTrustedDirectory, TrustViolationError } from "../store/db";
 import { useStore } from "../store/useStore";
 import { shareHistoryWithDevice, type HistoryShareProgress } from "../store/historyShare";
@@ -59,6 +60,10 @@ export default function DeviceManager() {
   const [shareTarget, setShareTarget] = useState<{ sid: string; name: string } | null>(null);
   const [shareProgress, setShareProgress] = useState<HistoryShareProgress | null>(null);
   const [shareSummary, setShareSummary] = useState<string | null>(null);
+  // busySid is state, so two payloads in one tick both read null; the flag has
+  // to be a ref to keep a second scan from opening a second pairing session,
+  // which consumes the first one server-side.
+  const pairingInFlight = useRef(false);
 
   const devices = directory?.devices ?? [];
   const pending = devices.filter((device) => device.trust_state === "pending");
@@ -94,10 +99,15 @@ export default function DeviceManager() {
       setSecurityWarning(null);
       setDirectory({
         ...result,
-        security_epoch: keyDirectory.security_epoch,
-        directory_hash: keyDirectory.directory_hash,
-        identity_sig_pub: keyDirectory.identity_sig_pub,
-        security_mode: keyDirectory.security_mode,
+        // /devices carries these too, and a 5xx on the independent
+        // /key-directory request used to spread undefined over them, leaving
+        // no security_epoch and so no approve/reject/revoke/upgrade at all.
+        ...(keyDirectory.ok ? {
+          security_epoch: keyDirectory.security_epoch,
+          directory_hash: keyDirectory.directory_hash,
+          identity_sig_pub: keyDirectory.identity_sig_pub,
+          security_mode: keyDirectory.security_mode,
+        } : {}),
       });
     } catch (error) {
       const message = securityError(error);
@@ -199,27 +209,14 @@ export default function DeviceManager() {
    * the certificate is bound to this one scan and cannot be replayed.
    */
   const startPairing = async (payload: string) => {
-    const parsed = parsePairingQr(payload);
-    if (!parsed) {
-      useStore.setState({ error: "QR 내용을 읽을 수 없습니다. 새 기기 화면의 코드를 다시 스캔하세요." });
+    if (pairingInFlight.current) return;
+    const check = checkPairingPayload(payload, devices, window.location.origin);
+    if (!check.ok) {
+      useStore.setState({ error: check.error });
       return;
     }
-    if (parsed.server !== window.location.origin) {
-      useStore.setState({ error: "다른 서버의 페어링 코드입니다. 같은 릴레이의 기기만 연결할 수 있습니다." });
-      return;
-    }
-    const subject = devices.find((device) => device.sid === parsed.sid);
-    if (!subject || subject.trust_state !== "pending") {
-      useStore.setState({ error: "이 코드에 해당하는 승인 대기 기기를 찾지 못했습니다." });
-      return;
-    }
-    // The relay's own pending row is the authority on the subject's keys; a QR
-    // claiming different ones is either stale or an attempt to swap in a key.
-    if (subject.pub_key !== parsed.box_pk || subject.sig_pub !== parsed.sig_pk
-      || subject.challenge !== parsed.challenge) {
-      useStore.setState({ error: "QR의 키가 서버에 등록된 대기 기기와 일치하지 않습니다. 승인하지 마세요." });
-      return;
-    }
+    const parsed = check.parsed;
+    pairingInFlight.current = true;
     setBusySid(parsed.sid);
     try {
       const session = await api.pairingSession(parsed.sid, parsed.challenge, parsed.nonce_new);
@@ -244,6 +241,7 @@ export default function DeviceManager() {
     } catch (error) {
       useStore.setState({ error: securityError(error) });
     } finally {
+      pairingInFlight.current = false;
       setBusySid(null);
     }
   };

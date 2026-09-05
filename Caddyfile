@@ -12,13 +12,29 @@
 		reverse_proxy backend:5000
 	}
 
+	# A hashed chunk that a deploy has already removed must 404 here: the
+	# catch-all below rewrites every missing path to index.html, and
+	# @staticAssets would then pin that HTML under the .js URL for a year,
+	# which nothing on the server side can invalidate.
+	handle /assets/* {
+		root * /srv
+		file_server
+	}
+
 	handle {
 		root * /srv
 		try_files {path} /index.html
 		file_server
 	}
 
-	@staticAssets path /assets/*
+	@staticAssets {
+		path /assets/*
+		# Gates the year-long cache on the file actually being on disk, so the
+		# 404 above is not itself cached immutably.
+		file {
+			root /srv
+		}
+	}
 	header @staticAssets Cache-Control "public, max-age=31536000, immutable"
 	@appShell path / /index.html /sw.js /registerSW.js /manifest.webmanifest
 	header @appShell Cache-Control "no-cache"

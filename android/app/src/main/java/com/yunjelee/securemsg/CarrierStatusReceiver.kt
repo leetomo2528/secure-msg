@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.telephony.SmsMessage
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.room.withTransaction
@@ -90,6 +91,8 @@ internal object CarrierCallbackPersistence {
     }
 }
 
+private data class DeliveryReport(val tpStatus: Int, val outcome: CarrierState.DeliveryOutcome)
+
 /** Receives asynchronous carrier SENT/DELIVERED callbacks and persists them. */
 class CarrierStatusReceiver : BroadcastReceiver() {
     companion object {
@@ -101,6 +104,7 @@ class CarrierStatusReceiver : BroadcastReceiver() {
         const val EXTRA_PROVIDER_ID = "provider_id"
         const val EXTRA_PART = "part"
         const val EXTRA_PART_COUNT = "part_count"
+        const val EXTRA_PDU_ID = "pdu_id"
         const val EXTRA_STATUS = "status"
         const val EXTRA_ERROR = "error"
     }
@@ -116,8 +120,26 @@ class CarrierStatusReceiver : BroadcastReceiver() {
         val part = intent.getIntExtra(EXTRA_PART, 0).coerceAtLeast(0)
         val partCount = intent.getIntExtra(EXTRA_PART_COUNT, 1).coerceIn(1, 100)
         if (part !in 0 until partCount) return
-        val callbackResult = resultCode
-        val partOk = callbackResult == Activity.RESULT_OK
+        // The framework hands every delivery report to the PendingIntent with
+        // Activity.RESULT_OK and carries the carrier's real verdict in the "pdu"
+        // extra, so resultCode alone filed both a permanent TP-Status failure and an
+        // interim "still trying" report as "delivered" - and canAdvance then pinned
+        // that terminal lie against the true failure that arrived after it.
+        val report = if (action == ACTION_DELIVERED) parseDeliveryReport(intent) else null
+        // Interim report: the service centre is still retrying and a final report is
+        // still owed to us. Recording no part result holds the message at "sent",
+        // which is the honest state, instead of claiming an outcome the carrier has
+        // not reached. Nothing re-sends off that state - RelayReceiptRetryPolicy
+        // consumes "sent" as resolved - so holding here cannot duplicate an SMS.
+        if (report?.outcome == CarrierState.DeliveryOutcome.PENDING) return
+        // A classified report carries the carrier's own status byte into the
+        // user-visible diagnostic, where a constant RESULT_OK would say nothing.
+        val callbackResult = report?.tpStatus ?: resultCode
+        val partOk = when (report?.outcome) {
+            CarrierState.DeliveryOutcome.SUCCEEDED -> true
+            CarrierState.DeliveryOutcome.FAILED -> false
+            else -> resultCode == Activity.RESULT_OK
+        }
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -145,7 +167,7 @@ class CarrierStatusReceiver : BroadcastReceiver() {
                 ) ?: return@launch
 
                 // These touch state outside Room and must only run after the transaction commits.
-                MmsSender.deletePdu(context, intent.getStringExtra("pdu_id"))
+                MmsSender.deletePdu(context, intent.getStringExtra(EXTRA_PDU_ID))
                 if (providerId > 0 && committed.statusApplied) {
                     val providerStatus = when (committed.status) {
                         "delivered" -> android.provider.Telephony.Sms.STATUS_COMPLETE
@@ -173,5 +195,28 @@ class CarrierStatusReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    /**
+     * The carrier's status report, or null when this handset did not hand us one we
+     * can trust. The "pdu"/"format" extras are fill-in data, so a device that omits
+     * either - or a PDU the platform cannot parse - has to keep the old resultCode
+     * path rather than lose the delivered ticks that path gets right.
+     */
+    private fun parseDeliveryReport(intent: Intent): DeliveryReport? {
+        val pdu = intent.getByteArrayExtra("pdu") ?: return null
+        val format = intent.getStringExtra("format") ?: return null
+        // 3GPP2 reports (errorClass shl 8) or messageStatus out of getStatus()
+        // instead of a TP-Status octet, and the TS 23.040 ranges would misread it.
+        if (format != SmsMessage.FORMAT_3GPP) return null
+        val message = try {
+            SmsMessage.createFromPdu(pdu, format)
+        } catch (e: Exception) {
+            Log.w("CarrierStatusReceiver", "unparseable carrier delivery report", e)
+            null
+        }
+        if (message == null || !message.isStatusReportMessage) return null
+        val outcome = CarrierState.classifyDeliveryReport(message.status) ?: return null
+        return DeliveryReport(message.status, outcome)
     }
 }

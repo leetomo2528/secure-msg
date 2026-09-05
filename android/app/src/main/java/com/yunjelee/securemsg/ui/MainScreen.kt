@@ -43,11 +43,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.yunjelee.securemsg.AppDatabase
 import com.yunjelee.securemsg.ConversationTarget
 import com.yunjelee.securemsg.RelayApi
@@ -64,6 +67,10 @@ import kotlinx.coroutines.withContext
 private const val SECTION_MESSAGES = 0
 private const val SECTION_CONTACTS = 1
 private const val SECTION_SETTINGS = 2
+
+// The shell gutter, plus each item's own gap to whatever follows it — a
+// header with nothing to report is exactly the inset (see ShellHeader).
+private val ShellItemPadding = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
 
 private val NAV_ITEMS = listOf(
     SmNavItem("메시지", SmIconKind.Bubble),
@@ -132,33 +139,45 @@ fun MainScreen(
         }
     }
 
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     // The Android bridge receives device_pending over Socket.IO, but the
     // service can be running while the user is looking at the message tab.
     // Poll the authoritative device list so a pending web login is visible in
     // the foreground UI instead of being reduced to a logcat entry.
-    LaunchedEffect(creds.sid) {
-        while (isActive) {
-            var authRejected = false
-            pendingApprovalCount = withContext(Dispatchers.IO) {
-                runCatching {
-                    val response = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }.listDevices()
-                    if (!response.optBoolean("ok") && response.optInt("_http_status") == 401) {
-                        authRejected = true
-                        return@runCatching 0
-                    }
-                    val devices = response.optJSONArray("devices") ?: return@runCatching 0
-                    (0 until devices.length()).count { index ->
-                        val device = devices.optJSONObject(index)
-                        device != null && device.optString("sid") != creds.sid && device.optString("trust_state") == "pending"
-                    }
-                }.getOrDefault(0)
+    //
+    // Gated on the lifecycle, not on the composition: the composition outlives
+    // onStop, so the loop kept an authenticated GET going every 15s with the
+    // screen off, for a banner only ShellHeader draws. repeatOnLifecycle also
+    // re-polls at onStart, which is when a stale count most needs refreshing.
+    LaunchedEffect(creds.sid, lifecycle) {
+        var authRejected = false
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isActive && !authRejected) {
+                val polled: Int? = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val response = RelayApi(ServerConfig.url(context)).also { it.token = creds.token }.listDevices()
+                        if (!response.optBoolean("ok") && response.optInt("_http_status") == 401) {
+                            authRejected = true
+                            return@runCatching 0
+                        }
+                        // null, not 0: a poll that failed knows nothing about
+                        // pending devices, and reporting 0 made the approval
+                        // banner flap with connectivity.
+                        val devices = response.optJSONArray("devices") ?: return@runCatching null
+                        (0 until devices.length()).count { index ->
+                            val device = devices.optJSONObject(index)
+                            device != null && device.optString("sid") != creds.sid && device.optString("trust_state") == "pending"
+                        }
+                    }.getOrNull()
+                }
+                polled?.let { pendingApprovalCount = it }
+                if (authRejected) {
+                    // The session is gone (logout/revocation/expiry). Stop polling the
+                    // auth API with a dead token; the login screen takes over.
+                    break
+                }
+                delay(15_000)
             }
-            if (authRejected) {
-                // The session is gone (logout/revocation/expiry). Stop polling the
-                // auth API with a dead token; the login screen takes over.
-                break
-            }
-            delay(15_000)
         }
     }
 
@@ -366,13 +385,6 @@ private fun ShellHeader(
     requestPerms: () -> Unit,
     update: UpdateFlow,
 ) {
-    // UpdateBanner emits nothing for these states. The padding wrapper below
-    // would otherwise be an empty child and still claim its gap.
-    val showsUpdateBanner = when (val state = update.state) {
-        UpdateUiState.Idle, UpdateUiState.Checking -> false
-        is UpdateUiState.Failed -> state.info != null
-        else -> true
-    }
     Column(
         Modifier
             .fillMaxWidth()
@@ -412,10 +424,10 @@ private fun ShellHeader(
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
+                    .then(ShellItemPadding)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(Sm.teal.copy(alpha = 0.10f))
-                    .border(1.dp, Sm.teal, RoundedCornerShape(14.dp))
+                    .background(Sm.accent.copy(alpha = 0.10f))
+                    .border(1.dp, Sm.accent, RoundedCornerShape(14.dp))
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(9.dp),
             ) {
@@ -431,27 +443,22 @@ private fun ShellHeader(
             }
         }
         if (!smsRoleHeld) {
-            SmCard(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("기본 SMS 앱 설정이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                    SmGhostButton(text = "설정", onClick = requestSmsRole)
-                }
-            }
+            NoticeCard("기본 SMS 앱 설정이 필요합니다.", action = "설정", onClick = requestSmsRole)
         }
+        // Only ever one of the two: the role has to be held before the runtime
+        // permissions can be asked for.
         if (smsRoleHeld && !smsPermissionsGranted) {
-            SmCard(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("SMS 권한이 필요합니다.", color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                    SmGhostButton(text = "허용", onClick = requestPerms)
-                }
-            }
+            NoticeCard("SMS 권한이 필요합니다.", action = "허용", onClick = requestPerms)
         }
 
         // The updater checks in the background from this screen. Keep the
         // resulting action visible here; without this banner an Available
         // result was silently reduced to the settings-card status text.
-        if (showsUpdateBanner) {
-            Box(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)) {
+        //
+        // The wrapper claims its gap even around a banner that draws nothing,
+        // so it asks the banner instead of re-deriving the rule from the state.
+        if (update.state.rendersBanner) {
+            Box(ShellItemPadding) {
                 UpdateBanner(
                     state = update.state,
                     onUpdate = update.onUpdate,
@@ -462,6 +469,20 @@ private fun ShellHeader(
                     onDismiss = update.onDismiss,
                 )
             }
+        }
+    }
+}
+
+/**
+ * One shell notice: a sentence and the button that resolves it. The SMS-role
+ * and SMS-permission cards were the same eight lines three values apart.
+ */
+@Composable
+private fun NoticeCard(text: String, action: String, onClick: () -> Unit) {
+    SmCard(ShellItemPadding) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(text, color = Sm.warning, fontSize = 12.sp, modifier = Modifier.weight(1f))
+            SmGhostButton(text = action, onClick = onClick)
         }
     }
 }

@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,6 +55,10 @@ internal const val ACCOUNT_RECOVERY_WARNING =
 internal const val NEW_DEVICE_HISTORY_WARNING =
     "새 휴대폰·새 설치는 기기 등록 이전 메시지를 복호화할 수 없습니다. " +
         "이미 승인된 기존 기기의 설정에서 '이전 대화 공유'를 실행해야 지난 메시지를 읽을 수 있습니다."
+
+private val UsernamePattern = Regex("^[a-z0-9_]{3,20}$")
+private val EmailPattern = Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")
+private val VerificationCodePattern = Regex("^\\d{6}$")
 
 private class EmailRegistrationRequired(val challengeId: String) : Exception()
 
@@ -130,52 +133,33 @@ fun LoginScreen(
     }
 
     if (confirmNewDevice) {
-        AlertDialog(
-            onDismissRequest = { confirmNewDevice = false },
-            containerColor = Sm.surface,
-            shape = RoundedCornerShape(16.dp),
-            titleContentColor = Sm.text1,
-            textContentColor = Sm.text3,
-            title = { Text("새 기기로 등록") },
-            text = {
-                Text(
-                    "이 휴대폰은 계정의 새 기기로 등록됩니다. 새 기기는 등록 이전 대화를 읽을 수 없고, " +
-                        "이미 승인된 기존 기기에서 '이전 대화 공유'를 실행해야 지난 메시지를 볼 수 있습니다. " +
-                        "또 등록 요청은 기존 기기의 승인을 받아야 사용할 수 있습니다.",
-                )
+        SmConfirmDialog(
+            title = "새 기기로 등록",
+            body = "이 휴대폰은 계정의 새 기기로 등록됩니다. 새 기기는 등록 이전 대화를 읽을 수 없고, " +
+                "이미 승인된 기존 기기에서 '이전 대화 공유'를 실행해야 지난 메시지를 볼 수 있습니다. " +
+                "또 등록 요청은 기존 기기의 승인을 받아야 사용할 수 있습니다.",
+            confirmLabel = "새 기기로 등록",
+            onConfirm = {
+                confirmNewDevice = false
+                submitLogin(true)
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmNewDevice = false
-                    submitLogin(true)
-                }) { Text("새 기기로 등록", color = Sm.teal) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmNewDevice = false }) { Text("취소", color = Sm.text3) }
-            },
+            onDismiss = { confirmNewDevice = false },
+            confirmColor = Sm.accent,
         )
     }
 
     if (confirmForget) {
-        AlertDialog(
-            onDismissRequest = { confirmForget = false },
-            containerColor = Sm.surface,
-            shape = RoundedCornerShape(16.dp),
-            titleContentColor = Sm.text1,
-            textContentColor = Sm.text3,
-            title = { Text("로컬 기기 초기화") },
-            text = { Text("이 휴대폰의 개인키와 로컬 메시지를 삭제합니다. 서버에 남은 기기 등록은 다른 기기에서 폐기해야 합니다.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmForget = false
-                    username = ""
-                    password = ""
-                    onForgetLocalDevice()
-                }) { Text("삭제", color = Sm.danger) }
+        SmConfirmDialog(
+            title = "로컬 기기 초기화",
+            body = "이 휴대폰의 개인키와 로컬 메시지를 삭제합니다. 서버에 남은 기기 등록은 다른 기기에서 폐기해야 합니다.",
+            confirmLabel = "삭제",
+            onConfirm = {
+                confirmForget = false
+                username = ""
+                password = ""
+                onForgetLocalDevice()
             },
-            dismissButton = {
-                TextButton(onClick = { confirmForget = false }) { Text("취소", color = Sm.text3) }
-            },
+            onDismiss = { confirmForget = false },
         )
     }
 
@@ -279,7 +263,7 @@ fun LoginScreen(
                 }
                 Text(
                     if (recoveryOpen) "비밀번호 찾기 닫기" else "비밀번호를 잊으셨나요?",
-                    color = Sm.cyan, fontSize = 12.sp, textAlign = TextAlign.Center,
+                    color = Sm.accent, fontSize = 12.sp, textAlign = TextAlign.Center,
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable {
@@ -311,7 +295,7 @@ fun LoginScreen(
                                 scope.launch(Dispatchers.IO) {
                                     try {
                                         val challenge = requestPasswordReset(
-                                            context, serverUrl.trim(), username.trim(), recoveryEmail.trim(),
+                                            serverUrl.trim(), username.trim(), recoveryEmail.trim(),
                                         )
                                         withContext(Dispatchers.Main) {
                                             recoveryChallenge = challenge
@@ -348,7 +332,7 @@ fun LoginScreen(
                                 scope.launch(Dispatchers.IO) {
                                     try {
                                         confirmPasswordReset(
-                                            context, serverUrl.trim(), username.trim(), recoveryEmail.trim(),
+                                            serverUrl.trim(), username.trim(), recoveryEmail.trim(),
                                             recoveryChallenge.orEmpty(), recoveryCode, recoveryNewPassword,
                                         )
                                         withContext(Dispatchers.Main) {
@@ -373,7 +357,7 @@ fun LoginScreen(
                         }) { Text("인증코드 다시 받기", color = Sm.text3) }
                     }
                     recoveryMessage?.let {
-                        Text(it, color = Sm.cyan, fontSize = 12.sp, lineHeight = 16.sp)
+                        Text(it, color = Sm.accent, fontSize = 12.sp, lineHeight = 16.sp)
                     }
                 }
             }
@@ -388,15 +372,14 @@ fun LoginScreen(
 }
 
 internal suspend fun requestPasswordReset(
-    context: Context,
     serverUrl: String,
     username: String,
     email: String,
 ): String {
-    if (!Regex("^[a-z0-9_]{3,20}$").matches(username)) {
+    if (!UsernamePattern.matches(username)) {
         throw IllegalArgumentException("아이디는 영소문자·숫자·_ 3~20자로 입력하세요.")
     }
-    if (!Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(email)) {
+    if (!EmailPattern.matches(email)) {
         throw IllegalArgumentException("올바른 이메일 주소를 입력하세요.")
     }
     val api = RelayApi(validateServerUrl(serverUrl))
@@ -406,7 +389,6 @@ internal suspend fun requestPasswordReset(
 }
 
 internal suspend fun confirmPasswordReset(
-    context: Context,
     serverUrl: String,
     username: String,
     email: String,
@@ -414,7 +396,7 @@ internal suspend fun confirmPasswordReset(
     code: String,
     newPassword: String,
 ) {
-    if (challengeId.isBlank() || !Regex("^\\d{6}$").matches(code)) {
+    if (challengeId.isBlank() || !VerificationCodePattern.matches(code)) {
         throw IllegalArgumentException("6자리 인증코드를 입력하세요.")
     }
     if (newPassword.length < 8) throw IllegalArgumentException("새 비밀번호는 8자 이상이어야 합니다.")
@@ -426,7 +408,7 @@ internal suspend fun confirmPasswordReset(
     if (!response.optBoolean("ok")) throw Exception(response.optString("error", "비밀번호 변경에 실패했습니다."))
 }
 
-private fun validateServerUrl(serverUrl: String): String {
+internal fun validateServerUrl(serverUrl: String): String {
     val parsedUrl = serverUrl.toHttpUrlOrNull()
         ?: throw IllegalArgumentException("올바른 서버 URL을 입력하세요.")
     if (parsedUrl.scheme != "https" && !isLocalTestHost(parsedUrl.host)) {
@@ -452,22 +434,12 @@ internal suspend fun doLogin(
     registrationCode: String = "",
     confirmNewDevice: Boolean = false,
 ): SavedCredentials {
-    if (!Regex("^[a-z0-9_]{3,20}$").matches(username)) {
+    if (!UsernamePattern.matches(username)) {
         throw IllegalArgumentException("아이디는 영소문자·숫자·_ 3~20자로 입력하세요.")
     }
     if (password.isEmpty()) throw IllegalArgumentException("비밀번호를 입력하세요.")
     if (password.length > 1024) throw IllegalArgumentException("비밀번호가 너무 깁니다.")
-    val parsedUrl = serverUrl.toHttpUrlOrNull()
-        ?: throw IllegalArgumentException("올바른 서버 URL을 입력하세요.")
-    if (parsedUrl.scheme != "https" && !isLocalTestHost(parsedUrl.host)) {
-        throw IllegalArgumentException("원격 서버는 HTTPS 주소를 사용해야 합니다.")
-    }
-    if (parsedUrl.username.isNotEmpty() || parsedUrl.password.isNotEmpty() ||
-        parsedUrl.encodedPath != "/" || parsedUrl.query != null || parsedUrl.fragment != null
-    ) {
-        throw IllegalArgumentException("서버 URL은 도메인과 포트까지만 입력하세요.")
-    }
-    val api = RelayApi(parsedUrl.toString().trimEnd('/'))
+    val api = RelayApi(validateServerUrl(serverUrl))
     val salt = CryptoUtil.saltForUser(username)
     val pwHash = CryptoUtil.hashPassword(password, salt)
 
@@ -499,7 +471,13 @@ internal suspend fun doLogin(
             Credentials.save(context, saved)
             return saved
         }
-        if (r.optString("error") !in setOf("device not found", "device revoked")) {
+        // The relay declares its `error` prose localizable and changeable and
+        // sends no code on /device-login, so classify by status — 404 and 403
+        // there mean only "device gone" and "device revoked". The prose match
+        // stays for relays that predate _http_status.
+        val deviceGone = r.optInt("_http_status") in setOf(403, 404) ||
+            r.optString("error") in setOf("device not found", "device revoked")
+        if (!deviceGone) {
             throw Exception(r.optString("error", "device login failed"))
         }
     }
@@ -515,16 +493,7 @@ internal suspend fun doLogin(
         // The new-account branch below needs no such prompt: there is nothing
         // to have missed, and no existing device that could share it.
         if (!confirmNewDevice) throw NewDeviceConfirmationRequired()
-        val dr = api.deviceRegister(username, pwHash, deviceName, kp.boxPk, kp.signPk)
-        if (!dr.optBoolean("ok")) throw Exception(dr.optString("error", "device register failed"))
-        api.token = dr.getString("token")
-        val saved = SavedCredentials(
-            username = username, uid = dr.getInt("uid"),
-            sid = dr.getString("sid"), token = dr.getString("token"),
-            deviceName = deviceName, keypair = kp,
-        )
-        Credentials.save(context, saved)
-        return saved
+        return registerDevice(context, api, username, pwHash, deviceName, kp)
     }
 
     // Login failed. The server deliberately returns the same 401 for an
@@ -544,7 +513,7 @@ internal suspend fun doLogin(
     if (password.length < 8) {
         throw IllegalArgumentException("새 계정 비밀번호는 8자 이상이면 됩니다. 영문·숫자·특수문자는 자유롭게 조합할 수 있습니다.")
     }
-    if (!Regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$").matches(registrationEmail)) {
+    if (!EmailPattern.matches(registrationEmail)) {
         throw IllegalArgumentException("새 계정은 가입 이메일을 입력해야 합니다.")
     }
     if (registrationChallenge == null) {
@@ -554,13 +523,24 @@ internal suspend fun doLogin(
         }
         throw EmailRegistrationRequired(requested.getString("challenge_id"))
     }
-    if (!Regex("^\\d{6}$").matches(registrationCode)) {
+    if (!VerificationCodePattern.matches(registrationCode)) {
         throw IllegalArgumentException("가입 이메일로 받은 6자리 인증코드를 입력하세요.")
     }
     val reg = api.registerEmailVerify(registrationChallenge, registrationCode)
     if (!reg.optBoolean("ok")) {
         throw Exception(reg.optString("error", "이메일 인증에 실패했습니다."))
     }
+    return registerDevice(context, api, username, pwHash, deviceName, kp)
+}
+
+private suspend fun registerDevice(
+    context: Context,
+    api: RelayApi,
+    username: String,
+    pwHash: String,
+    deviceName: String,
+    kp: CryptoUtil.DeviceKeypair,
+): SavedCredentials {
     val dr = api.deviceRegister(username, pwHash, deviceName, kp.boxPk, kp.signPk)
     if (!dr.optBoolean("ok")) throw Exception(dr.optString("error", "device register failed"))
     api.token = dr.getString("token")

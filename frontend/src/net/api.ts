@@ -3,10 +3,17 @@
  * proxies to the Flask server; in prod Caddy reverse-proxies.
  */
 import { io, type Socket } from "socket.io-client";
-import type { Envelope, RecipientDevice } from "../crypto/keys";
+import type { Envelope } from "../crypto/keys";
 
 const API = "/api";
 const REQUEST_TIMEOUT_MS = 12_000;
+/**
+ * A message page carries up to 200 envelopes and the relay accepts
+ * MAX_ENVELOPE_BYTES (1.5 MiB) each, so an MMS-heavy page is tens of MB. At
+ * the shared budget such a page aborts, the sync leaves its cursor where it
+ * was, and the next pass asks for the identical page forever.
+ */
+const MESSAGE_PAGE_TIMEOUT_MS = 60_000;
 const SOCKET_ACK_TIMEOUT_MS = 10_000;
 
 interface ApiResult {
@@ -35,10 +42,7 @@ export interface LoginResult extends ApiResult {
   has_pending_devices?: boolean;
 }
 
-export interface DeviceRegisterResult {
-  ok: boolean;
-  error?: string;
-  status?: number;
+export interface DeviceRegisterResult extends ApiResult {
   sid?: string;
   token?: string;
   uid?: number;
@@ -74,12 +78,23 @@ export interface ConvMember {
   kind: "web" | "android_gateway";
 }
 
+/**
+ * Whether an account directory is signed end to end (verified_v2) or only
+ * trusted on first use (legacy_v1). Spelled once: a mode added to the union
+ * but missed in one validator is a verification hole nothing would surface.
+ */
+export type SecurityMode = "legacy_v1" | "verified_v2";
+
+export function isSecurityMode(value: unknown): value is SecurityMode {
+  return value === "legacy_v1" || value === "verified_v2";
+}
+
 export interface DirectoryCheckpoint {
   user_id: number;
   identity_sig_pub: string;
   security_epoch: number;
   directory_hash: string;
-  security_mode?: "legacy_v1" | "verified_v2";
+  security_mode?: SecurityMode;
 }
 
 export interface DeviceHistoryEntry {
@@ -169,7 +184,7 @@ export interface DeviceDirectoryResult extends ApiResult {
   security_epoch?: number;
   directory_hash?: string;
   identity_sig_pub?: string;
-  security_mode?: "legacy_v1" | "verified_v2";
+  security_mode?: SecurityMode;
 }
 
 export interface KeyDirectoryResult extends ApiResult {
@@ -179,7 +194,7 @@ export interface KeyDirectoryResult extends ApiResult {
   directory_hash?: string;
   identity_sig_pub?: string;
   trust_enforced_at?: number | null;
-  security_mode?: "legacy_v1" | "verified_v2";
+  security_mode?: SecurityMode;
   device_history?: DeviceHistoryEntry[];
   approval_certificates?: ApprovalCertificate[];
   revocation_certificates?: RevocationCertificate[];
@@ -217,7 +232,7 @@ export function isCompleteKeyDirectory(
     && directory.approval_certificates
     && directory.revocation_certificates
     && directory.security_upgrade_certificates
-    && (directory.security_mode === "legacy_v1" || directory.security_mode === "verified_v2"),
+    && isSecurityMode(directory.security_mode),
   );
 }
 
@@ -266,11 +281,9 @@ export interface BlockRule {
   created_at: number;
 }
 
-export interface BlocklistResult {
-  ok: boolean;
+export interface BlocklistResult extends ApiResult {
   rules?: BlockRule[];
   rule?: BlockRule;
-  error?: string;
 }
 
 /** One re-wrapped message key offered to a later-registered device. */
@@ -294,6 +307,13 @@ export interface ShareKeysResult extends ApiResult {
 /** Server-enforced per-request cap on /share-keys entries. */
 export const SHARE_KEYS_BATCH_MAX = 200;
 
+/**
+ * Server-enforced size of a /missing-keys answer. It is the LOWEST unkeyed
+ * sequences and takes no offset, so a full page a sharer cannot open is a
+ * wall rather than a page to advance past.
+ */
+export const MISSING_KEYS_PAGE_SIZE = 500;
+
 export interface ServerMessage {
   id: number;
   seq: number;
@@ -307,6 +327,37 @@ export interface ServerMessage {
   carrier_status?: string;
   carrier_error?: string | null;
   carrier_updated_at?: number | null;
+}
+
+/**
+ * One conversation row as the relay serves it. `name` is the routing identity
+ * (a phone number for an SMS thread); a contact label never substitutes for it.
+ */
+export interface Conversation {
+  cid: string;
+  conv_id: number;
+  name: string;
+  /** Account-wide contact label supplied by the server for presentation only. */
+  synced_contact_name?: string | null;
+  members: string[];
+  created_at: number;
+}
+
+export interface ConversationsResult extends ApiResult {
+  conversations?: Conversation[];
+}
+
+export interface CreateConversationResult extends ApiResult {
+  cid?: string;
+}
+
+export interface RenameConversationResult extends ApiResult {
+  cid?: string;
+  name?: string;
+}
+
+export interface MessagesResult extends ApiResult {
+  messages?: ServerMessage[];
 }
 
 export class Api {
@@ -325,9 +376,10 @@ export class Api {
     path: string,
     init: RequestInit = {},
     notifyUnauthorized = true,
+    timeoutMs = REQUEST_TIMEOUT_MS,
   ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     // Bind the request and any 401 side effect to the same session. A delayed
     // response from an old JWT must not log out a newer session.
     const requestToken = this.token;
@@ -375,12 +427,12 @@ export class Api {
     }
   }
 
-  private post<T extends ApiResult = any>(path: string, body: unknown): Promise<T> {
+  private post<T extends ApiResult>(path: string, body: unknown): Promise<T> {
     return this.request<T>(path, { method: "POST", body: JSON.stringify(body) });
   }
 
-  private get<T extends ApiResult = any>(path: string): Promise<T> {
-    return this.request<T>(path);
+  private get<T extends ApiResult>(path: string, timeoutMs?: number): Promise<T> {
+    return this.request<T>(path, {}, true, timeoutMs);
   }
 
   login(username: string, pwHash: string): Promise<LoginResult> {
@@ -466,18 +518,21 @@ export class Api {
   removeBlockRule(id: number): Promise<BlocklistResult> {
     return this.post("/blocklist/remove", { id });
   }
-  renameConversation(cid: string, name: string): Promise<{ ok: boolean; cid?: string; name?: string; error?: string }> {
+  renameConversation(cid: string, name: string): Promise<RenameConversationResult> {
     return this.post("/conversation/rename", { cid, name });
   }
-  createConversation(members: string[], name?: string) {
+  createConversation(members: string[], name?: string): Promise<CreateConversationResult> {
     return this.post("/conversation", { members, ...(name ? { name } : {}) });
   }
-  listConversations() { return this.get("/conversations"); }
+  listConversations(): Promise<ConversationsResult> { return this.get("/conversations"); }
   convMembers(cid: string): Promise<ConversationMembersResult> {
     return this.get(`/conversation/${encodeURIComponent(cid)}/members`);
   }
-  fetchMessages(cid: string, since: number, limit = 200): Promise<{ ok: boolean; messages?: ServerMessage[]; error?: string }> {
-    return this.get(`/conversation/${encodeURIComponent(cid)}/messages?since=${since}&limit=${limit}`);
+  fetchMessages(cid: string, since: number, limit = 200): Promise<MessagesResult> {
+    return this.get(
+      `/conversation/${encodeURIComponent(cid)}/messages?since=${since}&limit=${limit}`,
+      MESSAGE_PAGE_TIMEOUT_MS,
+    );
   }
   /** Sequences in `cid` that `sid` holds no envelope key for. */
   missingKeys(cid: string, sid: string): Promise<MissingKeysResult> {
@@ -620,18 +675,23 @@ function emitMessageOnce(
   envelope: Envelope,
 ): Promise<MessageAck> {
   return new Promise((resolve) => {
-    let finished = false;
-    const timer = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      resolve({ ok: false, error: "메시지 전송 확인 시간 초과", timedOut: true });
-    }, SOCKET_ACK_TIMEOUT_MS);
-    socket.emit("message_send", { cid, mid: messageId, payload: envelope }, (ack: unknown) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolve(isMessageAck(ack) ? ack : { ok: false, error: "서버 확인 응답 없음" });
-    });
+    // socket.io's own timeout rather than a private one: an emit made while the
+    // connection is down is parked in sendBuffer and flushed on reconnect, and
+    // only this form splices it back out when the timer expires. A private
+    // timer reported the send as failed while the packet was still queued, so
+    // the relay delivered it minutes later and the user's re-send became a
+    // second real SMS to the contact.
+    socket.timeout(SOCKET_ACK_TIMEOUT_MS).emit(
+      "message_send",
+      { cid, mid: messageId, payload: envelope },
+      (error: Error | null, ack: unknown) => {
+        if (error) {
+          resolve({ ok: false, error: "메시지 전송 확인 시간 초과", timedOut: true });
+          return;
+        }
+        resolve(isMessageAck(ack) ? ack : { ok: false, error: "서버 확인 응답 없음" });
+      },
+    );
   });
 }
 
@@ -639,5 +699,3 @@ function isMessageAck(value: unknown): value is MessageAck {
   return typeof value === "object" && value !== null
     && typeof (value as MessageAck).ok === "boolean";
 }
-
-export type { Envelope, RecipientDevice };

@@ -1,10 +1,13 @@
 package com.yunjelee.securemsg
 
 import com.yunjelee.securemsg.ui.isLocalTestHost
+import com.yunjelee.securemsg.ui.validateServerUrl
 import com.yunjelee.securemsg.ui.ACCOUNT_RECOVERY_WARNING
 import com.yunjelee.securemsg.ui.NEW_DEVICE_HISTORY_WARNING
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class LoginValidationTest {
@@ -47,5 +50,41 @@ class LoginValidationTest {
         assertFalse(isLocalTestHost("1.2.3"))
         assertFalse(isLocalTestHost("1.2.3.4.5"))
         assertFalse(isLocalTestHost("300.1.2.3"))
+    }
+
+    @Test
+    fun serverUrlKeepsOriginAndDropsTheTrailingSlash() {
+        assertEquals("https://msg.example.com", validateServerUrl("https://msg.example.com/"))
+        assertEquals("https://msg.example.com:8443", validateServerUrl("https://msg.example.com:8443"))
+    }
+
+    @Test
+    fun plainHttpIsAcceptedOnlyForLocalTestHosts() {
+        assertEquals("http://192.168.0.10:5000", validateServerUrl("http://192.168.0.10:5000"))
+        val rejected = assertThrows(IllegalArgumentException::class.java) {
+            validateServerUrl("http://msg.example.com")
+        }
+        assertEquals("원격 서버는 HTTPS 주소를 사용해야 합니다.", rejected.message)
+    }
+
+    @Test
+    fun serverUrlRejectsAnythingBeyondHostAndPort() {
+        for (url in listOf(
+            "https://user:pw@msg.example.com",
+            "https://msg.example.com/relay",
+            "https://msg.example.com/?probe=1",
+            "https://msg.example.com/#frag",
+        )) {
+            val rejected = assertThrows(IllegalArgumentException::class.java) {
+                validateServerUrl(url)
+            }
+            assertEquals("서버 URL은 도메인과 포트까지만 입력하세요.", rejected.message)
+        }
+    }
+
+    @Test
+    fun unparseableServerUrlIsRejected() {
+        assertThrows(IllegalArgumentException::class.java) { validateServerUrl("msg.example.com") }
+        assertThrows(IllegalArgumentException::class.java) { validateServerUrl("") }
     }
 }

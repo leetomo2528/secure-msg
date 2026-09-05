@@ -377,8 +377,13 @@ class TrustedDeviceTest(unittest.TestCase):
             after.json["recipient_keyset_hash"],
         )
 
-    def test_key_directory_is_one_read_snapshot_while_approval_commits(self):
-        pending, _box, _key, _sig = self._new_pending()
+    def _read_while_approving(self, path: str, pending: dict):
+        """GET ``path`` with its read snapshot pinned across a live approval.
+
+        Returns (response read from the older snapshot, approval result). Both
+        isolation tests need this exact choreography; only the endpoint and the
+        assertions about the two views differ.
+        """
         snapshot_pinned = threading.Event()
         resume_reader = threading.Event()
         reader_finished = threading.Event()
@@ -386,17 +391,18 @@ class TrustedDeviceTest(unittest.TestCase):
         result: dict[str, object] = {}
 
         def pause_after_snapshot_query(connection, user_id, *, user=None):
-            snapshot_pinned.set()
-            if not resume_reader.wait(timeout=5):
-                raise TimeoutError("reader snapshot was not resumed")
+            # A conversation endpoint materializes one proof per member, so
+            # only the first call may block: the rest run after the resume.
+            if not snapshot_pinned.is_set():
+                snapshot_pinned.set()
+                if not resume_reader.wait(timeout=5):
+                    raise TimeoutError("reader snapshot was not resumed")
             return original_get_proof(connection, user_id, user=user)
 
-        def read_directory():
+        def read_path():
             try:
                 with app.test_client() as reader:
-                    result["response"] = reader.get(
-                        "/api/key-directory", headers=self.first_headers
-                    )
+                    result["response"] = reader.get(path, headers=self.first_headers)
             except BaseException as exc:  # surface thread failures in this test
                 result["error"] = exc
             finally:
@@ -407,13 +413,12 @@ class TrustedDeviceTest(unittest.TestCase):
             "_get_directory_proof_with_conn",
             side_effect=pause_after_snapshot_query,
         ):
-            reader_thread = threading.Thread(target=read_directory, daemon=True)
+            reader_thread = threading.Thread(target=read_path, daemon=True)
             reader_thread.start()
             self.assertTrue(snapshot_pinned.wait(timeout=5))
 
             try:
                 approved = self._approve(pending)
-                self.assertEqual(approved["security_epoch"], 2)
                 self.assertFalse(reader_finished.is_set())
             finally:
                 resume_reader.set()
@@ -422,7 +427,12 @@ class TrustedDeviceTest(unittest.TestCase):
         self.assertFalse(reader_thread.is_alive())
         if "error" in result:
             raise result["error"]  # type: ignore[misc]
-        before = result["response"]
+        return result["response"], approved
+
+    def test_key_directory_is_one_read_snapshot_while_approval_commits(self):
+        pending, _box, _key, _sig = self._new_pending()
+        before, approved = self._read_while_approving("/api/key-directory", pending)
+        self.assertEqual(approved["security_epoch"], 2)
         self.assertEqual(before.status_code, 200, before.json)
         self.assertEqual(before.json["security_epoch"], 1)
         self.assertEqual(
@@ -448,52 +458,10 @@ class TrustedDeviceTest(unittest.TestCase):
         self.assertEqual(created.status_code, 200, created.json)
         cid = created.json["cid"]
         pending, _box, _key, _sig = self._new_pending(seed=31)
-        snapshot_pinned = threading.Event()
-        resume_reader = threading.Event()
-        reader_finished = threading.Event()
-        original_get_proof = store._get_directory_proof_with_conn
-        result: dict[str, object] = {}
-
-        def pause_after_snapshot_query(connection, user_id, *, user=None):
-            if not snapshot_pinned.is_set():
-                snapshot_pinned.set()
-                if not resume_reader.wait(timeout=5):
-                    raise TimeoutError("conversation snapshot was not resumed")
-            return original_get_proof(connection, user_id, user=user)
-
-        def read_members():
-            try:
-                with app.test_client() as reader:
-                    result["response"] = reader.get(
-                        f"/api/conversation/{cid}/members",
-                        headers=self.first_headers,
-                    )
-            except BaseException as exc:  # surface thread failures in this test
-                result["error"] = exc
-            finally:
-                reader_finished.set()
-
-        with mock.patch.object(
-            store,
-            "_get_directory_proof_with_conn",
-            side_effect=pause_after_snapshot_query,
-        ):
-            reader_thread = threading.Thread(target=read_members, daemon=True)
-            reader_thread.start()
-            self.assertTrue(snapshot_pinned.wait(timeout=5))
-
-            try:
-                approved = self._approve(pending)
-                self.assertEqual(approved["security_epoch"], 2)
-                self.assertFalse(reader_finished.is_set())
-            finally:
-                resume_reader.set()
-            reader_thread.join(timeout=5)
-
-        self.assertFalse(reader_thread.is_alive())
-        if "error" in result:
-            raise result["error"]  # type: ignore[misc]
-        before = result["response"]
+        before, approved = self._read_while_approving(
+            f"/api/conversation/{cid}/members", pending
+        )
+        self.assertEqual(approved["security_epoch"], 2)
         self.assertEqual(before.status_code, 200, before.json)
         self.assertEqual(
             {row["sid"] for row in before.json["members"]}, {self.first["sid"]}
@@ -562,12 +530,142 @@ class TrustedDeviceTest(unittest.TestCase):
         )
         self.assertEqual(first["trust_state"], "approved")
 
-    def test_last_approved_device_self_revoke_locks_account_without_rebootstrap(self):
-        live_socket = socketio.test_client(
-            app, auth={"token": self.first["token"]}
-        )
-        self.assertTrue(live_socket.is_connected())
+    def test_reject_pending_device_tombstones_it_without_advancing_the_epoch(self):
+        pending, _box, _key, _sig = self._new_pending(seed=67)
+        pending_headers = self._headers(pending["token"])
+        epoch_before = store.get_user(self.uid)["security_epoch"]
+        body = {
+            "sid": pending["sid"],
+            "challenge": pending["challenge"],
+            "parent_epoch": epoch_before,
+        }
 
+        rejected = self.client.post(
+            "/api/device-reject-pending", headers=self.first_headers, json=body
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.json)
+        self.assertEqual(rejected.json["rejected"], pending["sid"])
+        tombstone = store.get_device_by_sid(pending["sid"])
+        self.assertEqual(tombstone["trust_state"], "revoked")
+        self.assertIsNotNone(tombstone["revoked_at"])
+        # A rejected device was never in the directory, so nothing a peer
+        # pinned changed and the epoch it verifies against must not move.
+        self.assertEqual(store.get_user(self.uid)["security_epoch"], epoch_before)
+
+        denied = self.client.get(
+            "/api/device-pending-status", headers=pending_headers
+        )
+        self.assertEqual(denied.status_code, 401, denied.json)
+
+        log = self.client.get("/api/security-log", headers=self.first_headers)
+        self.assertEqual(log.status_code, 200, log.json)
+        self.assertEqual(
+            [event["event_type"] for event in log.json["events"]],
+            ["device_bootstrap", "device_pending", "pending_device_rejected"],
+        )
+        self.assertEqual(log.json["events"][-1]["security_epoch"], epoch_before)
+
+        replayed = self.client.post(
+            "/api/device-reject-pending", headers=self.first_headers, json=body
+        )
+        self.assertEqual(replayed.status_code, 404, replayed.json)
+
+    def test_reject_pending_device_is_bound_to_challenge_epoch_and_actor(self):
+        pending, _box, _key, _sig = self._new_pending(seed=71)
+        epoch = store.get_user(self.uid)["security_epoch"]
+
+        def reject(**overrides):
+            body = {
+                "sid": pending["sid"],
+                "challenge": pending["challenge"],
+                "parent_epoch": epoch,
+            }
+            body.update(overrides)
+            return self.client.post(
+                "/api/device-reject-pending", headers=self.first_headers, json=body
+            )
+
+        # The challenge is the only proof the rejecting device saw this
+        # registration at all; without it a peer could tombstone any stranger's
+        # pending device by sid alone.
+        wrong_challenge = reject(challenge=_b64u(bytes(32)))
+        self.assertEqual(wrong_challenge.status_code, 404, wrong_challenge.json)
+        self.assertEqual(
+            store.get_device_by_sid(pending["sid"])["trust_state"], "pending"
+        )
+
+        stale = reject(parent_epoch=epoch - 1)
+        self.assertEqual(stale.status_code, 409, stale.json)
+        self.assertEqual(stale.json["error"], "security epoch changed")
+
+        peer, _peer_box, _peer_key, _peer_sig = self._new_pending(seed=73)
+        self._approve(peer)
+        approved = self.client.post(
+            "/api/device-reject-pending",
+            headers=self.first_headers,
+            json={
+                "sid": peer["sid"],
+                "challenge": peer["challenge"],
+                "parent_epoch": store.get_user(self.uid)["security_epoch"],
+            },
+        )
+        self.assertEqual(approved.status_code, 404, approved.json)
+        self.assertEqual(
+            store.get_device_by_sid(peer["sid"])["trust_state"], "approved"
+        )
+
+        with self.assertRaises(PermissionError):
+            store.reject_pending_device(
+                self.uid,
+                self.first["sid"],
+                store.get_device_by_sid(self.first["sid"])["session_version"] + 1,
+                pending["sid"],
+                pending["challenge"],
+                store.get_user(self.uid)["security_epoch"],
+            )
+        with mock.patch.object(
+            store, "reject_pending_device", side_effect=PermissionError("stale actor")
+        ):
+            unauthorized = reject()
+        self.assertEqual(unauthorized.status_code, 401, unauthorized.json)
+        self.assertEqual(unauthorized.json["error"], "actor is no longer approved")
+        self.assertEqual(
+            store.get_device_by_sid(pending["sid"])["trust_state"], "pending"
+        )
+
+    def test_last_approved_device_cannot_revoke_itself(self):
+        """Zero approved devices is unrecoverable, so the relay refuses to get there.
+
+        add_device only bootstraps into 'approved' while the account has no
+        device rows at all, and a revocation keeps its tombstone forever, so
+        the account could never approve the replacement it registers next.
+        """
+        refused = self.client.post(
+            "/api/device-revoke",
+            headers=self.first_headers,
+            json=self._signed_revoke(self.first["sid"]),
+        )
+        self.assertEqual(refused.status_code, 409, refused.json)
+        self.assertEqual(
+            refused.json["error"], "cannot revoke the last approved device"
+        )
+        self.assertEqual(
+            store.get_device_by_sid(self.first["sid"])["trust_state"], "approved"
+        )
+        self.assertEqual(store.get_user(self.uid)["security_epoch"], 1)
+        still_usable = self.client.get("/api/devices", headers=self.first_headers)
+        self.assertEqual(still_usable.status_code, 200, still_usable.json)
+
+        # A pending device is not a successor — it has nobody left to approve it.
+        replacement, _box, _key, _sig = self._new_pending(seed=61)
+        still_refused = self.client.post(
+            "/api/device-revoke",
+            headers=self.first_headers,
+            json=self._signed_revoke(self.first["sid"]),
+        )
+        self.assertEqual(still_refused.status_code, 409, still_refused.json)
+
+        self._approve(replacement)
         revoked = self.client.post(
             "/api/device-revoke",
             headers=self.first_headers,
@@ -575,37 +673,12 @@ class TrustedDeviceTest(unittest.TestCase):
         )
         self.assertEqual(revoked.status_code, 200, revoked.json)
         self.assertEqual(revoked.json["revoked"], self.first["sid"])
-        tombstone = store.get_device_by_sid(self.first["sid"])
-        self.assertIsNotNone(tombstone)
-        self.assertEqual(
-            tombstone["trust_state"], "revoked"
-        )
-        self.assertIsNotNone(tombstone["revoked_at"])
-        self.assertEqual(tombstone["pub_key"], self.first_box)
-        self.assertEqual(tombstone["sig_pub"], self.first_sig_public)
-        denied = self.client.get("/api/devices", headers=self.first_headers)
-        self.assertEqual(denied.status_code, 401, denied.json)
-
-        live_socket.emit(
-            "message_send", {"cid": "unused", "payload": {}}, callback=True
-        )
-        self.assertFalse(live_socket.is_connected())
-
-        replacement_box, _replacement_signing, replacement_sig = _key_material(61)
-        replacement = self._register_device(
-            "replacement", replacement_box, replacement_sig
-        )
-        self.assertEqual(replacement["trust_state"], "pending")
-        status = self.client.get(
-            "/api/device-pending-status",
-            headers=self._headers(replacement["token"]),
-        )
-        self.assertEqual(status.status_code, 200, status.json)
-        self.assertEqual(status.json["trust_state"], "pending")
         self.assertEqual(
             [d["trust_state"] for d in store.list_user_devices(self.uid)],
-            ["revoked", "pending"],
+            ["revoked", "approved"],
         )
+        denied = self.client.get("/api/devices", headers=self.first_headers)
+        self.assertEqual(denied.status_code, 401, denied.json)
 
     def test_approval_toctou_errors_have_stable_http_mapping(self):
         pending, _box, _key, _sig = self._new_pending(seed=57)
@@ -836,6 +909,122 @@ class TrustedDeviceTest(unittest.TestCase):
                 hmac.compare_digest(expected_signature, event["server_signature"])
             )
             previous_hash = event["event_hash"]
+
+    def test_verification_challenge_keeps_no_usable_login_credential(self):
+        """pw_hash here is the exact value /login and /device-register accept.
+
+        users.pw_hash is bcrypt over it precisely so reading the database file
+        does not hand out a live credential; a challenge row retained for
+        debugging must not undo that.
+        """
+
+        def stored_hashes() -> list[str]:
+            with store.conn_ctx() as connection:
+                return [
+                    row["pw_hash"]
+                    for row in connection.execute(
+                        "SELECT pw_hash FROM email_verification_challenges "
+                        "ORDER BY rowid"
+                    ).fetchall()
+                ]
+
+        # setUp registered this account through the email flow.
+        self.assertEqual(stored_hashes(), [""])
+
+        email = f"{self.username}_second@example.test"
+        request = {
+            "username": f"{self.username}b",
+            "email": email,
+            "pw_hash": "B" * 43,
+        }
+        with mock.patch("emailer.send_code"):
+            first = self.client.post("/api/register/email/request", json=request)
+            self.assertEqual(first.status_code, 200, first.json)
+            resent = self.client.post("/api/register/email/request", json=request)
+            self.assertEqual(resent.status_code, 200, resent.json)
+        # Only the live challenge still needs the credential.
+        self.assertEqual(stored_hashes(), ["", "", "B" * 43])
+
+        with store.conn_ctx() as connection:
+            connection.execute(
+                "UPDATE email_verification_challenges SET expires_at = ? "
+                "WHERE consumed_at IS NULL",
+                (store.now() - 1,),
+            )
+        store.prune_challenges()
+        self.assertEqual(stored_hashes(), ["", "", ""])
+
+    def test_client_mid_retry_survives_a_history_key_share(self):
+        """A backfilled key does not make a resend a different message.
+
+        share_message_keys rewrites `keys` on a stored envelope, so comparing
+        the whole payload turned an unchanged retry into a mid conflict — and
+        both clients answer that by minting a new mid, which sends the SMS
+        twice.
+        """
+        created = self.client.post(
+            "/api/conversation",
+            headers=self.first_headers,
+            json={"members": [self.username], "name": "+821044455566"},
+        )
+        self.assertEqual(created.status_code, 200, created.json)
+        conv_id = store.get_conversation_by_cid(created.json["cid"])["id"]
+        envelope = json.dumps(
+            {
+                "ct": "A" * 22,
+                "nonce": "A" * 32,
+                "keys": {self.first["sid"]: {"ek": "A" * 64, "n": "A" * 32}},
+            },
+            separators=(",", ":"),
+        )
+        message_id, seq, inserted = store.insert_message(
+            conv_id, self.uid, self.first["sid"], envelope, client_mid="mid-share-0001"
+        )
+        self.assertTrue(inserted)
+
+        pending, _box, _key, _sig = self._new_pending(seed=79)
+        self._approve(pending)
+        shared = store.share_message_keys(
+            conv_id,
+            pending["sid"],
+            self.first["sid"],
+            [{"seq": seq, "ek": "B" * 64, "n": "B" * 32}],
+        )
+        self.assertEqual(shared["added"], 1)
+
+        self.assertEqual(
+            store.insert_message(
+                conv_id,
+                self.uid,
+                self.first["sid"],
+                envelope,
+                client_mid="mid-share-0001",
+            ),
+            (message_id, seq, False),
+        )
+
+        for field, value in (("ct", "C" * 22), ("nonce", "D" * 32)):
+            different = json.loads(envelope)
+            different[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                store.insert_message(
+                    conv_id,
+                    self.uid,
+                    self.first["sid"],
+                    json.dumps(different, separators=(",", ":")),
+                    client_mid="mid-share-0001",
+                )
+        rewrapped = json.loads(envelope)
+        rewrapped["keys"][self.first["sid"]]["ek"] = "E" * 64
+        with self.assertRaises(ValueError):
+            store.insert_message(
+                conv_id,
+                self.uid,
+                self.first["sid"],
+                json.dumps(rewrapped, separators=(",", ":")),
+                client_mid="mid-share-0001",
+            )
+
 
 
 class TrustedDeviceLegacyMigrationTest(unittest.TestCase):

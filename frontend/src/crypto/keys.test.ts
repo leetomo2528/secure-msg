@@ -224,6 +224,17 @@ describe("password hashing contract", () => {
     expect(a).toBe(b);
   });
 
+  it("matches the cross-platform golden vector", async () => {
+    // The relay stores bcrypt over THIS hash, so a user who registers on the
+    // web must be able to log in from the Android client and back. The salt is
+    // pinned separately because that is where the two implementations differ in
+    // shape (web lowercases then NFKC-normalizes, Android normalizes first).
+    // The same literals are asserted on-device and against PyNaCl on the relay.
+    expect(saltForUser("alice_92")).toBe("Z8TMpFrk1L3TGTqifSaL2A");
+    expect(await hashPassword("correct horse", saltForUser("alice_92")))
+      .toBe("dzuVYr5AiVb52u3imbOmNAxzOtD1gwLxYUS1kVQLNfE");
+  });
+
   it("differs per user and rejects an empty salt", async () => {
     const a = await hashPassword("correct horse", saltForUser("alice_92"));
     const b = await hashPassword("correct horse", saltForUser("bob_92"));

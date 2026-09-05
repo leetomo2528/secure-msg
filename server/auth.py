@@ -55,6 +55,12 @@ REGISTER_EMAIL_IP_WINDOW = 3600
 PASSWORD_RESET_IP_SCOPE = "password-reset-request-ip"
 PASSWORD_RESET_IP_LIMIT = 20
 PASSWORD_RESET_IP_WINDOW = 3600
+# The confirm side keys its bucket on the caller-supplied username, so rotating
+# that opens a fresh budget per probe; this address-independent cap is what
+# bounds how many (username, email) pairs one client can walk through.
+PASSWORD_RESET_CONFIRM_IP_SCOPE = "password-reset-confirm-ip"
+PASSWORD_RESET_CONFIRM_IP_LIMIT = 60
+PASSWORD_RESET_CONFIRM_IP_WINDOW = 3600
 # Returned only when the device row itself says 'revoked'. A pending device
 # acts on this by discarding its local keypair, so it must not be reachable
 # through an ordinary expired/rotated token.
@@ -64,18 +70,36 @@ DEVICE_REVOKED_CODE = "device_revoked"
 # it again through /device-login.
 SESSION_EXPIRED_CODE = "session_expired"
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,20}", re.ASCII)
+# "this conversation name is a phone number" is the SMS-thread test, and it
+# decides three separate things: whether /conversation collapses to the
+# self-only thread, whether a rename writes the contact label instead of the
+# name, and whether the socket accepts carrier status for the thread at all.
+# Those lived as three identical copies; one definition here — the module the
+# other server modules already take their wire validators from — is what stops
+# the create-time and carrier-time answers from drifting apart.
+PHONE_RE = re.compile(r"\+?[0-9*#]{3,24}", re.ASCII)
 B64U_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 SID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}", re.ASCII)
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}\.[^@\s]{2,63}$", re.ASCII)
 LOGIN_PROOF_DOMAIN = "securemsg-device-login-v1"
+# One cost for every server-side hash. _DUMMY_PW_HASH below equalises response
+# time only while it costs exactly what a real stored hash costs, so the two
+# must never be able to drift apart.
+BCRYPT_ROUNDS = 12
+
+
+def _server_hash(pw_hash: str) -> str:
+    """bcrypt the client's Argon2id output for storage defense in depth."""
+    return bcrypt.hashpw(
+        pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
+    ).decode("utf-8")
+
 
 # Precomputed bcrypt hash (same cost as real stored hashes) so credential checks
 # spend identical work whether the username exists or not. Without this, a
 # missing username skips bcrypt entirely and leaks account existence through a
 # ~250ms response-time difference.
-_DUMMY_PW_HASH = bcrypt.hashpw(
-    b"securemsg-timing-equalizer", bcrypt.gensalt(rounds=12)
-).decode("utf-8")
+_DUMMY_PW_HASH = _server_hash("securemsg-timing-equalizer")
 
 
 def _check_password(pw_hash: str, stored_hash: str | None) -> bool:
@@ -229,6 +253,27 @@ def _valid_b64u(value: object, raw_length: int | None = None) -> bool:
     return raw_length is None or len(decoded) == raw_length
 
 
+def _decode_b64u(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _signature_valid(sig_pub: str, statement: str, signature: str) -> bool:
+    """The single Ed25519 statement check for every endpoint that needs one.
+
+    Four hand-rolled copies had already drifted: /device-login re-implemented
+    the padding arithmetic inline and named binascii.Error separately (it is a
+    ValueError subclass), so a change to the accepted encoding could land on
+    three call sites and silently miss the fourth.
+    """
+    try:
+        VerifyKey(_decode_b64u(sig_pub)).verify(
+            statement.encode("utf-8"), _decode_b64u(signature)
+        )
+    except (BadSignatureError, ValueError):
+        return False
+    return True
+
+
 def _text(body: dict, field: str) -> str:
     value = body.get(field)
     return value if isinstance(value, str) else ""
@@ -241,6 +286,18 @@ def _json_body() -> dict | None:
 
 def _email(value: object) -> str:
     return value.strip().lower() if isinstance(value, str) else ""
+
+
+def _epoch(body: dict) -> int | None:
+    """``parent_epoch`` off the wire, or None when it is not a usable epoch.
+
+    bool is an int subclass, so ``True`` would otherwise be accepted as epoch 1
+    and satisfy a comparison against a real epoch of 1.
+    """
+    value = body.get("parent_epoch")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
 
 
 def _code_digest(challenge_id: str, code: str) -> str:
@@ -340,10 +397,17 @@ def pending_auth_required(fn):
         # client is entitled to act on destructively. Collapsing both into one
         # 401 made a pending device discard its local state on any expiry — or
         # whenever a relay chose to answer 401.
-        if not device or device["user_id"] != uid or device["session_version"] != sv:
+        if not device or device["user_id"] != uid:
             return _err("invalid token", 401)
+        # Ahead of the session_version comparison because every revoke path
+        # bumps session_version in the same UPDATE, which made this branch
+        # unreachable: a rejected browser polled a bare "invalid token" 401
+        # forever instead of discarding its keypair. The token is server-signed
+        # for exactly this uid/sid, so its own row's trust state leaks nothing.
         if device["trust_state"] == "revoked":
             return _err("device revoked", 401, code=DEVICE_REVOKED_CODE)
+        if device["session_version"] != sv:
+            return _err("invalid token", 401)
         g.auth = {
             "uid": uid, "sid": sid, "device_id": device["id"], "session_version": sv,
             "session_started_at": int(device["session_started_at"] or 0),
@@ -410,7 +474,7 @@ def register_email_verify():
     )
     if pending is None:
         return _err("verification code is invalid or expired", 400)
-    server_hash = bcrypt.hashpw(pending["pw_hash"].encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    server_hash = _server_hash(pending["pw_hash"])
     try:
         uid = store.create_user(pending["username"], server_hash, pending["email"], int(time.time()))
     except sqlite3.IntegrityError:
@@ -516,18 +580,29 @@ def password_reset_confirm():
         return _err("invalid password reset request", 400)
     # Keyed on the username, NOT the caller-supplied challenge_id: a fresh
     # challenge_id would otherwise open a fresh bucket on every request and
-    # leave this endpoint effectively unlimited.
-    retry_after = rate_limit("password-reset-confirm", username, 10, 60)
+    # leave this endpoint effectively unlimited. The username is caller-supplied
+    # as well, so the address-independent per-IP cap is what actually bounds how
+    # many pairs one client can walk through.
+    retry_after = rate_limit("password-reset-confirm", username, 10, 60) or rate_limit_ip(
+        PASSWORD_RESET_CONFIRM_IP_SCOPE,
+        PASSWORD_RESET_CONFIRM_IP_LIMIT,
+        PASSWORD_RESET_CONFIRM_IP_WINDOW,
+    )
     if retry_after:
         return _rate_error(retry_after)
+    # Kept ahead of consume_password_reset so an unlinked pair costs one indexed
+    # SELECT rather than that transaction's BEGIN IMMEDIATE on the single
+    # worker. It answers with the SAME message the transaction returns: the two
+    # used to differ, which made this endpoint the (username, email) oracle
+    # /password-reset/request goes to such lengths to avoid being.
     user = store.get_user_by_name(username)
     if not user or user.get("email") != email:
-        return _err("invalid password reset request", 400)
+        return _err("verification code is invalid or expired", 400)
     # bcrypt runs only once the code itself verifies (store calls this inside
     # the same transaction). Hashing first would let anyone who knows a
     # username/email pair spend ~250ms of the single worker per bad code.
     def server_hash() -> str:
-        return bcrypt.hashpw(pw_hash.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+        return _server_hash(pw_hash)
 
     reset_username = store.consume_password_reset(
         challenge_id, email, _code_digest(challenge_id, code), server_hash, int(time.time()),
@@ -700,12 +775,7 @@ def device_login():
     statement = device_login_statement(
         user["id"], sid, challenge_id, challenge, int(dev["session_version"])
     )
-    try:
-        VerifyKey(base64.urlsafe_b64decode(dev["sig_pub"] + "=" * (-len(dev["sig_pub"]) % 4))).verify(
-            statement.encode("utf-8"),
-            base64.urlsafe_b64decode(proof + "=" * (-len(proof) % 4)),
-        )
-    except (BadSignatureError, ValueError, binascii.Error):
+    if not _signature_valid(dev["sig_pub"], statement, proof):
         return _err("invalid device login proof", 401)
     consumed = store.consume_device_login_challenge(
         challenge_id, challenge, dev["id"], user["id"], sid, int(dev["session_version"])
@@ -812,6 +882,28 @@ def devices_list():
     )
 
 
+def _emit_device_revoked(uid: int, sid: str) -> None:
+    """Announce a revocation to the account's remaining devices.
+
+    The user row is re-read after the write on purpose: peers verify the new
+    directory against the epoch this revocation produced, so emitting the
+    pre-write values hands them a hash that no longer matches anything.
+    """
+    # Imported lazily to avoid the auth <-> sockets module cycle.
+    from sockets import emit_to_user_devices
+
+    user = store.get_user(uid)
+    emit_to_user_devices(
+        uid,
+        "device_revoked",
+        {
+            "sid": sid,
+            "security_epoch": user["security_epoch"],
+            "directory_hash": user["directory_hash"],
+        },
+    )
+
+
 @bp.post("/device-revoke")
 @auth_required
 def device_revoke():
@@ -821,14 +913,12 @@ def device_revoke():
     sid = _text(body, "sid")
     signature = _text(body, "signature")
     reason = _text(body, "reason")
-    parent_epoch = body.get("parent_epoch")
+    parent_epoch = _epoch(body)
     if (
         not SID_RE.fullmatch(sid)
         or not _valid_b64u(signature, 64)
         or reason != "user_revoked"
-        or not isinstance(parent_epoch, int)
-        or isinstance(parent_epoch, bool)
-        or parent_epoch < 0
+        or parent_epoch is None
     ):
         return _err("sid, parent_epoch, user_revoked reason and Ed25519 signature required", 400)
     dev = store.get_device_by_sid(sid)
@@ -836,11 +926,7 @@ def device_revoke():
         return _err("device not found", 404)
     actor = store.get_device_by_sid(g.auth["sid"])
     statement = revoke_statement(g.auth["uid"], dev, g.auth["sid"], parent_epoch)
-    try:
-        VerifyKey(_decode_b64u(actor["sig_pub"])).verify(
-            statement.encode(), _decode_b64u(signature)
-        )
-    except (BadSignatureError, ValueError):
+    if not _signature_valid(actor["sig_pub"], statement, signature):
         return _err("invalid revoke signature", 403)
     try:
         changed = store.revoke_device(
@@ -860,18 +946,7 @@ def device_revoke():
         return _err("security epoch changed", 409)
     if not changed:
         return _err("device already revoked", 409)
-    from sockets import emit_to_user_devices
-
-    refreshed = store.get_user(g.auth["uid"])
-    emit_to_user_devices(
-        g.auth["uid"],
-        "device_revoked",
-        {
-            "sid": sid,
-            "security_epoch": refreshed["security_epoch"],
-            "directory_hash": refreshed["directory_hash"],
-        },
-    )
+    _emit_device_revoked(g.auth["uid"], sid)
     return _ok(revoked=sid)
 
 
@@ -899,18 +974,7 @@ def pending_device_revoke():
         device["id"], g.auth["uid"], g.auth["sid"], g.auth["session_version"]
     ):
         return _err("device is no longer pending", 409)
-    from sockets import emit_to_user_devices
-
-    user = store.get_user(g.auth["uid"])
-    emit_to_user_devices(
-        g.auth["uid"],
-        "device_revoked",
-        {
-            "sid": g.auth["sid"],
-            "security_epoch": user["security_epoch"],
-            "directory_hash": user["directory_hash"],
-        },
-    )
+    _emit_device_revoked(g.auth["uid"], g.auth["sid"])
     return _ok(revoked=g.auth["sid"])
 
 
@@ -922,8 +986,8 @@ def reject_pending_device():
         return _err("JSON object required", 400)
     sid = _text(body, "sid")
     challenge = _text(body, "challenge")
-    parent_epoch = body.get("parent_epoch")
-    if not SID_RE.fullmatch(sid) or not _valid_b64u(challenge, 32) or not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0:
+    parent_epoch = _epoch(body)
+    if not SID_RE.fullmatch(sid) or not _valid_b64u(challenge, 32) or parent_epoch is None:
         return _err("sid, challenge and parent_epoch required", 400)
     try:
         changed = store.reject_pending_device(
@@ -1039,15 +1103,13 @@ def security_upgrade():
     body = _json_body()
     if body is None:
         return _err("JSON object required", 400)
-    parent_epoch = body.get("parent_epoch")
+    parent_epoch = _epoch(body)
     signature = _text(body, "signature")
-    if not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0 or not _valid_b64u(signature, 64):
+    if parent_epoch is None or not _valid_b64u(signature, 64):
         return _err("parent_epoch and Ed25519 signature required", 400)
     device = store.get_device_by_sid(g.auth["sid"])
     statement = legacy_upgrade_statement(g.auth["uid"], device["sid"], device["sig_pub"], parent_epoch)
-    try:
-        VerifyKey(_decode_b64u(device["sig_pub"])).verify(statement.encode(), _decode_b64u(signature))
-    except (BadSignatureError, ValueError):
+    if not _signature_valid(device["sig_pub"], statement, signature):
         return _err("invalid upgrade signature", 403)
     try:
         result = store.upgrade_legacy_security(g.auth["uid"], g.auth["sid"], g.auth["session_version"], parent_epoch, statement, signature)
@@ -1068,8 +1130,8 @@ def device_approve():
         return _err("JSON object required", 400)
     subject_sid = _text(body, "subject_sid")
     signature = _text(body, "signature")
-    parent_epoch = body.get("parent_epoch")
-    if not SID_RE.fullmatch(subject_sid) or not _valid_b64u(signature, 64) or not isinstance(parent_epoch, int) or isinstance(parent_epoch, bool) or parent_epoch < 0:
+    parent_epoch = _epoch(body)
+    if not SID_RE.fullmatch(subject_sid) or not _valid_b64u(signature, 64) or parent_epoch is None:
         return _err("subject_sid, parent_epoch and Ed25519 signature required", 400)
     subject = store.get_device_by_sid(subject_sid)
     if not subject or subject["user_id"] != g.auth["uid"]:
@@ -1095,9 +1157,7 @@ def device_approve():
             return _err("pairing_id, nonce_new and nonce_approver required", 400)
     approver = store.get_device_by_sid(g.auth["sid"])
     statement = approval_statement(g.auth["uid"], subject, parent_epoch, pairing)
-    try:
-        VerifyKey(_decode_b64u(approver["sig_pub"])).verify(statement.encode(), _decode_b64u(signature))
-    except (BadSignatureError, ValueError):
+    if not _signature_valid(approver["sig_pub"], statement, signature):
         return _err("invalid approval signature", 403)
     try:
         result = store.approve_pending_device(
@@ -1130,10 +1190,6 @@ def device_approve():
         {"sid": subject_sid, **result},
     )
     return _ok(approved=subject_sid, **result)
-
-
-def _decode_b64u(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 @bp.get("/key-directory")

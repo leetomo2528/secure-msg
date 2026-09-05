@@ -6,12 +6,12 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.provider.Telephony
+import android.telephony.SmsManager
 import android.util.Log
 import androidx.room.withTransaction
 import com.yunjelee.securemsg.ui.LastOpened
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
@@ -23,6 +23,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Foreground remote-messaging service.
@@ -46,9 +47,9 @@ class SmsBridgeService : Service() {
     private var creds: SavedCredentials? = null
     private lateinit var db: AppDatabase
     private lateinit var incomingRepository: IncomingMessageRepository
-    private var outboxLoop: Job? = null
     private val outboxLoopStarted = AtomicBoolean(false)
     private val sessionInvalidated = AtomicBoolean(false)
+    private val lastTrustRefreshAt = AtomicLong(0L)
     /**
      * MMS id -> deferred retries already spent on it. Entries are never removed:
      * the count *is* the "how often has this row been nudged" marker, and
@@ -70,6 +71,8 @@ class SmsBridgeService : Service() {
         const val EXTRA_RECEIVED_AT = "received_at"
         private const val TAG = "SmsBridgeService"
         private const val CLAIM_RETRY_GRACE_MS = 30_000L
+        /** Floor between unforced key-directory re-reads; see [refreshDeviceTrust]. */
+        private const val TRUST_REFRESH_MIN_INTERVAL_MS = 60_000L
         /**
          * Backoff for a downloaded-but-not-ready MMS. Three tries spanning ~5
          * minutes: long enough to outlast a slow part download on a weak data
@@ -237,7 +240,7 @@ class SmsBridgeService : Service() {
      */
     private fun startOutboxLoop() {
         if (!outboxLoopStarted.compareAndSet(false, true)) return
-        outboxLoop = scope.launch {
+        scope.launch {
             while (true) {
                 // Unattended self-update rides the same heartbeat, relay or
                 // not — launched, never awaited: a multi-minute APK download
@@ -311,13 +314,11 @@ class SmsBridgeService : Service() {
             return
         }
         val trustView = DeviceSecurityController(
-            RelayTrustedDeviceApi(relayApi, loaded.uid.toLong()),
+            RelayTrustedDeviceApi(relayApi),
             loaded,
             DeviceTrustRepository(db),
         ).refresh()
-        if (trustView.serverUnsupported || trustView.selfPending || trustView.error != null ||
-            trustView.trustWarning != null
-        ) {
+        if (trustView.blocksDirectoryUse) {
             Log.e(TAG, "Bridge blocked by device trust: $trustView")
             stopSelf()
             return
@@ -395,6 +396,19 @@ class SmsBridgeService : Service() {
                 // verifies the directory before accepting recipient keys.
                 Log.w(TAG, "New device approval is pending")
             }
+            client.onDeviceApproved = {
+                // The receive path pins nothing on its own, so until this
+                // lands every envelope from the newly approved device is
+                // refused as unpinned — and syncConversation stops at the
+                // first refusal, holding the rest of that conversation too.
+                scope.launch {
+                    try {
+                        if (refreshDeviceTrust("device approval", force = true)) syncFromServer()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Trust refresh after device approval failed", e)
+                    }
+                }
+            }
         }
         relay!!.connect(loaded.token)
         // Account usernames are identifiers; keep them out of logcat like the
@@ -411,9 +425,22 @@ class SmsBridgeService : Service() {
         // user must be told, or the next symptom is "messages stopped syncing".
         SmsNotifier.notifySessionExpired(this)
         scope.launch {
-            Credentials.clearSession(this@SmsBridgeService)
-            relay?.disconnect()
-            stopSelf()
+            try {
+                Credentials.clearSession(this@SmsBridgeService)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // clearSession re-encrypts through the Keystore and can throw.
+                // Uncaught here it takes down the default SMS app, and the
+                // one-shot flag above would then refuse every later attempt,
+                // so the bridge would reconnect with the dead token until the
+                // process died. Let the next rejection try again.
+                Log.e(TAG, "Clearing the rejected relay session failed", e)
+                sessionInvalidated.set(false)
+            } finally {
+                relay?.disconnect()
+                stopSelf()
+            }
         }
     }
 
@@ -458,6 +485,16 @@ class SmsBridgeService : Service() {
     private fun getServerUrl(): String {
         return ServerConfig.url(this)
     }
+
+    /**
+     * The process-wide RelayApi, created on first use.
+     *
+     * Cached rather than rebuilt per call because [refreshAuthToken] renews the
+     * token on the instance this returns; a fresh RelayApi per caller would keep
+     * handing the relay the token that was on disk at service start.
+     */
+    private fun apiFor(c: SavedCredentials): RelayApi =
+        api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
 
     /**
      * Carrier SMS -> encrypted multi-device relay.
@@ -523,25 +560,38 @@ class SmsBridgeService : Service() {
         // message ever gets to reach the shade — and on that live path the age
         // gate must not apply, or an SMS the carrier queued overnight lands in
         // the thread with nothing announcing it.
-        persisted?.takeIf {
-            IncomingNotificationPolicy.shouldNotify(
-                rescan, it.newlyCreated, receivedAt, System.currentTimeMillis(),
-            )
-        }?.let { fresh ->
-            SmsNotifier.notifyIncoming(
-                context = this,
-                phoneNumber = fresh.conversation.normalizedPhone,
-                body = body,
-                date = receivedAt,
-                cid = fresh.conversation.cid,
-                messageIdentity = fresh.outbox.mid,
-                displayName = fresh.conversation.displayName,
-                // A sweep import must not banner: dozens at once is what gets
-                // the HIGH channel demoted to silent by adaptive notifications.
-                liveAlert = !rescan,
-            )
-        }
+        notifyIfLive(persisted, rescan, body, receivedAt)
         flushOutbox()
+    }
+
+    /**
+     * The single notify gate for both carrier paths. [date] is the message's own
+     * timestamp, not now: the age gate in [IncomingNotificationPolicy] is what
+     * keeps a logout-cleared ledger from re-announcing the whole inbox.
+     */
+    private fun notifyIfLive(
+        persisted: IncomingMessageRepository.Persisted?,
+        rescan: Boolean,
+        body: String,
+        date: Long,
+    ) {
+        val fresh = persisted?.takeIf {
+            IncomingNotificationPolicy.shouldNotify(
+                rescan, it.newlyCreated, date, System.currentTimeMillis(),
+            )
+        } ?: return
+        SmsNotifier.notifyIncoming(
+            context = this,
+            phoneNumber = fresh.conversation.normalizedPhone,
+            body = body,
+            date = date,
+            cid = fresh.conversation.cid,
+            messageIdentity = fresh.outbox.mid,
+            displayName = fresh.conversation.displayName,
+            // A sweep import must not banner: dozens at once is what gets
+            // the HIGH channel demoted to silent by adaptive notifications.
+            liveAlert = !rescan,
+        )
     }
 
     private suspend fun processRecentMms(rescan: Boolean) {
@@ -589,8 +639,12 @@ class SmsBridgeService : Service() {
             flushOutbox()
             return
         }
-        if (!isSmsAddress(phone)) {
-            Log.w(TAG, "Ignoring MMS with invalid sender id=$id")
+        if (phone.isBlank()) {
+            // Only a provider row with no usable address is dropped here. A
+            // sender that is not a phone number — an alphanumeric id, an
+            // email gateway — is stored and notified like the SMS path does;
+            // this app is the default SMS app and reads nothing but Room, so
+            // refusing it used to make the message unreachable everywhere.
             db.processedMmsDao().insert(ProcessedMms(identity.epoch, id, identity.fingerprint))
             return
         }
@@ -620,24 +674,7 @@ class SmsBridgeService : Service() {
         )
         // A logout clears the processed-MMS ledger, so without the age gate the
         // next startup sweep would re-notify every inbox row it can still see.
-        persisted?.takeIf {
-            IncomingNotificationPolicy.shouldNotify(
-                rescan, it.newlyCreated, mms.date, System.currentTimeMillis(),
-            )
-        }?.let { fresh ->
-            SmsNotifier.notifyIncoming(
-                context = this,
-                phoneNumber = fresh.conversation.normalizedPhone,
-                body = IncomingNotificationPolicy.preview(content),
-                date = mms.date,
-                cid = fresh.conversation.cid,
-                messageIdentity = fresh.outbox.mid,
-                displayName = fresh.conversation.displayName,
-                // A sweep import must not banner: dozens at once is what gets
-                // the HIGH channel demoted to silent by adaptive notifications.
-                liveAlert = !rescan,
-            )
-        }
+        notifyIfLive(persisted, rescan, IncomingNotificationPolicy.preview(content), mms.date)
         flushOutbox()
     }
 
@@ -682,7 +719,7 @@ class SmsBridgeService : Service() {
             for (queuedRow in rows) {
                 val content = RelayContentCodec.decode(queuedRow.plaintext)
                 var row = queuedRow
-                if (row.payload.isBlank() || row.cid.startsWith("local_")) {
+                if (row.payload.isBlank() || row.cid.startsWith(SmsThread.LOCAL_CID_PREFIX)) {
                     val prepared = try {
                         prepareRelayOutbox(row)
                     } catch (e: Exception) {
@@ -690,10 +727,16 @@ class SmsBridgeService : Service() {
                         null
                     }
                     if (prepared == null) {
-                        db.relayOutboxDao().recordAttempt(
-                            row.id,
-                            "relay preparation deferred",
-                        )
+                        val terminal = terminalOutboxRejection(row)
+                        if (terminal != null) {
+                            Log.w(TAG, "Outbox row can never be relayed mid=${row.mid}: $terminal")
+                            db.relayOutboxDao().markUnsendable(row.id, terminal)
+                        } else {
+                            db.relayOutboxDao().recordAttempt(
+                                row.id,
+                                "relay preparation deferred",
+                            )
+                        }
                         continue
                     }
                     row = prepared
@@ -727,18 +770,11 @@ class SmsBridgeService : Service() {
                         carrierState = "dispatched",
                     )
                     row.localMessageId?.let { localId ->
-                        val local = db.messageDao().getById(localId)
-                        if (local == null || CarrierState.canAdvance(
-                                local.carrierStatus,
-                                row.carrierState,
-                            )
-                        ) {
-                            db.messageDao().setCarrierStatusById(
-                                localId,
-                                row.carrierState,
-                                row.lastError,
-                            )
-                        }
+                        db.messageDao().advanceCarrierStatus(
+                            localId,
+                            row.carrierState,
+                            row.lastError,
+                        )
                     }
                 }
                 if (row.relayState == "sent") {
@@ -817,7 +853,7 @@ class SmsBridgeService : Service() {
                             seq,
                             content.type,
                             content.subject,
-                            attachmentsJson(content),
+                            RelayContentCodec.attachmentsJson(content),
                         )
                     } else {
                         db.messageDao().insert(
@@ -830,7 +866,7 @@ class SmsBridgeService : Service() {
                                 mine = !isIncoming,
                                 contentType = content.type,
                                 subject = content.subject,
-                                attachmentsJson = attachmentsJson(content),
+                                attachmentsJson = RelayContentCodec.attachmentsJson(content),
                                 serverKey = "${row.cid}:$seq",
                                 carrierStatus = if (!isIncoming) row.carrierState else "none",
                                 carrierError = row.lastError,
@@ -861,12 +897,26 @@ class SmsBridgeService : Service() {
         }
     }
 
+    /**
+     * Why a queued row can never be prepared, however often it is retried.
+     *
+     * Only a deterministic rejection belongs here: an offline relay or a trust
+     * refresh error must stay in the pending set. An SMS whose sender is an
+     * alphanumeric id ("Google") or an email address has no carrier address to
+     * relay to and never will, and pending() is a fixed oldest-first window —
+     * a hundred such rows hide every newer one and stop the outbox entirely.
+     */
+    private fun terminalOutboxRejection(row: RelayOutbox): String? =
+        "sender is not a carrier address".takeIf {
+            !PhoneNumberNormalizer.isSmsAddress(PhoneNumberNormalizer.normalize(row.phoneNumber))
+        }
+
     /** Resolve/create the server SMS conversation and encrypt queued carrier content. */
     private suspend fun prepareRelayOutbox(row: RelayOutbox): RelayOutbox? {
         val c = creds ?: Credentials.load(this) ?: return null
-        val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
+        val a = apiFor(c)
         val phone = PhoneNumberNormalizer.normalize(row.phoneNumber)
-        if (!isSmsAddress(phone)) return null
+        if (!PhoneNumberNormalizer.isSmsAddress(phone)) return null
 
         // Always re-resolve through the server-owned membership list. A stale
         // local cache must never turn a group conversation into a carrier send.
@@ -915,8 +965,33 @@ class SmsBridgeService : Service() {
         val members = a.convMembers(resolvedThread.cid)
         if (!members.optBoolean("ok")) return null
         if (!validateTrustedRecipients(a, c, members)) return null
+        val recipients = pinMembers(members.optJSONArray("members") ?: JSONArray(), "send")
+            ?: return null
+        if (recipients.isEmpty()) return null
+        val payload = CryptoUtil.envelopeToJson(
+            CryptoUtil.encryptMessage(row.plaintext, recipients, c.keypair),
+        )
+        db.relayOutboxDao().markPrepared(row.id, resolvedThread.cid, payload.toString())
+        return db.relayOutboxDao().getByMid(row.mid)
+    }
+
+    /**
+     * TOFU-pin every device a conversation's member list names.
+     *
+     * One implementation for the send and receive paths, which held verbatim
+     * copies of this loop — same fields, same skip rule, same rejection — so
+     * neither copy was the stricter one and the merge changes no decision.
+     * Pinning is the app's only defence against a relay that swaps a recipient
+     * key, and the copy that drifts is the one that stops defending.
+     *
+     * Null means a listed sid's key no longer matches its pin: the caller must
+     * abandon the whole message, never proceed with the members that did pin.
+     */
+    private suspend fun pinMembers(
+        membersArr: JSONArray,
+        logContext: String,
+    ): List<CryptoUtil.Recipient>? {
         val recipients = mutableListOf<CryptoUtil.Recipient>()
-        val membersArr = members.optJSONArray("members") ?: JSONArray()
         for (index in 0 until membersArr.length()) {
             val member = membersArr.optJSONObject(index) ?: continue
             val sid = member.optString("sid")
@@ -931,17 +1006,12 @@ class SmsBridgeService : Service() {
                 ),
             )
             if (!pinned) {
-                Log.e(TAG, "Blocked send: public key changed for pinned sid=$sid")
+                Log.e(TAG, "Blocked $logContext: public key changed for pinned sid=$sid")
                 return null
             }
             recipients += CryptoUtil.Recipient(sid, pubKey)
         }
-        if (recipients.isEmpty()) return null
-        val payload = CryptoUtil.envelopeToJson(
-            CryptoUtil.encryptMessage(row.plaintext, recipients, c.keypair),
-        )
-        db.relayOutboxDao().markPrepared(row.id, resolvedThread.cid, payload.toString())
-        return db.relayOutboxDao().getByMid(row.mid)
+        return recipients
     }
 
     private suspend fun handleCarrierStatus(intent: Intent) {
@@ -950,20 +1020,20 @@ class SmsBridgeService : Service() {
         val seq = intent.getIntExtra(CarrierStatusReceiver.EXTRA_SEQ, 0)
         val status = intent.getStringExtra(CarrierStatusReceiver.EXTRA_STATUS).orEmpty()
         val error = intent.getStringExtra(CarrierStatusReceiver.EXTRA_ERROR)
+        // Offline, the durable retries in flushOutbox/flushReceiptStatuses are
+        // what report this later; nothing here is worth doing without a socket.
+        val client = relay?.takeIf { it.isConnected } ?: return
         val row = db.relayOutboxDao().getByMid(mid)
-        val actualCid = row?.cid?.takeIf { it.isNotBlank() } ?: cid
-        val actualSeq = row?.serverSeq?.takeIf { it > 0 } ?: seq
-        val client = relay
-        if (row != null && client?.isConnected == true) {
+        if (row != null) {
             syncOutboxCarrierStatus(row, client)
             return
         }
-        if (actualCid.isNotBlank() && actualSeq > 0 && status.isNotBlank() && client?.isConnected == true) {
-            val ack = client.emitCarrierStatusAwait(actualCid, actualSeq, status, error)
+        if (cid.isNotBlank() && seq > 0 && status.isNotBlank()) {
+            val ack = client.emitCarrierStatusAwait(cid, seq, status, error)
             if (ack.optBoolean("ok")) {
-                db.relayReceiptDao().markStatusSynced(actualCid, actualSeq, status)
+                db.relayReceiptDao().markStatusSynced(cid, seq, status)
             } else {
-                Log.w(TAG, "Carrier status relay deferred for $actualCid/$actualSeq")
+                Log.w(TAG, "Carrier status relay deferred for $cid/$seq")
             }
         }
     }
@@ -986,21 +1056,6 @@ class SmsBridgeService : Service() {
         }
     }
 
-    private fun attachmentsJson(content: RelayContent): String? {
-        if (content.attachments.isEmpty()) return null
-        val rows = JSONArray()
-        content.attachments.forEach {
-            rows.put(
-                JSONObject()
-                    .put("name", it.name)
-                    .put("content_type", it.contentType)
-                    .put("data", it.data)
-                    .put("size", it.size),
-            )
-        }
-        return rows.toString()
-    }
-
     /** Relay message from web/another device -> carrier SMS. */
     private fun handleRelayMessage(env: JSONObject) {
         val cid = env.optString("cid")
@@ -1009,7 +1064,7 @@ class SmsBridgeService : Service() {
             syncMutex.withLock {
                 try {
                     val c = creds ?: Credentials.load(this@SmsBridgeService) ?: return@withLock
-                    val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
+                    val a = apiFor(c)
                     syncConversation(cid, a, c)
                 } catch (e: Exception) {
                     Log.e(TAG, "Relay event sync failed for cid=$cid", e)
@@ -1038,6 +1093,11 @@ class SmsBridgeService : Service() {
             val response = a.fetchMessages(cid, cursor)
             if (!response.optBoolean("ok")) {
                 Log.e(TAG, "History fetch failed: ${response.optString("error")}")
+                return
+            }
+            // The response carries the conversation id; its rows do not.
+            if (response.optString("cid").let { it.isNotEmpty() && it != cid }) {
+                Log.e(TAG, "History page belongs to another conversation than $cid; retrying")
                 return
             }
             val rows = response.optJSONArray("messages") ?: return
@@ -1092,12 +1152,23 @@ class SmsBridgeService : Service() {
                 return false
             }
             val status = env.optString("carrier_status", "none")
-            if (status.isNotBlank() && status != "none") {
+            val local = db.messageDao().getByServerKey("$cid:$seq")
+            // The history page is fetched from a cursor captured before
+            // flushOutbox ACKed this row, so it can carry a carrier status
+            // older than the SENT/DELIVERED callback already applied locally,
+            // and nothing repairs a regression afterwards.
+            if (status.isNotBlank() && status != "none" && local != null &&
+                CarrierState.canAdvance(local.carrierStatus, status)
+            ) {
                 db.messageDao().setCarrierStatus(
                     cid,
                     seq,
                     status,
-                    env.optString("carrier_error").takeIf { it.isNotBlank() },
+                    // optString over a JSON null returns "null" on the
+                    // device's org.json, and carrier_error is null for every
+                    // successfully sent row.
+                    env.takeUnless { it.isNull("carrier_error") }
+                        ?.optString("carrier_error")?.takeIf { it.isNotBlank() },
                     env.optLong("carrier_updated_at").takeIf { it > 0 }?.times(1000)
                         ?: System.currentTimeMillis(),
                 )
@@ -1115,29 +1186,21 @@ class SmsBridgeService : Service() {
             if (membersResp.optBoolean("ok")) {
                 memberLookupSucceeded = true
                 val membersArr = membersResp.optJSONArray("members") ?: JSONArray()
-                for (i in 0 until membersArr.length()) {
-                    val m = membersArr.optJSONObject(i) ?: continue
-                    val sid = m.optString("sid")
-                    val pubKey = m.optString("pub_key")
-                    if (sid.isBlank() || pubKey.isBlank()) continue
-                    val pinned = db.deviceCacheDao().pinOrReject(
-                        DeviceCache(
-                            sid = sid,
-                            userId = m.optInt("user_id"),
-                            name = m.optString("name"),
-                            pubKey = pubKey,
-                        ),
-                    )
-                    if (!pinned) {
-                        Log.e(TAG, "Blocked receive: public key changed for pinned sid=$sid")
-                        return false
-                    }
-                }
+                // The pinned list itself is unused here; only the rejection matters.
+                if (pinMembers(membersArr, "receive") == null) return false
                 senderDev = db.deviceCacheDao().get(senderSid)
             }
         }
         if (senderPubKey == null) senderPubKey = senderDev?.pubKey
-        val trustedSender = db.deviceTrustDao().getPin(senderSid)
+        var trustedSender = db.deviceTrustDao().getPin(senderSid)
+        if (trustedSender == null && refreshDeviceTrust("unpinned sender")) {
+            // Nothing else re-reads the key directory on the receive path:
+            // startBridge skips it while the socket is up and the send-side
+            // refresh only runs when this phone has something to send. A web
+            // device approved from another device would otherwise be refused
+            // on every message, holding the whole conversation behind it.
+            trustedSender = db.deviceTrustDao().getPin(senderSid)
+        }
         if (senderPubKey != null && (trustedSender == null || trustedSender.pubKey != senderPubKey)) {
             Log.e(TAG, "Blocked envelope: sender is missing or differs from trusted sid=$senderSid")
             return false
@@ -1218,23 +1281,26 @@ class SmsBridgeService : Service() {
                     return false
                 }
                 RelayReceiptRetryPolicy.Action.CONSUME_RESOLVED -> {
-                    relay?.let { client ->
-                        if (client.isConnected) {
-                            client.emitCarrierStatusAwait(
-                                cid,
-                                seq,
-                                receipt.status,
-                                receipt.lastError,
-                            ).takeIf { it.optBoolean("ok") }?.let {
-                                db.relayReceiptDao().markStatusSynced(cid, seq, receipt.status)
-                            }
-                        }
-                    }
+                    syncReceiptStatus(cid, seq, receipt.status, receipt.lastError)
                     db.threadDao().advanceLastSeq(cid, seq)
                     relay?.emitDelivered(cid, seq)
                     return true
                 }
             }
+        }
+
+        val rejection = predispatchRejection(content)
+        if (rejection != null) {
+            // The carrier API is never reached for these, so no callback can
+            // ever resolve the receipt. Left 'attempting' — deliberately not
+            // retryable — it would hold this conversation's cursor forever,
+            // and every later message in it with the cursor.
+            Log.e(TAG, "Carrier refused $cid/$seq before dispatch: $rejection")
+            db.relayReceiptDao().markStatus(cid, seq, "failed", rejection)
+            syncReceiptStatus(cid, seq, "failed", rejection)
+            db.threadDao().advanceLastSeq(cid, seq)
+            relay?.emitDelivered(cid, seq)
+            return true
         }
 
         // Persist the ambiguous boundary immediately before entering the
@@ -1263,19 +1329,7 @@ class SmsBridgeService : Service() {
             db.relayReceiptDao().markStatus(cid, seq, "dispatched", null)
         }
         val effectiveReceipt = db.relayReceiptDao().get(cid, seq) ?: return false
-        relay?.let { client ->
-            if (client.isConnected) {
-                val ack = client.emitCarrierStatusAwait(
-                    cid,
-                    seq,
-                    effectiveReceipt.status,
-                    effectiveReceipt.lastError,
-                )
-                if (ack.optBoolean("ok")) {
-                    db.relayReceiptDao().markStatusSynced(cid, seq, effectiveReceipt.status)
-                }
-            }
-        }
+        syncReceiptStatus(cid, seq, effectiveReceipt.status, effectiveReceipt.lastError)
 
         try {
             val serverTime = env.optLong("created_at")
@@ -1291,7 +1345,7 @@ class SmsBridgeService : Service() {
                     blocked = false,
                     contentType = content.type,
                     subject = content.subject,
-                    attachmentsJson = attachmentsJson(content),
+                    attachmentsJson = RelayContentCodec.attachmentsJson(content),
                     serverKey = "$cid:$seq",
                     // A very fast framework callback can resolve the receipt
                     // before send() returns. Preserve that newer result.
@@ -1314,6 +1368,67 @@ class SmsBridgeService : Service() {
         return true
     }
 
+    /**
+     * Why the carrier API will refuse this content before it is ever called.
+     *
+     * SmsSender reports such a rejection as a plain false, indistinguishable
+     * from a throw after SmsManager already accepted the message — and that
+     * ambiguity is exactly what makes an 'attempting' receipt non-retryable.
+     * Naming the deterministic cases here keeps one over-long message (the web
+     * composer accepts 20_000 characters, the carrier 20 segments) from
+     * freezing the SMS thread it was sent to.
+     */
+    private fun predispatchRejection(content: RelayContent): String? {
+        if (content.type == RelayContentCodec.TYPE_MMS) return null
+        if (content.text.isBlank()) return "SMS body is empty"
+        val segments = runCatching {
+            getSystemService(SmsManager::class.java).divideMessage(content.text).size
+        }.getOrNull() ?: return null
+        return "SMS exceeds ${SmsSender.MAX_MULTIPART_SEGMENTS} carrier segments"
+            .takeIf { segments > SmsSender.MAX_MULTIPART_SEGMENTS }
+    }
+
+    /** Report one receipt's carrier outcome; [flushReceiptStatuses] retries the rest. */
+    private suspend fun syncReceiptStatus(cid: String, seq: Int, status: String, error: String?) {
+        val client = relay ?: return
+        if (!client.isConnected) return
+        val ack = client.emitCarrierStatusAwait(cid, seq, status, error)
+        if (ack.optBoolean("ok")) {
+            db.relayReceiptDao().markStatusSynced(cid, seq, status)
+        }
+    }
+
+    /**
+     * Re-read and re-verify the key directory outside the send path.
+     *
+     * Rate-limited because the caller is a per-message miss: a conversation
+     * full of envelopes from one unknown device must not become a GET
+     * /key-directory per envelope. A device approval event forces it, being
+     * both rare and the authoritative signal.
+     */
+    private suspend fun refreshDeviceTrust(reason: String, force: Boolean = false): Boolean {
+        val now = System.currentTimeMillis()
+        if (force) {
+            lastTrustRefreshAt.set(now)
+        } else {
+            val previous = lastTrustRefreshAt.get()
+            if (now - previous < TRUST_REFRESH_MIN_INTERVAL_MS) return false
+            if (!lastTrustRefreshAt.compareAndSet(previous, now)) return false
+        }
+        val c = creds ?: Credentials.load(this) ?: return false
+        val relayApi = apiFor(c)
+        val view = DeviceSecurityController(
+            RelayTrustedDeviceApi(relayApi),
+            c,
+            DeviceTrustRepository(db),
+        ).refresh()
+        if (view.blocksDirectoryUse) {
+            Log.w(TAG, "Directory refresh after $reason rejected: $view")
+            return false
+        }
+        return true
+    }
+
     /** Fail-closed validation for the self-only SMS relay recipient directory. */
     private suspend fun validateTrustedRecipients(
         relayApi: RelayApi,
@@ -1321,13 +1436,11 @@ class SmsBridgeService : Service() {
         response: JSONObject,
     ): Boolean {
         val refreshed = DeviceSecurityController(
-            RelayTrustedDeviceApi(relayApi, credentials.uid.toLong()),
+            RelayTrustedDeviceApi(relayApi),
             credentials,
             DeviceTrustRepository(db),
         ).refresh()
-        if (refreshed.serverUnsupported || refreshed.selfPending || refreshed.error != null ||
-            refreshed.trustWarning != null
-        ) {
+        if (refreshed.blocksDirectoryUse) {
             Log.e(TAG, "Recipient directory refresh rejected: $refreshed")
             return false
         }
@@ -1364,6 +1477,29 @@ class SmsBridgeService : Service() {
         return expected == response.optString("recipient_keyset_hash")
     }
 
+    /**
+     * Apply one server conversation row to the local thread.
+     *
+     * The copy() branch is what keeps lastSeq/lastActivityAt and the
+     * address-book name this device resolved: rebuilding the row from the
+     * server fields alone would reset a conversation's cursor on every sync.
+     */
+    private suspend fun upsertThreadFromRow(cid: String, phone: String, row: JSONObject): SmsThread {
+        val existing = db.threadDao().get(cid)
+        return (
+            existing?.copy(
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            ) ?: SmsThread(
+                cid = cid,
+                phoneNumber = phone,
+                serverName = serverConversationName(row),
+                syncedContactName = nullableContactName(row, "synced_contact_name"),
+            )
+            ).also { db.threadDao().upsert(it) }
+    }
+
     private suspend fun resolveThreadFromServer(
         cid: String,
         a: RelayApi,
@@ -1376,18 +1512,7 @@ class SmsBridgeService : Service() {
             val row = rows.optJSONObject(i) ?: continue
             if (row.optString("cid") != cid) continue
             val phone = ownedPhone(row, username) ?: return null
-            val existing = db.threadDao().get(cid)
-            return (existing?.copy(
-                phoneNumber = phone,
-                serverName = serverConversationName(row),
-                syncedContactName = nullableContactName(row, "synced_contact_name"),
-            ) ?: SmsThread(
-                cid = cid,
-                phoneNumber = phone,
-                serverName = serverConversationName(row),
-                syncedContactName = nullableContactName(row, "synced_contact_name"),
-            ))
-                .also { db.threadDao().upsert(it) }
+            return upsertThreadFromRow(cid, phone, row)
         }
         return null
     }
@@ -1408,18 +1533,7 @@ class SmsBridgeService : Service() {
             if (ownedPhone(row, c.username) != phone) continue
             val cid = row.optString("cid")
             if (cid.isBlank()) continue
-            val existing = db.threadDao().get(cid)
-            return (existing?.copy(
-                phoneNumber = phone,
-                serverName = serverConversationName(row),
-                syncedContactName = nullableContactName(row, "synced_contact_name"),
-            ) ?: SmsThread(
-                cid = cid,
-                phoneNumber = phone,
-                serverName = serverConversationName(row),
-                syncedContactName = nullableContactName(row, "synced_contact_name"),
-            ))
-                .also { db.threadDao().upsert(it) }
+            return upsertThreadFromRow(cid, phone, row)
         }
 
         val created = a.createConversation(JSONArray().put(c.username), phone)
@@ -1432,7 +1546,20 @@ class SmsBridgeService : Service() {
         return SmsThread(cid, phone, phone).also { db.threadDao().upsert(it) }
     }
 
-    private fun ownedPhone(row: JSONObject, username: String): String? {
+    /**
+     * The number this relay conversation is the carrier gateway for, or null.
+     *
+     * Ownership normally comes from the conversation name, but any member may
+     * rename any conversation and the web offers rename with no SMS guard. A
+     * rename to "Mom" used to drop the cid from the owned set: web messages in
+     * it were discarded, and the number's next incoming SMS created a second
+     * relay conversation, splitting the history while the web kept sending
+     * into the dead one. A cid this device already pinned to a number stays
+     * that number's thread. The self-only membership test is what actually
+     * gates carrier authority and is still required on both paths — a group
+     * conversation named like a phone number must never reach the carrier.
+     */
+    private suspend fun ownedPhone(row: JSONObject, username: String): String? {
         val memberRows = row.optJSONArray("members") ?: return null
         val members = buildList {
             for (index in 0 until memberRows.length()) {
@@ -1440,7 +1567,11 @@ class SmsBridgeService : Service() {
                 if (member.isNotBlank()) add(member)
             }
         }
-        return SmsConversationPolicy.ownedPhone(row.optString("name"), members, username)
+        SmsConversationPolicy.ownedPhone(row.optString("name"), members, username)
+            ?.let { return it }
+        if (members.size != 1 || members.single() != username) return null
+        val cid = row.optString("cid").takeIf { it.isNotBlank() } ?: return null
+        return db.threadDao().get(cid)?.phoneNumber?.takeIf(PhoneNumberNormalizer::isSmsAddress)
     }
 
     private fun serverConversationName(row: JSONObject): String? =
@@ -1455,7 +1586,7 @@ class SmsBridgeService : Service() {
         syncMutex.withLock {
             try {
                 val c = creds ?: Credentials.load(this) ?: return@withLock
-                val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
+                val a = apiFor(c)
                 val ownedCids = syncSmsThreads()
                 for (cid in ownedCids) {
                     syncConversation(cid, a, c, ownershipAlreadyVerified = true)
@@ -1476,7 +1607,18 @@ class SmsBridgeService : Service() {
                 receipt.status,
                 receipt.lastError,
             )
-            if (!ack.optBoolean("ok")) return
+            if (!ack.optBoolean("ok")) {
+                val error = ack.optString("error")
+                if (RelayReceiptRetryPolicy.isRetryableAckError(error)) return
+                // Retiring it costs this one status. Waiting costs every
+                // status after it, in every conversation, forever: the queue
+                // is oldest-first and the relay's refusal will not change.
+                Log.w(
+                    TAG,
+                    "Carrier status permanently rejected for " +
+                        "${receipt.cid}/${receipt.seq}: $error",
+                )
+            }
             db.relayReceiptDao().markStatusSynced(
                 receipt.cid,
                 receipt.seq,
@@ -1487,7 +1629,7 @@ class SmsBridgeService : Service() {
 
     private suspend fun syncSmsThreads(): Set<String> {
         val c = creds ?: return emptySet()
-        val a = api ?: RelayApi(getServerUrl()).also { it.token = c.token }.also { api = it }
+        val a = apiFor(c)
         val response = a.listConversations()
         if (!response.optBoolean("ok")) {
             Log.e(TAG, "Conversation sync failed: ${response.optString("error")}")
@@ -1501,19 +1643,7 @@ class SmsBridgeService : Service() {
             val phone = ownedPhone(row, c.username)
             if (cid.isNotBlank() && phone != null) {
                 val absorbed = db.withTransaction {
-                    val existing = db.threadDao().get(cid)
-                    db.threadDao().upsert(
-                        existing?.copy(
-                            phoneNumber = phone,
-                            serverName = serverConversationName(row),
-                            syncedContactName = nullableContactName(row, "synced_contact_name"),
-                        ) ?: SmsThread(
-                            cid = cid,
-                            phoneNumber = phone,
-                            serverName = serverConversationName(row),
-                            syncedContactName = nullableContactName(row, "synced_contact_name"),
-                        ),
-                    )
+                    upsertThreadFromRow(cid, phone, row)
                     // A provisional thread for this number that no outbox row
                     // will ever merge — HistoryRestore builds one, because it
                     // uploads nothing. Absorbing it here is the only path that
@@ -1555,9 +1685,6 @@ class SmsBridgeService : Service() {
         }
     }
 
-    private fun isSmsAddress(value: String): Boolean =
-        Regex("^\\+?[0-9*#]{3,24}$").matches(value)
-
     private fun startForeground() {
         val notif = BridgeNotifications.build(this)
         if (Build.VERSION.SDK_INT >= 34) {
@@ -1579,6 +1706,18 @@ class SmsBridgeService : Service() {
         super.onDestroy()
     }
 }
+
+/**
+ * The fail-closed answer to "may this device use the key directory at all?".
+ *
+ * startBridge, the per-message trust refresh and the recipient validation each
+ * spelled these four fields out, so a fifth blocking field would have had to be
+ * added to three predicates at once — and the one that was missed would keep
+ * relaying against an unverified directory. Private to this file because
+ * DeviceTrust.kt is where it belongs once HistoryShare's copy can move too.
+ */
+private val DeviceSecurityView.blocksDirectoryUse: Boolean
+    get() = serverUnsupported || selfPending || error != null || trustWarning != null
 
 internal object MmsRowProcessor {
     suspend fun process(

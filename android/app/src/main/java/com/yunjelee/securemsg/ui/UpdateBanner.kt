@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
@@ -15,6 +16,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,6 +42,26 @@ sealed interface UpdateUiState {
 }
 
 /**
+ * Whether [UpdateBanner] draws anything for this state. The shell wraps the
+ * banner in a padded box that claims its gap even around an empty child, so
+ * the shell has to know — and it must ask rather than re-derive the rule: the
+ * two copies would part company the first time a state was added, and this
+ * interface has gained three of them.
+ */
+val UpdateUiState.rendersBanner: Boolean
+    get() = when (this) {
+        UpdateUiState.Idle, UpdateUiState.Checking -> false
+        is UpdateUiState.Failed -> info != null
+        is UpdateUiState.Available,
+        is UpdateUiState.Downloading,
+        is UpdateUiState.Ready,
+        is UpdateUiState.Installing,
+        is UpdateUiState.SessionSubmitted,
+        is UpdateUiState.NeedsPermission,
+        is UpdateUiState.InstallBlocked -> true
+    }
+
+/**
  * Snapshot of the in-app update flow passed down from MainActivity so
  * MainScreen/SettingsPane don't need 11 individual parameters.
  */
@@ -58,7 +82,21 @@ data class UpdateFlow(
     val onDismiss: (UpdateInfo) -> Unit,
 )
 
-/** Inline update banner shown above the tabs; renders every state but Idle. */
+private val BannerShape = RoundedCornerShape(14.dp)
+
+/**
+ * The one banner container. Each branch below carried its own copy of this
+ * chain, so the radius and the 12dp inset had to be changed in seven places
+ * to stay one shape.
+ */
+private fun Modifier.bannerSurface(fill: Brush, outline: Color): Modifier = this
+    .fillMaxWidth()
+    .clip(BannerShape)
+    .background(fill)
+    .border(1.dp, outline, BannerShape)
+    .padding(12.dp)
+
+/** Inline update banner shown above the tabs; [rendersBanner] says for which states. */
 @Composable
 fun UpdateBanner(
     state: UpdateUiState,
@@ -71,12 +109,7 @@ fun UpdateBanner(
 ) {
     when (state) {
         is UpdateUiState.Available -> Row(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Sm.gradientSoft)
-                .border(1.dp, Sm.teal.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
-                .padding(12.dp),
+            Modifier.bannerSurface(SolidColor(Sm.accentSoft), Sm.accent.copy(alpha = 0.4f)),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -87,25 +120,26 @@ fun UpdateBanner(
                 lineHeight = 16.sp,
                 modifier = Modifier.weight(1f),
             )
-            SmGradientButton(text = "업데이트", onClick = { onUpdate(state.info) })
+            SmGradientButton(
+                text = "업데이트",
+                onClick = { onUpdate(state.info) },
+                // The only SmGradientButton with no fillMaxWidth/weight caller:
+                // the gradient otherwise ends flush with the label's glyphs.
+                modifier = Modifier.widthIn(min = 88.dp),
+            )
             TextButton(onClick = { onDismiss(state.info) }) {
                 Text("나중에", color = Sm.text3, fontSize = 12.sp)
             }
         }
         is UpdateUiState.Downloading -> Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Sm.surface)
-                .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
-                .padding(12.dp),
+            Modifier.bannerSurface(SolidColor(Sm.surface), Sm.border),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text("업데이트 다운로드 중… ${state.pct}%", color = Sm.cyan, fontSize = 12.sp)
+            Text("업데이트 다운로드 중… ${state.pct}%", color = Sm.accent, fontSize = 12.sp)
             LinearProgressIndicator(
                 progress = { state.pct / 100f },
                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-                color = Sm.teal,
+                color = Sm.accent,
                 trackColor = Sm.progressTrack,
             )
         }
@@ -120,18 +154,13 @@ fun UpdateBanner(
         // Never buttonless again (issue #5): when the system confirm fails to
         // surface, 취소 is the user's own way out of the waiting state.
         is UpdateUiState.SessionSubmitted -> Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Sm.surface)
-                .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
-                .padding(12.dp),
+            Modifier.bannerSurface(SolidColor(Sm.surface), Sm.border),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text("시스템 설치 확인을 기다리는 중…", color = Sm.cyan, fontSize = 12.sp)
+            Text("시스템 설치 확인을 기다리는 중…", color = Sm.accent, fontSize = 12.sp)
             LinearProgressIndicator(
                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-                color = Sm.teal,
+                color = Sm.accent,
                 trackColor = Sm.progressTrack,
             )
             TextButton(onClick = onCancelInstall) {
@@ -139,12 +168,7 @@ fun UpdateBanner(
             }
         }
         is UpdateUiState.NeedsPermission -> Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Sm.warning.copy(alpha = 0.07f))
-                .border(1.dp, Sm.warning.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
-                .padding(12.dp),
+            Modifier.bannerSurface(SolidColor(Sm.warning.copy(alpha = 0.07f)), Sm.warning.copy(alpha = 0.35f)),
         ) {
             Text(
                 "설치 권한이 필요합니다. 방금 열린 설정에서 '이 앱의 설치 허용'을 켜 주세요. 허용하면 자동으로 설치가 이어집니다.",
@@ -157,12 +181,7 @@ fun UpdateBanner(
             }
         }
         is UpdateUiState.InstallBlocked -> Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Sm.danger.copy(alpha = 0.06f))
-                .border(1.dp, Sm.danger.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
-                .padding(12.dp),
+            Modifier.bannerSurface(SolidColor(Sm.danger.copy(alpha = 0.06f)), Sm.danger.copy(alpha = 0.3f)),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
@@ -195,12 +214,7 @@ fun UpdateBanner(
         }
         is UpdateUiState.Failed -> if (state.info != null) {
             Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Sm.danger.copy(alpha = 0.06f))
-                    .border(1.dp, Sm.danger.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
-                    .padding(12.dp),
+                Modifier.bannerSurface(SolidColor(Sm.danger.copy(alpha = 0.06f)), Sm.danger.copy(alpha = 0.3f)),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -215,25 +229,20 @@ fun UpdateBanner(
                 }
             }
         }
-        else -> {}
+        UpdateUiState.Idle, UpdateUiState.Checking -> {}
     }
 }
 
 @Composable
 private fun InstallProgressBanner(message: String) {
     Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Sm.surface)
-            .border(1.dp, Sm.border, RoundedCornerShape(14.dp))
-            .padding(12.dp),
+        Modifier.bannerSurface(SolidColor(Sm.surface), Sm.border),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(message, color = Sm.cyan, fontSize = 12.sp)
+        Text(message, color = Sm.accent, fontSize = 12.sp)
         LinearProgressIndicator(
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-            color = Sm.teal,
+            color = Sm.accent,
             trackColor = Sm.progressTrack,
         )
     }

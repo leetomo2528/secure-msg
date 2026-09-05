@@ -9,9 +9,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Without this the token carries the repository default, which on an untouched
+# repo is write on contents — handed to third-party actions pinned to mutable
+# tags. No job here pushes anything.
+permissions:
+  contents: read
+
 jobs:
   secret-scan:
     runs-on: ubuntu-latest
+    # gitleaks-action reports its findings as a pull request comment.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,7 +98,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsodium-dev
       - name: Unit tests
         run: ./gradlew testDebugUnitTest --no-daemon
-      - name: Debug APK (release update asset is debug-signed)
+      # No emulator runs here, so the four androidTest suites would rot unseen
+      # until someone opened Android Studio; compiling them is the cheap half.
+      # tools/release-apk.sh carries the on-device half as a release step.
+      - name: Compile instrumented tests
+        run: ./gradlew assembleDebugAndroidTest --no-daemon
+      - name: Debug APK (compile check; releases are signed by tools/release-apk.sh)
         run: ./gradlew assembleDebug --no-daemon
 
   crypto-core:
@@ -104,3 +119,10 @@ jobs:
           workspaces: crypto-core
       - name: cargo test
         run: cargo test --quiet
+      # tests/wasm_browser.rs is #![cfg(target_arch = "wasm32")], so the run
+      # above compiles it to an empty binary and asserts nothing. Type-check the
+      # wasm-bindgen adapter at least, before the PWA starts linking it.
+      - name: cargo check (wasm32)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --target wasm32-unknown-unknown --all-targets

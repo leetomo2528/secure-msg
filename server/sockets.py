@@ -24,14 +24,13 @@ import config
 import store
 # The REST and socket paths validate the same wire format; one decoder
 # means a length or charset change cannot land on only one of them.
-from auth import _valid_b64u as valid_b64u, verify_jwt
+from auth import PHONE_RE, _valid_b64u as valid_b64u, verify_jwt
 from flask import request
 from flask_socketio import SocketIO, join_room
 from flask_socketio import disconnect as disconnect_client
 from rate_limit import check as rate_limit
 
 log = logging.getLogger("securemsg.sockets")
-PHONE_RE = re.compile(r"\+?[0-9*#]{3,24}", re.ASCII)
 
 _socketio_ref: SocketIO | None = None
 
@@ -117,7 +116,10 @@ def attach_socketio(app, socketio: SocketIO) -> None:
     _socketio_ref = socketio
     clients: dict[str, tuple[int, str, int, int, int]] = {}
 
-    def current_client() -> tuple[int, str, int] | None:
+    def current_client() -> tuple[int, str, dict] | None:
+        """The device row travels with the caller: every store.get_device_by_sid
+        opens its own sqlite connection, and the per-handler re-reads only
+        repeated the check insert_message makes inside its own write lock."""
         record = clients.get(request.sid)
         if not record:
             return None
@@ -140,7 +142,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             # terminated; clients keep their local keys and re-login).
             disconnect_client()
             return None
-        return uid, sid, device_id
+        return uid, sid, device
 
     @socketio.on("connect")
     def _connect(auth=None):
@@ -200,7 +202,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         client = current_client()
         if not client:
             return {"ok": False, "error": "unauthenticated"}
-        uid, sid, _device_id = client
+        uid, sid, sender_device = client
         retry_after = rate_limit("message-send", sid, 120, 60)
         if retry_after:
             return {
@@ -230,8 +232,12 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if not isinstance(payload["keys"], dict) or not payload["keys"]:
             return {"ok": False, "error": "payload.keys must be a non-empty dict"}
         try:
+            # allow_nan=False: json.dumps would otherwise emit the non-JSON
+            # tokens NaN/Infinity, and one stored row carrying either breaks
+            # every client's JSON.parse of the whole history page for good,
+            # since nothing deletes a message row.
             encoded_payload = json.dumps(
-                payload, separators=(",", ":"), ensure_ascii=False
+                payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False
             )
         except (TypeError, ValueError):
             return {"ok": False, "error": "payload must be JSON serializable"}
@@ -249,12 +255,6 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if client_mid:
             existing = store.get_message_by_sender_mid(sid, client_mid)
             if existing:
-                sender_device = store.get_device_by_sid(sid)
-                if not sender_device or sender_device["user_id"] != uid:
-                    return {
-                        "ok": False,
-                        "error": "sender device is revoked or unknown",
-                    }
                 if not store.message_retry_matches(
                     existing,
                     cid=cid,
@@ -285,9 +285,6 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             ):
                 return {"ok": False, "error": "invalid wrapped key"}
 
-        sender_device = store.get_device_by_sid(sid)
-        if not sender_device or sender_device["user_id"] != uid:
-            return {"ok": False, "error": "sender device is revoked or unknown"}
         created_at = store.now()
         try:
             msg_id, seq, inserted = store.insert_message(
@@ -330,23 +327,23 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         client = current_client()
         if not client or not isinstance(data, dict):
             return
-        uid, sid, device_id = client
+        uid, _sid, device = client
         cid = data.get("cid")
+        if not isinstance(cid, str) or not (1 <= len(cid) <= 64):
+            return
         seq = _parse_positive_seq(data.get("seq"))
         if seq is None:
             return
         conv = store.get_conversation_by_cid(cid)
         if not conv:
             return
-        members = store.list_members(conv["id"])
-        if not any(member["user_id"] == uid for member in members):
+        # Unlike the fan-out handlers this one never addresses the member
+        # devices, so it must not pay to materialize the key directory.
+        if not store.is_conversation_member(conv["id"], uid):
             return
         if seq > store.max_seq(conv["id"]):
             return
-        dev = store.get_device_by_sid(sid)
-        if not dev or dev["user_id"] != uid or dev["id"] != device_id:
-            return
-        store.set_cursor(dev["id"], conv["id"], seq)
+        store.set_cursor(device["id"], conv["id"], seq)
 
     @socketio.on("carrier_status")
     def _carrier_status(data: dict):
@@ -360,10 +357,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         client = current_client()
         if not client or not isinstance(data, dict):
             return {"ok": False, "error": "unauthenticated"}
-        uid, sid, device_id = client
-        device = store.get_device_by_sid(sid)
-        if not device or device["id"] != device_id or device["user_id"] != uid:
-            return {"ok": False, "error": "device revoked or unknown"}
+        uid, sid, device = client
         if device.get("kind") != "android_gateway":
             return {"ok": False, "error": "Android gateway required"}
         cid = data.get("cid")
@@ -418,7 +412,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         client = current_client()
         if not client or not isinstance(data, dict):
             return
-        uid, sid, _device_id = client
+        uid, sid, _device = client
         cid = data.get("cid")
         if not isinstance(cid, str) or not (1 <= len(cid) <= 64):
             return
@@ -427,7 +421,7 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         if rate_limit("typing", sid, 120, 60):
             return
         is_typing = data["is_typing"]
-        conv = store.get_conversation_by_cid(cid) if cid else None
+        conv = store.get_conversation_by_cid(cid)
         if not conv:
             return
         members = store.list_members(conv["id"])
