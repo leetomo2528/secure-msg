@@ -116,6 +116,15 @@ interface CursorRow {
    * notification at all. Keeping the floor lets a later sync re-read them.
    */
   retry_from?: number | null;
+  /**
+   * Highest sequence the user has actually looked at in this conversation.
+   * Distinct from `last_seq`, which only says the row reached this device:
+   * a message can be delivered, stored and never opened, and that is exactly
+   * the state the sidebar has to advertise. Absent on rows written before
+   * unread counts existed, where `last_seq` is the honest fallback — treating
+   * those as unread would mark every old thread new on the first upgrade.
+   */
+  read_seq?: number | null;
 }
 
 export interface BlockRow {
@@ -552,8 +561,94 @@ export async function setCursor(cid: string, last_seq: number): Promise<void> {
     cid,
     last_seq: Math.max(existing?.last_seq ?? 0, last_seq),
     retry_from: existing?.retry_from ?? null,
+    // Seed an upgraded row from the cursor as it stands BEFORE this advance.
+    // Reading it lazily instead would peg "read" to a value that climbs with
+    // every delivery, so no message could ever be unread; seeding it from the
+    // post-advance value would swallow the very rows this call is acking.
+    read_seq: existing?.read_seq ?? existing?.last_seq ?? 0,
   });
   await tx.done;
+}
+
+/**
+ * Highest sequence of `cid` actually on disk here, 0 when the thread is empty.
+ *
+ * The delivery cursor and the rows are written by two separate transactions
+ * (putMessage, then setCursor), so anything that clears the store between them
+ * — a second tab logging out mid-sync — leaves a cursor that outran its own
+ * messages. Every later pull asks the relay for `seq > cursor`, so those rows
+ * are never offered again and the thread is short a message for good. Reading
+ * the real high-water mark is what lets the sync notice and re-read.
+ */
+export async function highestStoredSeq(cid: string): Promise<number> {
+  const d = await db();
+  const cursor = await d
+    .transaction("messages")
+    .store.index("by-cid-seq")
+    .openCursor(
+      IDBKeyRange.bound([cid, Number.NEGATIVE_INFINITY], [cid, Number.POSITIVE_INFINITY]),
+      "prev",
+    );
+  return cursor?.value.seq ?? 0;
+}
+
+/** Remember that everything up to `seq` in `cid` has been seen by the user. */
+export async function markConversationRead(cid: string, seq: number): Promise<void> {
+  const d = await db();
+  const tx = d.transaction("cursors", "readwrite");
+  const existing = await tx.store.get(cid);
+  await tx.store.put({
+    cid,
+    last_seq: existing?.last_seq ?? 0,
+    retry_from: existing?.retry_from ?? null,
+    read_seq: Math.max(existing?.read_seq ?? 0, seq),
+  });
+  await tx.done;
+}
+
+export interface ConversationSummary {
+  lastSeq: number;
+  /** Milliseconds, matching MessageRow.created_at. */
+  lastAt: number;
+  preview: string;
+  unread: number;
+}
+
+/**
+ * Per-conversation arrival state for the sidebar, read straight from the rows.
+ *
+ * Kept out of the server's conversation list on purpose: the relay stores only
+ * ciphertext, so the newest line of a thread exists nowhere but here. Blocked
+ * rows are skipped so a filtered message never surfaces as a preview, and the
+ * user's own messages never count as unread.
+ */
+export async function conversationSummaries(
+  mySid: string,
+): Promise<Record<string, ConversationSummary>> {
+  const d = await db();
+  const [rows, cursors] = await Promise.all([d.getAll("messages"), d.getAll("cursors")]);
+  const readSeq = new Map<string, number>();
+  for (const row of cursors) readSeq.set(row.cid, row.read_seq ?? row.last_seq ?? 0);
+  const out: Record<string, ConversationSummary> = {};
+  for (const row of rows) {
+    if (row.blocked) continue;
+    const summary =
+      out[row.cid] ?? (out[row.cid] = { lastSeq: 0, lastAt: 0, preview: "", unread: 0 });
+    if (row.seq > summary.lastSeq) {
+      summary.lastSeq = row.seq;
+      summary.lastAt = row.created_at;
+      summary.preview = previewOf(row);
+    }
+    if (row.sender_sid !== mySid && row.seq > (readSeq.get(row.cid) ?? 0)) summary.unread += 1;
+  }
+  return out;
+}
+
+function previewOf(row: MessageRow): string {
+  const text = row.plaintext.trim();
+  if (text) return row.subject ? `${row.subject} — ${text}` : text;
+  if (row.subject) return row.subject;
+  return row.attachments?.length ? "(첨부파일)" : "";
 }
 
 /** Lowest sequence in `cid` this device pulled but could not decrypt. */
@@ -567,7 +662,12 @@ export async function setUndecryptableFloor(cid: string, seq: number | null): Pr
   const d = await db();
   const tx = d.transaction("cursors", "readwrite");
   const existing = await tx.store.get(cid);
-  await tx.store.put({ cid, last_seq: existing?.last_seq ?? 0, retry_from: seq });
+  await tx.store.put({
+    cid,
+    last_seq: existing?.last_seq ?? 0,
+    retry_from: seq,
+    read_seq: existing?.read_seq ?? null,
+  });
   await tx.done;
 }
 

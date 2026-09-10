@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { useStore } from "../store/useStore";
-import { searchMessages, type MessageRow } from "../store/db";
+import { useStore, type Conversation } from "../store/useStore";
+import { searchMessages, type ConversationSummary, type MessageRow } from "../store/db";
 import { conversationDisplayName } from "../store/helpers";
 import { ownedSmsPhone } from "../store/conversationPolicy";
 
 export default function ChatList() {
   const conversations = useStore((s) => s.conversations);
+  const convMeta = useStore((s) => s.convMeta);
   const username = useStore((s) => s.username);
   const activeCid = useStore((s) => s.activeCid);
   const selectConversation = useStore((s) => s.selectConversation);
@@ -29,6 +30,13 @@ export default function ChatList() {
     refreshConversations();
   }, [refreshConversations]);
 
+  // The relay orders threads by when the CONVERSATION was created, which for
+  // an SMS thread is the day the number first wrote — so a reply years later
+  // does not move it. Order by the newest message this device holds instead,
+  // falling back to the server's date for a thread with nothing readable yet.
+  const ordered = [...conversations].sort(
+    (a, b) => activityAt(b, convMeta[b.cid]) - activityAt(a, convMeta[a.cid]),
+  );
   const q = query.trim().toLowerCase();
   const convHits = q
     ? conversations.filter((c) =>
@@ -117,9 +125,12 @@ export default function ChatList() {
           아직 대화가 없습니다.
         </li>
       )}
-      {conversations.map((c) => {
+      {ordered.map((c) => {
         const display = conversationDisplayName(c);
         const active = activeCid === c.cid;
+        const meta = convMeta[c.cid];
+        const unread = active ? 0 : meta?.unread ?? 0;
+        const fallback = ownedSmsPhone(c, username) ? "SMS" : `SecureMsg · ${c.members.length}명`;
         return (
           <li key={c.cid}>
             <button
@@ -135,11 +146,25 @@ export default function ChatList() {
                     {display}
                   </span>
                   <span className="shrink-0 text-[10px] text-tx-4">
-                    {new Date(c.created_at * 1000).toLocaleDateString("ko-KR", { month: "short", day: "numeric" })}
+                    {formatStamp(activityAt(c, meta))}
                   </span>
                 </div>
-                <div className="mt-0.5 truncate text-[11px] text-tx-4">
-                  {ownedSmsPhone(c, username) ? "SMS" : `SecureMsg · ${c.members.length}명`}
+                <div className="mt-0.5 flex items-center gap-2">
+                  <span
+                    className={`min-w-0 flex-1 truncate text-[11px] ${
+                      unread > 0 ? "font-semibold text-tx-2" : "text-tx-4"
+                    }`}
+                  >
+                    {meta?.preview || fallback}
+                  </span>
+                  {unread > 0 && (
+                    <span
+                      aria-label={`읽지 않은 메시지 ${unread}개`}
+                      className="grid h-[18px] min-w-[18px] shrink-0 place-items-center rounded-full bg-brand-gradient px-1 text-[10px] font-bold text-white"
+                    >
+                      {unread > 99 ? "99+" : unread}
+                    </span>
+                  )}
                 </div>
               </div>
             </button>
@@ -150,6 +175,24 @@ export default function ChatList() {
       )}
     </div>
   );
+}
+
+/** Milliseconds of a thread's newest activity, message first, creation last. */
+function activityAt(conv: Conversation, meta?: ConversationSummary): number {
+  return meta?.lastAt || conv.created_at * 1000;
+}
+
+/** Today reads as a clock time; anything older as a date. */
+function formatStamp(ms: number): string {
+  const at = new Date(ms);
+  const now = new Date();
+  const sameDay =
+    at.getFullYear() === now.getFullYear() &&
+    at.getMonth() === now.getMonth() &&
+    at.getDate() === now.getDate();
+  return sameDay
+    ? at.toLocaleTimeString("ko-KR", { hour: "numeric", minute: "2-digit" })
+    : at.toLocaleDateString("ko-KR", { month: "short", day: "numeric" });
 }
 
 function hueOf(seed: string): number {

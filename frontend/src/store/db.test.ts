@@ -12,6 +12,9 @@ import {
   listBlockedSenders,
   getCursor,
   getMeta,
+  highestStoredSeq,
+  markConversationRead,
+  conversationSummaries,
   listMessages,
   putMessage,
   setBlocked,
@@ -161,6 +164,76 @@ describe("cursors", () => {
     expect(await getCursor("c_cursor")).toBe(5);
     await setCursor("c_cursor", 9);
     expect(await getCursor("c_cursor")).toBe(9);
+  });
+
+  it("reports the highest seq actually stored, not the cursor", async () => {
+    await putMessage(msg("c_top", 1));
+    await putMessage(msg("c_top", 2));
+    await setCursor("c_top", 7);
+    expect(await getCursor("c_top")).toBe(7);
+    expect(await highestStoredSeq("c_top")).toBe(2);
+    expect(await highestStoredSeq("c_top_empty")).toBe(0);
+  });
+
+  it("seeds read_seq from the pre-advance cursor so old threads are not unread", async () => {
+    // The upgrade case: a row written before unread counts existed.
+    await setCursor("c_read", 4);
+    await putMessage(msg("c_read", 5, { sender_sid: "dev_peer" }));
+    await setCursor("c_read", 5);
+    const summaries = await conversationSummaries("dev_me");
+    expect(summaries["c_read"].unread).toBe(1);
+    expect(summaries["c_read"].lastSeq).toBe(5);
+  });
+
+  it("clears the unread count once the conversation is marked read", async () => {
+    await putMessage(msg("c_seen", 1, { sender_sid: "dev_peer" }));
+    await setCursor("c_seen", 1);
+    expect((await conversationSummaries("dev_me"))["c_seen"].unread).toBe(1);
+    await markConversationRead("c_seen", 1);
+    expect((await conversationSummaries("dev_me"))["c_seen"].unread).toBe(0);
+    // Marking read must not rewind, and must leave the delivery cursor alone.
+    await markConversationRead("c_seen", 0);
+    expect((await conversationSummaries("dev_me"))["c_seen"].unread).toBe(0);
+    expect(await getCursor("c_seen")).toBe(1);
+  });
+});
+
+describe("conversation summaries", () => {
+  it("previews the newest readable line and ignores our own messages", async () => {
+    await putMessage(msg("c_sum", 1, { sender_sid: "dev_peer", plaintext: "먼저 온 문자" }));
+    await putMessage(msg("c_sum", 2, { sender_sid: "dev_me", plaintext: "내가 보낸 답장" }));
+    const summaries = await conversationSummaries("dev_me");
+    expect(summaries["c_sum"].preview).toBe("내가 보낸 답장");
+    expect(summaries["c_sum"].lastSeq).toBe(2);
+    // Only the peer's message counts toward the badge.
+    expect(summaries["c_sum"].unread).toBe(1);
+  });
+
+  it("never leaks a blocked message into the sidebar", async () => {
+    await putMessage(msg("c_blk", 1, { sender_sid: "dev_peer", plaintext: "보이는 문자" }));
+    await putMessage(
+      msg("c_blk", 2, { sender_sid: "dev_peer", plaintext: "차단된 문자", blocked: true }),
+    );
+    const summaries = await conversationSummaries("dev_me");
+    expect(summaries["c_blk"].preview).toBe("보이는 문자");
+    expect(summaries["c_blk"].lastSeq).toBe(1);
+    expect(summaries["c_blk"].unread).toBe(1);
+  });
+
+  it("falls back to the subject, then to an attachment marker", async () => {
+    await putMessage(
+      msg("c_mms", 1, { sender_sid: "dev_peer", plaintext: "", subject: "사진첨부" }),
+    );
+    expect((await conversationSummaries("dev_me"))["c_mms"].preview).toBe("사진첨부");
+    await putMessage(
+      msg("c_mms", 2, {
+        sender_sid: "dev_peer",
+        plaintext: "   ",
+        subject: null,
+        attachments: [{ name: "a.png", content_type: "image/png", data: "", size: 0 }],
+      }),
+    );
+    expect((await conversationSummaries("dev_me"))["c_mms"].preview).toBe("(첨부파일)");
   });
 });
 

@@ -13,7 +13,7 @@ import {
 } from "../crypto/keys";
 import { deviceFingerprint, signDeviceApproval } from "../crypto/deviceTrust";
 import { api, getSocket, setSocketBase } from "../net/api";
-import { pinTrustedDirectory } from "../store/db";
+import { db, getCursor, listMessages, pinTrustedDirectory } from "../store/db";
 import { useStore } from "../store/useStore";
 import { shareHistoryWithDevice } from "../store/historyShare";
 
@@ -203,6 +203,30 @@ describe("phone ↔ web relay interlock", () => {
     expect(relayed).toBeTruthy();
     expect(relayed!.sender_sid).toBe(gwSid);
     expect(relayed!.blocked).toBeFalsy();
+  }, 60_000);
+
+  it("re-reads a message the local store lost while the cursor stayed ahead", async () => {
+    // Half of a sync that something interrupted: the row is gone from disk,
+    // the delivery cursor still says it arrived. clearSessionData() is
+    // origin-wide while a security context is per-tab, so a second tab
+    // logging out between putMessage and setCursor leaves exactly this. The
+    // relay only ever returns `seq > cursor`, so without reconciliation the
+    // message is gone for good — notified once, then absent from the thread.
+    const before = await listMessages(smsCid);
+    const victim = before[before.length - 1];
+    expect(victim).toBeTruthy();
+    const cursorBefore = await getCursor(smsCid);
+    expect(cursorBefore).toBeGreaterThanOrEqual(victim.seq);
+
+    await (await db()).delete("messages", victim.id);
+    expect((await listMessages(smsCid)).some((m) => m.seq === victim.seq)).toBe(false);
+
+    await useStore.getState().syncConversation(smsCid);
+
+    const healed = (await listMessages(smsCid)).find((m) => m.seq === victim.seq);
+    expect(healed?.plaintext).toBe(victim.plaintext);
+    // Healing re-reads below the cursor; it must never rewind it.
+    expect(await getCursor(smsCid)).toBe(cursorBefore);
   }, 60_000);
 
   it("block keyword added on web is visible to the gateway device", async () => {

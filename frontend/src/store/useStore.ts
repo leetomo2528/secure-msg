@@ -49,6 +49,9 @@ import {
   setCarrierStatus,
   getCursor,
   setCursor,
+  highestStoredSeq,
+  markConversationRead,
+  conversationSummaries,
   getUndecryptableFloor,
   setUndecryptableFloor,
   addBlockKeyword,
@@ -65,6 +68,7 @@ import {
   type MessageRow,
   type BlockRow,
   type SenderRow,
+  type ConversationSummary,
   type MessageAttachment,
   pinTrustedDirectory,
   pinTrustedDirectories,
@@ -168,6 +172,17 @@ interface State {
   conversations: Conversation[];
   activeCid: string | null;
   activeMessages: MessageRow[];
+  /**
+   * Newest line, its time and the unread count per conversation, keyed by cid.
+   *
+   * Without it an arrival is invisible unless the affected thread happens to
+   * be the one on screen: the sync writes the row to IndexedDB and the only
+   * state it touches is `activeMessages`, which a closed thread never reads.
+   * The desktop notification fires precisely when the app is NOT being looked
+   * at, so the two conditions are complementary and the sidebar would sit
+   * unchanged next to a notification about a message it is not showing.
+   */
+  convMeta: Record<string, ConversationSummary>;
   /** Live QR pairing session + registration challenge while this device awaits approval. */
   pendingPairing: { pairingId: string; nonceApprover: string; expiresAt: number } | null;
   pendingChallenge: string | null;
@@ -200,6 +215,8 @@ interface State {
   newSmsConversation: (phone: string) => Promise<string | null>;
   selectConversation: (cid: string) => Promise<void>;
   syncConversation: (cid: string, context?: SecurityContext) => Promise<void>;
+  /** Recompute the sidebar's arrival state from the rows on disk. */
+  refreshConvMeta: () => Promise<void>;
   send: (cid: string, text: string) => Promise<boolean>;
   sendContent: (cid: string, content: RelayContent) => Promise<boolean>;
   addBlock: (kw: string) => Promise<void>;
@@ -226,6 +243,7 @@ export const useStore = create<State>((set, get) => ({
   conversations: [],
   activeCid: null,
   activeMessages: [],
+  convMeta: {},
   pendingPairing: null,
   pendingChallenge: null,
   blockKeywords: [],
@@ -542,6 +560,12 @@ export const useStore = create<State>((set, get) => ({
     } else {
       set({ error: r.error || "대화 목록을 불러오지 못했습니다" });
     }
+    // The relay knows nothing about message bodies or read state, so the list
+    // it just returned carries no arrival information at all. Fill that in
+    // from disk on the same pass, or a reload shows every thread as if it had
+    // never received anything until each one is synced.
+    if (!sameContext(context)) return;
+    await get().refreshConvMeta();
   },
 
   newConversation: async (members) => {
@@ -586,6 +610,15 @@ export const useStore = create<State>((set, get) => ({
     // header. Guard the async result against the still-active conversation.
     set({ activeCid: cid, activeMessages: [] });
     await refreshActiveMessages(cid, () => sameContext(context));
+    if (!sameContext(context)) return;
+    // Clear the badge from what is already on disk before the pull, so opening
+    // a thread reads as read immediately rather than after a network round
+    // trip; the sync marks the newly arrived tail read on its way out.
+    const seen = await highestStoredSeq(cid);
+    if (!sameContext(context)) return;
+    await markConversationRead(cid, seen);
+    if (!sameContext(context)) return;
+    await get().refreshConvMeta();
     if (!sameContext(context)) return;
     await queueConversationSync(cid, context);
   },
@@ -635,10 +668,24 @@ export const useStore = create<State>((set, get) => ({
       mr.members.filter((m) => m.kind === "android_gateway").map((m) => m.sid),
     );
     const pageSize = 200;
-    const startCursor = await getCursor(cid);
+    const deliveredCursor = await getCursor(cid);
     if (!canUseCrypto(context)) return;
     const previousFloor = await getUndecryptableFloor(cid);
     if (!canUseCrypto(context)) return;
+    // A cursor ahead of the rows actually held here hides them permanently:
+    // every pull asks for `seq > cursor`, so the relay never offers them
+    // again even though it still has them. The two writes are separate
+    // transactions (putMessage, then setCursor), and clearSessionData() is
+    // origin-wide while the security context is per-tab, so a second tab
+    // logging out between them leaves exactly that state. Fall back to the
+    // real high-water mark on disk — unless the re-read floor already
+    // accounts for the gap, in which case those rows are undecryptable
+    // rather than lost and re-downloading them every pass buys nothing.
+    const storedTop = await highestStoredSeq(cid);
+    if (!canUseCrypto(context)) return;
+    const gapIsUnexplained =
+      storedTop < deliveredCursor && (previousFloor == null || previousFloor > storedTop + 1);
+    const startCursor = gapIsUnexplained ? storedTop : deliveredCursor;
     // Keys another device shared for old messages arrive with no event of any
     // kind, and this device's cursor has long since moved past them, so the
     // gap is only ever found by looking again. Re-reading from the floor on
@@ -726,7 +773,10 @@ export const useStore = create<State>((set, get) => ({
           [content.subject, content.text].filter(Boolean).join("\n"),
           blockKeywords,
         ).blocked && !(senderBlocked && gatewaySids.has(sm.sender_sid));
-        if (shouldShow && sm.seq > startCursor && sm.sender_sid !== mySid) {
+        // Gated on the DELIVERED cursor, not the healed start: a row being
+        // re-read to repair a gap was already acked once, and notifying for
+        // it again would announce the repair rather than a new message.
+        if (shouldShow && sm.seq > deliveredCursor && sm.sender_sid !== mySid) {
           notifyBody = content.text || content.subject || "(첨부파일)";
           notifyIsIncoming = true;
         }
@@ -764,9 +814,34 @@ export const useStore = create<State>((set, get) => ({
     // Re-read state: the `me` snapshot predates the pagination loop, and the
     // user may have switched conversations while pages were being pulled.
     await refreshActiveMessages(cid, () => canUseCrypto(context));
+    // A thread the user is looking at is read by definition; anything else
+    // keeps its unread count so the sidebar can say a message landed.
+    if (canUseCrypto(context) && useStore.getState().activeCid === cid) {
+      const seen = await highestStoredSeq(cid);
+      if (!await runSessionEffect(context, () => markConversationRead(cid, seen))) return;
+    }
+    if (!canUseCrypto(context)) return;
+    await get().refreshConvMeta();
     if (canUseCrypto(context) && notifyIsIncoming && notifyBody != null) {
       maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody);
     }
+  },
+
+  refreshConvMeta: async () => {
+    const context = captureSecurityContext();
+    if (!canUseCrypto(context)) return;
+    const mySid = context.sid;
+    if (!mySid) return;
+    let summaries: Record<string, ConversationSummary>;
+    try {
+      summaries = await conversationSummaries(mySid);
+    } catch {
+      // A sidebar without previews is a worse UI, not a broken one; never let
+      // a read failure here take down the sync pass that called it.
+      return;
+    }
+    if (!sameContext(context)) return;
+    set({ convMeta: summaries });
   },
 
   send: async (cid, text) => {
@@ -1429,6 +1504,7 @@ function clearedSessionState() {
     conversations: [],
     activeCid: null,
     activeMessages: [],
+    convMeta: {},
     // Both describe a pending device's in-flight approval. Carrying them into
     // the next registration renders the QR with the NEW device's keys under
     // the OLD challenge, which the approver is told to read as an attack.
