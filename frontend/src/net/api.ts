@@ -324,6 +324,12 @@ export interface ServerMessage {
   sender_pub_key?: string;
   payload: Envelope;
   created_at: number;
+  /**
+   * The sending client's own idempotency key. Presentation hint only: it is
+   * outside the sealed envelope, so it may be read to place a bubble but never
+   * to decide anything that matters.
+   */
+  client_mid?: string | null;
   carrier_status?: string;
   carrier_error?: string | null;
   carrier_updated_at?: number | null;

@@ -16,6 +16,8 @@ import type { DeviceKeypair } from "../crypto/keys";
 import { serverDirectoryHash } from "../crypto/deviceTrust";
 import { isSecurityMode, type SecurityMode } from "../net/api";
 import { normalizePhone } from "./conversationPolicy";
+// Type-only in the other direction, so this stays a one-way dependency.
+import { messageDirection } from "./helpers";
 
 interface MetaRow {
   key: "current";
@@ -89,6 +91,16 @@ export interface MessageRow {
   sender_sid: string;
   plaintext: string;
   created_at: number;
+  /**
+   * Which way this message travelled, when that is knowable.
+   *
+   * `sender_sid` cannot answer it for an SMS thread: the Android gateway relays
+   * both the texts it receives from the carrier and the ones the owner types on
+   * the phone, and both arrive under the gateway's own sid. Left undefined for
+   * rows stored before this existed and for anything genuinely unclassifiable —
+   * never guess, an unknown row keeps the old neutral rendering.
+   */
+  direction?: "in" | "out";
   blocked?: boolean;
   content_type?: "text" | "mms";
   subject?: string | null;
@@ -545,6 +557,52 @@ export async function setCarrierStatus(
   await tx.done;
 }
 
+/**
+ * True while any stored row of `cid` has no direction on it.
+ *
+ * Rows written before direction existed cannot be re-derived locally — the
+ * signal lives on the server row, not in the sealed body — so the one-time
+ * backfill has to re-read them. Asking this first keeps that pass free on
+ * every later run: it stops at the first classified row and costs no network.
+ */
+export async function hasUnclassifiedMessages(cid: string): Promise<boolean> {
+  const d = await db();
+  let cursor = await d
+    .transaction("messages")
+    .store.index("by-cid")
+    .openCursor(IDBKeyRange.only(cid));
+  while (cursor) {
+    if (cursor.value.direction == null) return true;
+    cursor = await cursor.continue();
+  }
+  return false;
+}
+
+/**
+ * Stamp direction onto rows that are already stored, touching nothing else.
+ *
+ * Deliberately not a putMessage: the backfill knows only what the relay row
+ * says, and re-writing the body from it would undo a locally applied blocklist
+ * decision or a fresher carrier state.
+ */
+export async function patchMessageDirections(
+  cid: string,
+  entries: { seq: number; direction: "in" | "out" }[],
+): Promise<number> {
+  if (!entries.length) return 0;
+  const d = await db();
+  const tx = d.transaction("messages", "readwrite");
+  let patched = 0;
+  for (const entry of entries) {
+    const existing = await tx.store.get(msgKey(cid, entry.seq));
+    if (!existing || existing.direction != null) continue;
+    await tx.store.put({ ...existing, direction: entry.direction });
+    patched += 1;
+  }
+  await tx.done;
+  return patched;
+}
+
 // ----- cursors ----------------------------------------------------------
 
 export async function getCursor(cid: string): Promise<number> {
@@ -634,12 +692,18 @@ export async function conversationSummaries(
     if (row.blocked) continue;
     const summary =
       out[row.cid] ?? (out[row.cid] = { lastSeq: 0, lastAt: 0, preview: "", unread: 0 });
+    const outgoing = messageDirection(row, mySid) === "out";
     if (row.seq > summary.lastSeq) {
       summary.lastSeq = row.seq;
       summary.lastAt = row.created_at;
-      summary.preview = previewOf(row);
+      // Marked in the list too: the preview line is often the only thing the
+      // owner reads, and "who said this" is half of what it has to convey.
+      summary.preview = outgoing ? `나: ${previewOf(row)}` : previewOf(row);
     }
-    if (row.sender_sid !== mySid && row.seq > (readSeq.get(row.cid) ?? 0)) summary.unread += 1;
+    // Only what someone else sent can be unread. A text the owner typed on
+    // their own phone comes back through the gateway under its sid, and the
+    // sender check alone would badge the owner's own messages.
+    if (!outgoing && row.seq > (readSeq.get(row.cid) ?? 0)) summary.unread += 1;
   }
   return out;
 }

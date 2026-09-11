@@ -1693,8 +1693,15 @@ def fetch_messages_since(
 ) -> list[dict[str, Any]]:
     with conn_ctx() as c:
         rows = c.execute(
+            # client_mid rides along so a client can tell a message the gateway
+            # RECEIVED from one it SENT: the phone mints "in_<hash>" for carrier
+            # traffic and a UUID for its own sends, and both arrive under the
+            # gateway's sender_sid, which on its own cannot separate them. It is
+            # a presentation hint only — the value is outside the AEAD and the
+            # relay only ever shape-checks it, so nothing security-bearing may
+            # rest on it.
             "SELECT id, seq, conv_id, sender_id, sender_sid, sender_pub_key, payload, created_at, "
-            "carrier_status, carrier_error, carrier_updated_at "
+            "client_mid, carrier_status, carrier_error, carrier_updated_at "
             "FROM messages WHERE conv_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
             (conv_id, since_seq, limit),
         ).fetchall()

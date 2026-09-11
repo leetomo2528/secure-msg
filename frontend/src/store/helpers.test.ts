@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   conversationDisplayName,
+  directionFromMid,
   matchesBlockedSender,
+  messageDirection,
 } from "./helpers";
 import type { SenderRow } from "./db";
 
@@ -53,4 +55,33 @@ describe("cross-device contact display names", () => {
     expect(conversationDisplayName(undefined, "?")).toBe("?");
   });
 
+});
+
+describe("SMS direction", () => {
+  // The gateway relays both halves of a phone thread under its own sid, so the
+  // only thing separating them on the wire is the shape of the id it minted.
+  const RECEIVED = "in_" + "a3f0".repeat(15) + "b";
+  const SENT = "7f3a1c22-9b0e-4d5a-8c11-2e6f90ab34cd";
+
+  it("reads the gateway's own id shapes", () => {
+    expect(directionFromMid(RECEIVED)).toBe("in");
+    expect(directionFromMid(SENT)).toBe("out");
+  });
+
+  it("refuses to guess on anything else", () => {
+    for (const value of [null, undefined, "", "relay-e2e-mid-00000001", "in", "INBOX"]) {
+      expect(directionFromMid(value)).toBeNull();
+    }
+  });
+
+  it("prefers a stored direction over the sender", () => {
+    expect(messageDirection({ direction: "in", sender_sid: "sid-me" }, "sid-me")).toBe("in");
+    expect(messageDirection({ direction: "out", sender_sid: "sid-gw" }, "sid-me")).toBe("out");
+  });
+
+  it("falls back to this device, then admits it does not know", () => {
+    expect(messageDirection({ sender_sid: "sid-me" }, "sid-me")).toBe("out");
+    expect(messageDirection({ sender_sid: "sid-gw" }, "sid-me")).toBe("unknown");
+    expect(messageDirection({ sender_sid: "sid-gw" }, null)).toBe("unknown");
+  });
 });

@@ -1322,6 +1322,11 @@ class ServerSmokeTest(unittest.TestCase):
                 "sender_pub_key",
                 "payload",
                 "created_at",
+                # The sending client's own idempotency key. The web reads its
+                # shape to place a bubble: an SMS the gateway received and one
+                # it sent both arrive under the gateway's sid, and this is the
+                # only thing that separates them.
+                "client_mid",
                 "carrier_status",
                 "carrier_error",
                 "carrier_updated_at",

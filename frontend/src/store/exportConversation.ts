@@ -4,6 +4,9 @@
  * state it could not be tested at all.
  */
 import type { MessageRow } from "./db";
+import { messageDirection } from "./helpers";
+
+const DIRECTION_LABEL = { out: "sent", in: "received", unknown: "unknown" } as const;
 
 export interface ConversationExport {
   filename: string;
@@ -36,7 +39,12 @@ export function buildConversationExport(
   if (format === "json") {
     const messages = visible.map((m) => ({
       seq: m.seq,
-      mine: m.sender_sid === mySid,
+      // Three-valued on purpose. A row the gateway relayed before direction
+      // was recorded is genuinely unclassifiable, and an export that calls it
+      // "sent" states something nobody knows. `mine` stays for compatibility
+      // with exports already taken, and answers the narrower question.
+      direction: messageDirection(m, mySid),
+      mine: messageDirection(m, mySid) === "out",
       text: m.plaintext,
       subject: m.subject ?? undefined,
       content_type: m.content_type ?? "text",
@@ -56,7 +64,7 @@ export function buildConversationExport(
     ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
     ...visible.map((m) => [
       String(m.seq),
-      m.sender_sid === mySid ? "sent" : "received",
+      DIRECTION_LABEL[messageDirection(m, mySid)],
       esc(m.subject ?? ""),
       esc(m.plaintext),
       m.carrier_status ?? "",

@@ -229,6 +229,38 @@ describe("phone ↔ web relay interlock", () => {
     expect(await getCursor(smsCid)).toBe(cursorBefore);
   }, 60_000);
 
+  it("tells a text the gateway received from one the owner sent on the phone", async () => {
+    // Both arrive under the gateway's sid, so the sender cannot separate them.
+    // The phone's own idempotency key can: "in_<hash>" is minted on exactly one
+    // code path, the carrier-receive, and its sends use a UUID.
+    const members = await fetchJson(`${BASE}/api/conversation/${smsCid}/members`, {
+      headers: { Authorization: `Bearer ${gwToken}` },
+    });
+    const recipients = (members.members as Array<{ sid: string; pub_key: string }>)
+      .map((m) => ({ sid: m.sid, pub_key: m.pub_key }));
+    const relay = async (text: string, mid: string): Promise<number> => {
+      const envelope = await encryptMessage(
+        JSON.stringify({ v: 1, type: "text", text }), recipients, gwKeys!,
+      );
+      const ack = await new Promise<any>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("ack timeout")), 10_000);
+        gwSocket!.emit(
+          "message_send", { cid: smsCid, mid, payload: envelope },
+          (response: any) => { clearTimeout(timer); resolve(response); },
+        );
+      });
+      expect(ack.ok).toBe(true);
+      return ack.seq as number;
+    };
+    const inboundSeq = await relay("상대가 보낸 문자", `in_${"b4c1".repeat(15)}d`);
+    const outboundSeq = await relay("내가 폰에서 보낸 문자", "8c2f1a90-4d77-4b21-9f0e-1a2b3c4d5e6f");
+
+    await useStore.getState().syncConversation(smsCid);
+    const rows = await listMessages(smsCid);
+    expect(rows.find((m) => m.seq === inboundSeq)?.direction).toBe("in");
+    expect(rows.find((m) => m.seq === outboundSeq)?.direction).toBe("out");
+  }, 60_000);
+
   it("block keyword added on web is visible to the gateway device", async () => {
     await useStore.getState().addBlock("e2e차단키워드");
     // Server-side shared state (what every other device pulls).

@@ -73,6 +73,44 @@ export function isSafeMimeType(value: string): boolean {
     && value.length <= 120;
 }
 
+/**
+ * Direction inferred from the sending client's idempotency key.
+ *
+ * The Android gateway mints `in_<sha256 prefix>` for anything the carrier
+ * delivered and a UUID for a message it sent itself, so the two shapes are a
+ * function of which code path created the row. A UUID cannot start with `in_`
+ * (it holds no `i`, `n` or `_`), so the two tests cannot both match.
+ *
+ * This value rides OUTSIDE the sealed envelope, so the relay could rewrite it.
+ * It is a display hint and a way to classify history that predates the sealed
+ * `dir` field — never a security boundary. Anything unrecognised stays null so
+ * the caller renders it neutrally instead of guessing a side.
+ */
+export function directionFromMid(mid: string | null | undefined): "in" | "out" | null {
+  if (!mid) return null;
+  if (mid.startsWith("in_")) return "in";
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mid)) return "out";
+  return null;
+}
+
+/**
+ * Which side of the thread a stored message belongs on.
+ *
+ * `sender_sid` alone cannot answer this for an SMS thread — the gateway relays
+ * the owner's own texts under the same sid as the peer's — so it is only the
+ * fallback for messages this browser sent itself. "unknown" is a real answer
+ * and must stay distinguishable from "received": a row of unknown direction
+ * renders on the neutral side but must never be exported as if we knew.
+ */
+export function messageDirection(
+  message: { direction?: "in" | "out"; sender_sid: string },
+  mySid: string | null,
+): "in" | "out" | "unknown" {
+  if (message.direction === "in" || message.direction === "out") return message.direction;
+  if (mySid && message.sender_sid === mySid) return "out";
+  return "unknown";
+}
+
 /** Exported for unit tests. Parses the decrypted relay JSON with hard limits. */
 export function decodeRelayContent(value: string): RelayContent {
   try {
@@ -106,6 +144,11 @@ export function decodeRelayContent(value: string): RelayContent {
         type: parsed.type,
         text: parsed.text,
         subject: typeof parsed.subject === "string" ? parsed.subject.slice(0, MAX_SUBJECT_CHARS) : undefined,
+        // Optional, and deliberately NOT a version bump: both decoders reject
+        // anything but v:1 and fall through to rendering the raw JSON as the
+        // message body, so a v:2 would turn every message into gibberish on a
+        // client that has not updated. An unknown key is simply ignored there.
+        dir: parsed.dir === "in" || parsed.dir === "out" ? parsed.dir : undefined,
         attachments,
       };
     }

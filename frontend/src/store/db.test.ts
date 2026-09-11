@@ -203,10 +203,22 @@ describe("conversation summaries", () => {
     await putMessage(msg("c_sum", 1, { sender_sid: "dev_peer", plaintext: "먼저 온 문자" }));
     await putMessage(msg("c_sum", 2, { sender_sid: "dev_me", plaintext: "내가 보낸 답장" }));
     const summaries = await conversationSummaries("dev_me");
-    expect(summaries["c_sum"].preview).toBe("내가 보낸 답장");
+    // Marked so the list says who spoke last, not just what was said.
+    expect(summaries["c_sum"].preview).toBe("나: 내가 보낸 답장");
     expect(summaries["c_sum"].lastSeq).toBe(2);
     // Only the peer's message counts toward the badge.
     expect(summaries["c_sum"].unread).toBe(1);
+  });
+
+  it("marks a text the gateway relayed from the owner's own phone", async () => {
+    // Same sender_sid as the peer's messages; only `direction` separates them.
+    await putMessage(msg("c_gw", 1, { sender_sid: "dev_gateway", direction: "in", plaintext: "받은 문자" }));
+    await putMessage(msg("c_gw", 2, { sender_sid: "dev_gateway", direction: "out", plaintext: "폰에서 보낸 문자" }));
+    await setCursor("c_gw", 0);
+    const summaries = await conversationSummaries("dev_me");
+    expect(summaries["c_gw"].preview).toBe("나: 폰에서 보낸 문자");
+    // Only the received one is unread; the owner's own text is not news.
+    expect(summaries["c_gw"].unread).toBe(1);
   });
 
   it("never leaks a blocked message into the sidebar", async () => {

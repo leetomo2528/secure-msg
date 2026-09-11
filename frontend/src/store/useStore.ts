@@ -49,6 +49,8 @@ import {
   setCarrierStatus,
   getCursor,
   setCursor,
+  hasUnclassifiedMessages,
+  patchMessageDirections,
   highestStoredSeq,
   markConversationRead,
   conversationSummaries,
@@ -88,6 +90,8 @@ import {
   MAX_SUBJECT_CHARS,
   MAX_TEXT_CHARS,
   matchesBlockedSender,
+  messageDirection,
+  directionFromMid,
   ruleToKeywordRow,
   ruleToSenderRow,
 } from "./helpers";
@@ -129,6 +133,13 @@ export interface RelayContent {
   type: "text" | "mms";
   text: string;
   subject?: string;
+  /**
+   * Which way the message travelled, sealed inside the envelope so the relay
+   * can neither read nor forge it. Optional: it stays absent on everything
+   * relayed before the field existed, and on clients that have not shipped it
+   * yet. Stays under `v: 1` on purpose — see decodeRelayContent.
+   */
+  dir?: "in" | "out";
   attachments?: MessageAttachment[];
 }
 
@@ -217,6 +228,8 @@ interface State {
   syncConversation: (cid: string, context?: SecurityContext) => Promise<void>;
   /** Recompute the sidebar's arrival state from the rows on disk. */
   refreshConvMeta: () => Promise<void>;
+  /** Stamp direction onto history stored before the field existed. */
+  backfillDirections: () => Promise<void>;
   send: (cid: string, text: string) => Promise<boolean>;
   sendContent: (cid: string, content: RelayContent) => Promise<boolean>;
   addBlock: (kw: string) => Promise<void>;
@@ -776,7 +789,24 @@ export const useStore = create<State>((set, get) => ({
         // Gated on the DELIVERED cursor, not the healed start: a row being
         // re-read to repair a gap was already acked once, and notifying for
         // it again would announce the repair rather than a new message.
-        if (shouldShow && sm.seq > deliveredCursor && sm.sender_sid !== mySid) {
+        // Sealed field first, relay-supplied id shape second, nothing third.
+        // Resolved once here rather than at render: the mid is not persisted,
+        // so a later read would have no way to work it out again.
+        //
+        // The id shape is read ONLY for our own account's devices. Every other
+        // client mints a UUID too — a peer's browser included — so applying it
+        // more widely would put someone else's message on our side. Within the
+        // account it is unambiguous: `in_` is minted on exactly one code path,
+        // the gateway's carrier-receive, and nothing else ever writes it.
+        const direction =
+          content.dir
+          ?? (sm.sender_id === context.uid ? directionFromMid(sm.client_mid) : null)
+          ?? undefined;
+        // A text the owner typed on their own phone arrives under the gateway's
+        // sid like any other relayed message, so the old sender check announced
+        // the owner's own messages back to them.
+        if (shouldShow && sm.seq > deliveredCursor
+          && messageDirection({ direction, sender_sid: sm.sender_sid }, mySid) === "in") {
           notifyBody = content.text || content.subject || "(첨부파일)";
           notifyIsIncoming = true;
         }
@@ -784,6 +814,7 @@ export const useStore = create<State>((set, get) => ({
         const wrote = await runSessionEffect(context, () => putMessage({
           id: "", seq: sm.seq, cid, sender_id: sm.sender_id,
           sender_sid: sm.sender_sid, plaintext: content.text, created_at: sm.created_at * 1000,
+          direction,
           blocked: !shouldShow, content_type: content.type, subject: content.subject ?? null,
           attachments: content.attachments, carrier_status: sm.carrier_status ?? "none",
           carrier_error: sm.carrier_error,
@@ -825,6 +856,57 @@ export const useStore = create<State>((set, get) => ({
     if (canUseCrypto(context) && notifyIsIncoming && notifyBody != null) {
       maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody);
     }
+  },
+
+  backfillDirections: async () => {
+    // Rows stored before direction existed carry none, and it cannot be worked
+    // out from what is on disk — the signal is a server column, not part of the
+    // sealed body. So re-read the relay's metadata for those threads and stamp
+    // the rows in place.
+    //
+    // Nothing here decrypts, advances a cursor, or notifies: a full re-sync
+    // would do the job too, but rewinding the cursor re-announces months of
+    // history as if it had just arrived. Conversations that are already
+    // classified cost one indexed read and no network, so this is safe to run
+    // on every login rather than behind a flag that can go stale.
+    const context = captureSecurityContext();
+    if (!canUseCrypto(context)) return;
+    for (const conv of useStore.getState().conversations) {
+      if (!canUseCrypto(context)) return;
+      let unclassified: boolean;
+      try {
+        unclassified = await hasUnclassifiedMessages(conv.cid);
+      } catch {
+        continue;
+      }
+      if (!unclassified) continue;
+      let cursor = 0;
+      while (true) {
+        if (!canUseCrypto(context)) return;
+        const page = await api.fetchMessages(conv.cid, cursor, 200);
+        if (!canUseCrypto(context)) return;
+        if (!page.ok || !page.messages || page.messages.length === 0) break;
+        const entries: { seq: number; direction: "in" | "out" }[] = [];
+        let maxSeq = cursor;
+        for (const sm of page.messages) {
+          maxSeq = Math.max(maxSeq, sm.seq);
+          // Same restriction as the live ingest: only our own gateway's id
+          // shapes mean anything, every other client mints a UUID too.
+          if (sm.sender_id !== context.uid) continue;
+          const direction = directionFromMid(sm.client_mid);
+          if (direction) entries.push({ seq: sm.seq, direction });
+        }
+        const stamped = await runSessionEffect(
+          context,
+          async () => { await patchMessageDirections(conv.cid, entries); },
+        );
+        if (!stamped) return;
+        if (page.messages.length < 200 || maxSeq <= cursor) break;
+        cursor = maxSeq;
+      }
+    }
+    if (!sameContext(context)) return;
+    await get().refreshConvMeta();
   },
 
   refreshConvMeta: async () => {
@@ -908,6 +990,10 @@ export const useStore = create<State>((set, get) => ({
         type: content.type,
         text: content.text,
         ...(content.subject ? { subject: content.subject } : {}),
+        // Sealed, so every device that opens this envelope agrees on the side
+        // it belongs on without trusting the relay. Older clients ignore the
+        // key; `v` deliberately stays 1 so they keep parsing the rest.
+        dir: "out",
         attachments: content.attachments ?? [],
       });
       const socket = liveSocket();
@@ -949,6 +1035,7 @@ export const useStore = create<State>((set, get) => ({
       const wrote = await runSessionEffect(context, () => putMessage({
         id: "", seq: sentSeq, cid, sender_id: me.uid!,
         sender_sid: context.sid!, plaintext: content.text, created_at: Date.now(),
+        direction: "out",
         blocked: false, content_type: content.type, subject: content.subject ?? null,
         attachments: content.attachments ?? [],
         carrier_status: isSms ? "queued" : "none",
@@ -1171,6 +1258,11 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   await me.refreshBlocklist();
   if (!canUseCrypto(context)) return;
   await me.refreshConversations();
+  if (!canUseCrypto(context)) return;
+  // Before the socket: the sidebar and every thread read direction off the
+  // stored rows, so history that predates the field should be classified
+  // before the user can look at it. Costs nothing once it has run.
+  await me.backfillDirections();
   if (!canUseCrypto(context)) return;
   // Wire socket.
   const socket = liveSocket();

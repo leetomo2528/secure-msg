@@ -56,10 +56,22 @@ describe("CSV export", () => {
     expect(csvBody([row()]).startsWith("\uFEFF")).toBe(true);
   });
 
-  it("labels direction by sender, not by order", () => {
-    const [mine, theirs] = csvCells([row(), row({ seq: 2, sender_sid: "sid-peer" })]);
+  it("labels direction from the stored direction, not from the sender", () => {
+    // Both of these came from the Android gateway's sid: the sender says
+    // nothing about which way an SMS travelled.
+    const [sent, received] = csvCells([
+      row({ sender_sid: "sid-gateway", direction: "out" }),
+      row({ seq: 2, sender_sid: "sid-gateway", direction: "in" }),
+    ]);
+    expect(sent).toContain(",sent,");
+    expect(received).toContain(",received,");
+  });
+
+  it("falls back to this device's sid, and admits when nothing knows", () => {
+    const [mine, unclassified] = csvCells([row(), row({ seq: 2, sender_sid: "sid-peer" })]);
     expect(mine).toContain(",sent,");
-    expect(theirs).toContain(",received,");
+    // Pre-direction history: calling this "received" would be a guess.
+    expect(unclassified).toContain(",unknown,");
   });
 
   it("omits blocked rows", () => {

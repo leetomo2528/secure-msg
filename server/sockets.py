@@ -309,6 +309,10 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             "sender_sid": sid,
             "sender_pub_key": sender_device["pub_key"],
             "payload": payload,
+            # Mirrors fetch_messages_since: the live event and the history pull
+            # must describe a message identically, or a client classifies the
+            # same row differently depending on which path delivered it.
+            "client_mid": client_mid,
             # Must be the stored row's timestamp, not a fresh now(): history pull
             # returns the stored value and clients reconcile live events against it.
             "created_at": created_at,

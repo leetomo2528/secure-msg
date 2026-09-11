@@ -5,6 +5,7 @@ import type { MessageAttachment } from "../store/db";
 import { Avatar } from "./ChatList";
 import {
   conversationDisplayName,
+  messageDirection,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
 } from "../store/helpers";
@@ -209,7 +210,10 @@ export default function ChatView({ cid }: { cid: string }) {
               </div>
             );
           }
-          const mine = m.sender_sid === sid;
+          // "unknown" renders like a received message rather than guessing a
+          // side, but the carrier line below still shows, so a misplaced row
+          // stays recognisable instead of hiding the evidence.
+          const mine = messageDirection(m, sid) === "out";
           return (
             <div key={`${m.cid}:${m.seq}`} className={`flex animate-rise ${mine ? "justify-end" : "justify-start"}`}>
               <div
@@ -226,7 +230,7 @@ export default function ChatView({ cid }: { cid: string }) {
                 ))}
                 <div className={`mt-1.5 text-[10px] tabular-nums ${mine ? "text-white/60" : "text-tx-4"}`}>
                   {new Date(m.created_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
-                  {mine && m.carrier_status && m.carrier_status !== "none" && ` · ${carrierLabel(m.carrier_status)}`}
+                  {m.carrier_status && m.carrier_status !== "none" && ` · ${carrierLabel(m.carrier_status)}`}
                 </div>
               </div>
             </div>
