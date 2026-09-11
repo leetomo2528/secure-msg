@@ -3,6 +3,7 @@ import { buildConversationExport } from "./exportConversation";
 import type { MessageRow } from "./db";
 
 const MY_SID = "sid-me";
+const MY_UID = 1;
 const AT = new Date("2026-03-14T08:09:10.000Z");
 
 function row(overrides: Partial<MessageRow> = {}): MessageRow {
@@ -19,7 +20,7 @@ function row(overrides: Partial<MessageRow> = {}): MessageRow {
 }
 
 function csvBody(rows: MessageRow[]): string {
-  return buildConversationExport(rows, MY_SID, "+821012345678", "csv", AT).body;
+  return buildConversationExport(rows, MY_SID, MY_UID, "+821012345678", "csv", AT).body;
 }
 
 function csvCells(rows: MessageRow[]): string[] {
@@ -85,7 +86,8 @@ describe("JSON export", () => {
   it("omits blocked rows and reports the surviving count", () => {
     const out = buildConversationExport(
       [row(), row({ seq: 2, plaintext: "스팸", blocked: true })],
-      MY_SID, "엄마", "json", AT,
+      MY_SID,
+      MY_UID, "엄마", "json", AT,
     );
     const parsed = JSON.parse(out.body);
     expect(parsed.count).toBe(1);
@@ -96,7 +98,7 @@ describe("JSON export", () => {
 
   it("defaults content_type to text and keeps carrier status", () => {
     const out = buildConversationExport(
-      [row({ carrier_status: "delivered" })], MY_SID, "엄마", "json", AT,
+      [row({ carrier_status: "delivered" })], MY_SID, MY_UID, "엄마", "json", AT,
     );
     const parsed = JSON.parse(out.body);
     expect(parsed.messages[0].content_type).toBe("text");
@@ -106,19 +108,19 @@ describe("JSON export", () => {
 
 describe("export filename", () => {
   it("keeps Korean letters and digits, replacing everything else", () => {
-    const out = buildConversationExport([], MY_SID, "엄마 (집)", "csv", AT);
+    const out = buildConversationExport([], MY_SID, MY_UID, "엄마 (집)", "csv", AT);
     expect(out.filename).toBe("securemsg-엄마__집_-2026-03-14.csv");
   });
 
   it("keeps a phone identity readable and matches the format", () => {
-    expect(buildConversationExport([], MY_SID, "+821012345678", "csv", AT).filename)
+    expect(buildConversationExport([], MY_SID, MY_UID, "+821012345678", "csv", AT).filename)
       .toBe("securemsg-+821012345678-2026-03-14.csv");
-    expect(buildConversationExport([], MY_SID, "+821012345678", "json", AT).filename)
+    expect(buildConversationExport([], MY_SID, MY_UID, "+821012345678", "json", AT).filename)
       .toBe("securemsg-+821012345678-2026-03-14.json");
   });
 
   it("never lets a title escape into a path", () => {
-    const out = buildConversationExport([], MY_SID, "../../etc/passwd", "csv", AT);
+    const out = buildConversationExport([], MY_SID, MY_UID, "../../etc/passwd", "csv", AT);
     expect(out.filename).not.toContain("/");
     expect(out.filename).not.toContain("..");
   });

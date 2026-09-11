@@ -26,6 +26,7 @@ function esc(value: string): string {
 export function buildConversationExport(
   rows: MessageRow[],
   mySid: string | null,
+  myUid: number | null,
   title: string,
   format: "csv" | "json",
   now: Date = new Date(),
@@ -43,8 +44,8 @@ export function buildConversationExport(
       // was recorded is genuinely unclassifiable, and an export that calls it
       // "sent" states something nobody knows. `mine` stays for compatibility
       // with exports already taken, and answers the narrower question.
-      direction: messageDirection(m, mySid),
-      mine: messageDirection(m, mySid) === "out",
+      direction: messageDirection(m, mySid, myUid),
+      mine: messageDirection(m, mySid, myUid) === "out",
       text: m.plaintext,
       subject: m.subject ?? undefined,
       content_type: m.content_type ?? "text",
@@ -64,7 +65,7 @@ export function buildConversationExport(
     ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
     ...visible.map((m) => [
       String(m.seq),
-      DIRECTION_LABEL[messageDirection(m, mySid)],
+      DIRECTION_LABEL[messageDirection(m, mySid, myUid)],
       esc(m.subject ?? ""),
       esc(m.plaintext),
       m.carrier_status ?? "",

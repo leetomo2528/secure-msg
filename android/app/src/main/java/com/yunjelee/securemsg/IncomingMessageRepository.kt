@@ -76,7 +76,17 @@ class IncomingMessageRepository(
                     mid = mid,
                     cid = thread.cid,
                     payload = "",
-                    plaintext = encoded,
+                    // Deliberately NOT `encoded`: the relayed body carries the
+                    // sealed direction, while the identity above must keep
+                    // hashing the direction-less encoding. Feeding `dir` into
+                    // the mid would re-key every incoming message at the
+                    // upgrade boundary and let an in-flight one relay twice.
+                    // Nothing downstream re-hashes this column — it is read
+                    // only to encrypt (SmsBridgeService) and to re-read the
+                    // content for a carrier send — so the two may diverge.
+                    plaintext = RelayContentCodec.encode(
+                        content.copy(direction = RelayContentCodec.DIR_IN),
+                    ),
                     contentType = content.type,
                     subject = content.subject,
                     attachmentsJson = attachmentsJson,

@@ -4,6 +4,7 @@ import {
   directionFromMid,
   matchesBlockedSender,
   messageDirection,
+  recordedDirection,
 } from "./helpers";
 import type { SenderRow } from "./db";
 
@@ -83,5 +84,42 @@ describe("SMS direction", () => {
     expect(messageDirection({ sender_sid: "sid-me" }, "sid-me")).toBe("out");
     expect(messageDirection({ sender_sid: "sid-gw" }, "sid-me")).toBe("unknown");
     expect(messageDirection({ sender_sid: "sid-gw" }, null)).toBe("unknown");
+  });
+});
+
+describe("what direction gets recorded", () => {
+  const MID_IN = "in_" + "a3f0".repeat(15) + "b";
+  const MID_OUT = "7f3a1c22-9b0e-4d5a-8c11-2e6f90ab34cd";
+  const ME = 7;
+
+  it("records our own account's sealed direction and id shape", () => {
+    expect(recordedDirection("out", MID_IN, ME, ME)).toBe("out");
+    expect(recordedDirection(undefined, MID_IN, ME, ME)).toBe("in");
+    expect(recordedDirection(undefined, MID_OUT, ME, ME)).toBe("out");
+  });
+
+  it("records nothing for another account, however it sealed the message", () => {
+    // A peer's browser seals dir:"out" on their own sends and mints UUID ids
+    // just like ours. Trusting either would put their message on our side.
+    expect(recordedDirection("out", MID_OUT, 9, ME)).toBeUndefined();
+    expect(recordedDirection("in", MID_IN, 9, ME)).toBeUndefined();
+    expect(recordedDirection(undefined, MID_OUT, 9, ME)).toBeUndefined();
+  });
+
+  it("records nothing when we do not know our own account", () => {
+    expect(recordedDirection("out", MID_OUT, ME, null)).toBeUndefined();
+    expect(recordedDirection("out", MID_OUT, ME, undefined)).toBeUndefined();
+  });
+
+  it("records nothing when the id has no recognisable shape", () => {
+    expect(recordedDirection(undefined, "relay-e2e-mid-00000001", ME, ME)).toBeUndefined();
+    expect(recordedDirection(undefined, null, ME, ME)).toBeUndefined();
+  });
+
+  it("reads an unrecorded peer message as received, our own device as unknown", () => {
+    // The account id is the only thing left once nothing was recorded.
+    expect(messageDirection({ sender_sid: "sid-peer", sender_id: 9 }, "sid-me", ME)).toBe("in");
+    expect(messageDirection({ sender_sid: "sid-mine-2", sender_id: ME }, "sid-me", ME)).toBe("unknown");
+    expect(messageDirection({ sender_sid: "sid-me", sender_id: ME }, "sid-me", ME)).toBe("out");
   });
 });

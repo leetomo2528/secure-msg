@@ -50,6 +50,8 @@ import {
   getCursor,
   setCursor,
   hasUnclassifiedMessages,
+  isDirectionBackfilled,
+  markDirectionBackfilled,
   patchMessageDirections,
   highestStoredSeq,
   markConversationRead,
@@ -91,7 +93,7 @@ import {
   MAX_TEXT_CHARS,
   matchesBlockedSender,
   messageDirection,
-  directionFromMid,
+  recordedDirection,
   ruleToKeywordRow,
   ruleToSenderRow,
 } from "./helpers";
@@ -798,15 +800,16 @@ export const useStore = create<State>((set, get) => ({
         // more widely would put someone else's message on our side. Within the
         // account it is unambiguous: `in_` is minted on exactly one code path,
         // the gateway's carrier-receive, and nothing else ever writes it.
-        const direction =
-          content.dir
-          ?? (sm.sender_id === context.uid ? directionFromMid(sm.client_mid) : null)
-          ?? undefined;
+        const direction = recordedDirection(
+          content.dir, sm.client_mid, sm.sender_id, context.uid,
+        );
         // A text the owner typed on their own phone arrives under the gateway's
         // sid like any other relayed message, so the old sender check announced
         // the owner's own messages back to them.
         if (shouldShow && sm.seq > deliveredCursor
-          && messageDirection({ direction, sender_sid: sm.sender_sid }, mySid) === "in") {
+          && messageDirection(
+            { direction, sender_sid: sm.sender_sid, sender_id: sm.sender_id }, mySid, context.uid,
+          ) !== "out") {
           notifyBody = content.text || content.subject || "(첨부파일)";
           notifyIsIncoming = true;
         }
@@ -873,13 +876,17 @@ export const useStore = create<State>((set, get) => ({
     if (!canUseCrypto(context)) return;
     for (const conv of useStore.getState().conversations) {
       if (!canUseCrypto(context)) return;
-      let unclassified: boolean;
+      let skip: boolean;
       try {
-        unclassified = await hasUnclassifiedMessages(conv.cid);
+        // The marker, not the row scan, is what ends this. Some rows can never
+        // be classified — a peer's message, or one whose relay id has no
+        // recognisable shape — and scanning alone would re-read those threads
+        // in full on every login to write nothing.
+        skip = await isDirectionBackfilled(conv.cid) || !await hasUnclassifiedMessages(conv.cid);
       } catch {
         continue;
       }
-      if (!unclassified) continue;
+      if (skip) continue;
       let cursor = 0;
       while (true) {
         if (!canUseCrypto(context)) return;
@@ -890,10 +897,11 @@ export const useStore = create<State>((set, get) => ({
         let maxSeq = cursor;
         for (const sm of page.messages) {
           maxSeq = Math.max(maxSeq, sm.seq);
-          // Same restriction as the live ingest: only our own gateway's id
-          // shapes mean anything, every other client mints a UUID too.
-          if (sm.sender_id !== context.uid) continue;
-          const direction = directionFromMid(sm.client_mid);
+          // Same rule as the live ingest, from the same helper: a peer's row
+          // is left unrecorded rather than guessed at.
+          const direction = recordedDirection(
+            undefined, sm.client_mid, sm.sender_id, context.uid,
+          );
           if (direction) entries.push({ seq: sm.seq, direction });
         }
         const stamped = await runSessionEffect(
@@ -904,6 +912,7 @@ export const useStore = create<State>((set, get) => ({
         if (page.messages.length < 200 || maxSeq <= cursor) break;
         cursor = maxSeq;
       }
+      if (!await runSessionEffect(context, () => markDirectionBackfilled(conv.cid))) return;
     }
     if (!sameContext(context)) return;
     await get().refreshConvMeta();
@@ -916,7 +925,7 @@ export const useStore = create<State>((set, get) => ({
     if (!mySid) return;
     let summaries: Record<string, ConversationSummary>;
     try {
-      summaries = await conversationSummaries(mySid);
+      summaries = await conversationSummaries(mySid, context.uid);
     } catch {
       // A sidebar without previews is a worse UI, not a broken one; never let
       // a read failure here take down the sync pass that called it.

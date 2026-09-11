@@ -19,12 +19,27 @@ data class RelayContent(
     val type: String = "text",
     val text: String,
     val subject: String? = null,
+    /**
+     * "in" for something the carrier delivered, "out" for something this
+     * account sent. Sealed inside the envelope so the relay can neither read
+     * nor forge it: every message this gateway relays — received and sent
+     * alike — reaches the other devices under this gateway's own sid, and
+     * without this they cannot tell the two apart.
+     *
+     * Null on anything minted before the field existed, and deliberately
+     * omitted from [encode] when null so an identity hash taken over the
+     * encoding of a direction-less content stays byte-identical to what
+     * earlier builds produced.
+     */
+    val direction: String? = null,
     val attachments: List<RelayAttachment> = emptyList(),
 )
 
 object RelayContentCodec {
     const val TYPE_TEXT = "text"
     const val TYPE_MMS = "mms"
+    const val DIR_IN = "in"
+    const val DIR_OUT = "out"
     const val MAX_ATTACHMENT_BYTES = 512 * 1024
     const val MAX_ATTACHMENTS = 8
 
@@ -58,10 +73,16 @@ object RelayContentCodec {
             )
         }
         return JSONObject()
+            // Stays 1 even though this now carries `dir`. Both decoders reject
+            // any other version and fall back to rendering the raw JSON as the
+            // message body, so bumping it would turn every message into
+            // gibberish on a client that has not updated yet; an unknown key,
+            // by contrast, is simply ignored by both.
             .put("v", 1)
             .put("type", content.type)
             .put("text", content.text)
             .putOpt("subject", content.subject?.take(120))
+            .putOpt("dir", content.direction?.takeIf { it == DIR_IN || it == DIR_OUT })
             .put("attachments", attachments)
             .toString()
     }
@@ -106,6 +127,7 @@ object RelayContentCodec {
             type = type,
             text = obj.optString("text").take(20_000),
             subject = obj.optString("subject").take(120).takeIf { it.isNotBlank() },
+            direction = obj.optString("dir").takeIf { it == DIR_IN || it == DIR_OUT },
             attachments = out,
         )
     }

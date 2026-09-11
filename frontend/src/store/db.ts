@@ -137,6 +137,15 @@ interface CursorRow {
    * those as unread would mark every old thread new on the first upgrade.
    */
   read_seq?: number | null;
+  /**
+   * Set once the one-time direction backfill has read this conversation.
+   *
+   * Without it the pass repeats forever on any thread holding a row it can
+   * never classify — a peer's message, or one whose relay id has no
+   * recognisable shape. "Is anything unclassified?" stays true, so every login
+   * re-downloads the whole history to write nothing.
+   */
+  dir_backfilled?: boolean;
 }
 
 export interface BlockRow {
@@ -624,6 +633,7 @@ export async function setCursor(cid: string, last_seq: number): Promise<void> {
     // every delivery, so no message could ever be unread; seeding it from the
     // post-advance value would swallow the very rows this call is acking.
     read_seq: existing?.read_seq ?? existing?.last_seq ?? 0,
+    dir_backfilled: existing?.dir_backfilled ?? false,
   });
   await tx.done;
 }
@@ -650,6 +660,27 @@ export async function highestStoredSeq(cid: string): Promise<number> {
   return cursor?.value.seq ?? 0;
 }
 
+/** True once the direction backfill has already read `cid` from the relay. */
+export async function isDirectionBackfilled(cid: string): Promise<boolean> {
+  const row = await (await db()).get("cursors", cid);
+  return row?.dir_backfilled === true;
+}
+
+/** Record that `cid` has been through the backfill, however little it stamped. */
+export async function markDirectionBackfilled(cid: string): Promise<void> {
+  const d = await db();
+  const tx = d.transaction("cursors", "readwrite");
+  const existing = await tx.store.get(cid);
+  await tx.store.put({
+    cid,
+    last_seq: existing?.last_seq ?? 0,
+    retry_from: existing?.retry_from ?? null,
+    read_seq: existing?.read_seq ?? null,
+    dir_backfilled: true,
+  });
+  await tx.done;
+}
+
 /** Remember that everything up to `seq` in `cid` has been seen by the user. */
 export async function markConversationRead(cid: string, seq: number): Promise<void> {
   const d = await db();
@@ -660,6 +691,7 @@ export async function markConversationRead(cid: string, seq: number): Promise<vo
     last_seq: existing?.last_seq ?? 0,
     retry_from: existing?.retry_from ?? null,
     read_seq: Math.max(existing?.read_seq ?? 0, seq),
+    dir_backfilled: existing?.dir_backfilled ?? false,
   });
   await tx.done;
 }
@@ -682,6 +714,7 @@ export interface ConversationSummary {
  */
 export async function conversationSummaries(
   mySid: string,
+  myUid?: number | null,
 ): Promise<Record<string, ConversationSummary>> {
   const d = await db();
   const [rows, cursors] = await Promise.all([d.getAll("messages"), d.getAll("cursors")]);
@@ -692,7 +725,7 @@ export async function conversationSummaries(
     if (row.blocked) continue;
     const summary =
       out[row.cid] ?? (out[row.cid] = { lastSeq: 0, lastAt: 0, preview: "", unread: 0 });
-    const outgoing = messageDirection(row, mySid) === "out";
+    const outgoing = messageDirection(row, mySid, myUid) === "out";
     if (row.seq > summary.lastSeq) {
       summary.lastSeq = row.seq;
       summary.lastAt = row.created_at;
@@ -731,6 +764,7 @@ export async function setUndecryptableFloor(cid: string, seq: number | null): Pr
     last_seq: existing?.last_seq ?? 0,
     retry_from: seq,
     read_seq: existing?.read_seq ?? null,
+    dir_backfilled: existing?.dir_backfilled ?? false,
   });
   await tx.done;
 }

@@ -27,7 +27,9 @@ object OutgoingSmsDispatcher {
         require(text.length <= 20_000) { "SMS body is too long" }
 
         val db = AppDatabase.get(context)
-        val content = RelayContentCodec.text(text)
+        // Sealed direction: this row reaches every other device under the
+        // gateway's own sid, exactly like an SMS the carrier delivered.
+        val content = RelayContentCodec.text(text).copy(direction = RelayContentCodec.DIR_OUT)
         val contentJson = RelayContentCodec.encode(content)
         val mid = UUID.randomUUID().toString()
         // The presentation row and the durable outbox row must appear or fail

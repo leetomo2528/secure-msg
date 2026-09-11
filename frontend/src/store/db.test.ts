@@ -12,8 +12,12 @@ import {
   listBlockedSenders,
   getCursor,
   getMeta,
+  getUndecryptableFloor,
+  setUndecryptableFloor,
   highestStoredSeq,
+  isDirectionBackfilled,
   markConversationRead,
+  markDirectionBackfilled,
   conversationSummaries,
   listMessages,
   putMessage,
@@ -195,6 +199,26 @@ describe("cursors", () => {
     await markConversationRead("c_seen", 0);
     expect((await conversationSummaries("dev_me"))["c_seen"].unread).toBe(0);
     expect(await getCursor("c_seen")).toBe(1);
+  });
+});
+
+describe("direction backfill marker", () => {
+  it("survives every other write to the cursor row", async () => {
+    // Without a marker the backfill re-reads a whole conversation on every
+    // login whenever one row can never be classified — a peer's message, or a
+    // relay id with no recognisable shape.
+    await setCursor("c_mark", 3);
+    expect(await isDirectionBackfilled("c_mark")).toBe(false);
+    await markDirectionBackfilled("c_mark");
+    expect(await isDirectionBackfilled("c_mark")).toBe(true);
+
+    await setCursor("c_mark", 9);
+    await markConversationRead("c_mark", 9);
+    await setUndecryptableFloor("c_mark", 4);
+    expect(await isDirectionBackfilled("c_mark")).toBe(true);
+    // ...and none of them lost the rest of the row either.
+    expect(await getCursor("c_mark")).toBe(9);
+    expect(await getUndecryptableFloor("c_mark")).toBe(4);
   });
 });
 

@@ -35,6 +35,41 @@ class RelayContentTest {
     }
 
     @Test
+    fun directionRoundTripsAndStaysOutOfAnUnmarkedEncoding() {
+        val plain = RelayContentCodec.text("문자")
+        // The identity hashes for an incoming message are taken over the
+        // encoding of a direction-less content. Emitting `dir` here would
+        // re-key every one of them at the upgrade boundary.
+        assertTrue(!RelayContentCodec.encode(plain).contains("\"dir\""))
+
+        val sent = plain.copy(direction = RelayContentCodec.DIR_OUT)
+        assertEquals(RelayContentCodec.DIR_OUT, RelayContentCodec.decode(RelayContentCodec.encode(sent)).direction)
+        val received = plain.copy(direction = RelayContentCodec.DIR_IN)
+        assertEquals(RelayContentCodec.DIR_IN, RelayContentCodec.decode(RelayContentCodec.encode(received)).direction)
+    }
+
+    @Test
+    fun unknownDirectionIsRefusedRatherThanCarried() {
+        assertTrue(!RelayContentCodec.encode(RelayContentCodec.text("x").copy(direction = "sideways")).contains("dir"))
+        val decoded = RelayContentCodec.decode(
+            JSONObject().put("v", 1).put("type", RelayContentCodec.TYPE_TEXT)
+                .put("text", "x").put("dir", "sideways").toString(),
+        )
+        assertEquals(null, decoded.direction)
+    }
+
+    @Test
+    fun aDirectionBearingBodyStillOpensOnAClientThatIgnoresIt() {
+        // v stays 1 so an older build parses the body instead of rendering the
+        // raw JSON, which is what a version bump would have caused.
+        val wire = RelayContentCodec.encode(
+            RelayContentCodec.text("안녕").copy(direction = RelayContentCodec.DIR_IN),
+        )
+        assertEquals(1, JSONObject(wire).optInt("v"))
+        assertEquals("안녕", RelayContentCodec.decode(wire).text)
+    }
+
+    @Test
     fun legacyPlaintextRemainsTextContent() {
         val decoded = RelayContentCodec.decode("old message")
         assertEquals(RelayContentCodec.TYPE_TEXT, decoded.type)

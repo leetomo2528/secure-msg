@@ -97,18 +97,46 @@ export function directionFromMid(mid: string | null | undefined): "in" | "out" |
  * Which side of the thread a stored message belongs on.
  *
  * `sender_sid` alone cannot answer this for an SMS thread — the gateway relays
- * the owner's own texts under the same sid as the peer's — so it is only the
- * fallback for messages this browser sent itself. "unknown" is a real answer
- * and must stay distinguishable from "received": a row of unknown direction
- * renders on the neutral side but must never be exported as if we knew.
+ * the owner's own texts under the same sid as the peer's — so a stored
+ * `direction` comes first. That field is only ever recorded for this account's
+ * own messages: a conversation peer seals `dir: "out"` into their sends too,
+ * and taking theirs at face value would move every one of their messages onto
+ * our side of the thread.
+ *
+ * Beyond that, an account other than ours is a definite sender, while our own
+ * other device is not: it is our account but not this browser, which is why
+ * "unknown" stays a real answer. It renders on the neutral side and must never
+ * be exported as if we knew.
  */
 export function messageDirection(
-  message: { direction?: "in" | "out"; sender_sid: string },
+  message: { direction?: "in" | "out"; sender_sid: string; sender_id?: number },
   mySid: string | null,
+  myUid?: number | null,
 ): "in" | "out" | "unknown" {
   if (message.direction === "in" || message.direction === "out") return message.direction;
   if (mySid && message.sender_sid === mySid) return "out";
+  if (myUid != null && message.sender_id != null && message.sender_id !== myUid) return "in";
   return "unknown";
+}
+
+/**
+ * The direction to STORE for a relayed row, or undefined to store none.
+ *
+ * Both inputs are only meaningful for our own account. A conversation peer
+ * seals `dir: "out"` into their sends exactly as we do, and their browser mints
+ * UUID relay ids exactly as ours does, so either one read without checking the
+ * sender would put every message they send on our side of the thread — and
+ * silence its notification with it. Their messages are left unrecorded; the
+ * reader classifies them from the account id instead.
+ */
+export function recordedDirection(
+  sealed: "in" | "out" | undefined,
+  clientMid: string | null | undefined,
+  senderId: number,
+  myUid: number | null | undefined,
+): "in" | "out" | undefined {
+  if (myUid == null || senderId !== myUid) return undefined;
+  return sealed ?? directionFromMid(clientMid) ?? undefined;
 }
 
 /** Exported for unit tests. Parses the decrypted relay JSON with hard limits. */

@@ -17,6 +17,9 @@ export default function ChatView({ cid }: { cid: string }) {
   const conversations = useStore((s) => s.conversations);
   const sendContent = useStore((s) => s.sendContent);
   const sid = useStore((s) => s.sid);
+  // The account, not just this browser: a message from another account is a
+  // definite "received" even when no direction was ever recorded on it.
+  const uid = useStore((s) => s.uid);
   const username = useStore((s) => s.username);
   const [text, setText] = useState("");
   const [subject, setSubject] = useState("");
@@ -48,7 +51,7 @@ export default function ChatView({ cid }: { cid: string }) {
 
   const exportMessages = (format: "csv" | "json") => {
     setExportMenu(false);
-    const file = buildConversationExport(activeMessages, sid, title, format);
+    const file = buildConversationExport(activeMessages, sid, uid, title, format);
     downloadText(file.filename, file.mime, file.body);
   };
 
@@ -213,7 +216,7 @@ export default function ChatView({ cid }: { cid: string }) {
           // "unknown" renders like a received message rather than guessing a
           // side, but the carrier line below still shows, so a misplaced row
           // stays recognisable instead of hiding the evidence.
-          const mine = messageDirection(m, sid) === "out";
+          const mine = messageDirection(m, sid, uid) === "out";
           return (
             <div key={`${m.cid}:${m.seq}`} className={`flex animate-rise ${mine ? "justify-end" : "justify-start"}`}>
               <div

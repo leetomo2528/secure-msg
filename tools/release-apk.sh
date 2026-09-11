@@ -85,7 +85,18 @@ unzip -o -q "$OUT" 'classes*.dex' -d "$TMPD"
 # strings the incident above was about. Bounding on non-[0-9.] instead also keeps
 # the leading version family open (0.x was the whole match once) while stopping
 # "127.0.0.1" in LoginScreen from reading as a 127.0.0 release.
-REPORT="$("$DEXDUMP" -d "$TMPD"/classes*.dex 2>/dev/null | awk -v want="$VERSION" -v allow="$PREVIEW_LITERAL" '
+# LC_ALL=C is load-bearing, and not for anything under this repo's control.
+# dexdump prints string data as MUTF-8: NUL is C0 80 and anything outside the
+# BMP is a CESU-8 surrogate pair, neither of which is valid UTF-8. Under a
+# UTF-8 locale awk aborts the entire scan at the first one ("towc: multibyte
+# conversion failure") with rc 2, which `set -e` turns into a failed release
+# AFTER the APK is built and signed. The first such byte in a real build is
+# `const-string "Exif\xC0\x80\xC0\x80"` inside androidx.camera, i.e. a
+# dependency this project cannot edit, and it sits in classes.dex while every
+# app version literal lives in classes2.dex — so before this, the guard aborted
+# before reaching a single app class and silently proved nothing. The scan only
+# ever matches ASCII digits and dots, so reading bytes loses it nothing.
+REPORT="$("$DEXDUMP" -d "$TMPD"/classes*.dex 2>/dev/null | LC_ALL=C awk -v want="$VERSION" -v allow="$PREVIEW_LITERAL" '
   /Class descriptor/ { inapp = ($0 ~ /Lcom\/yunjelee\/securemsg\//) }
   inapp && /const-string/ {
     s = $0 " "
