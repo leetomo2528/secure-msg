@@ -74,6 +74,32 @@ export function isSafeMimeType(value: string): boolean {
 }
 
 /**
+ * Types rendered as a picture rather than as a download link.
+ *
+ * A fixed whitelist, not a generic `image/*` test: the content is relayed from
+ * whoever sent the SMS, and a wildcard would let them pick an exotic image
+ * type the browser treats as something else. Kept here rather than in the view
+ * because the conversation-list preview has to agree with the bubble about
+ * what counts as a photo.
+ */
+export function isInlineImage(mime: string | null | undefined): boolean {
+  return /^image\/(png|jpe?g|gif|webp|bmp)$/i.test((mime ?? "").split(";")[0].trim());
+}
+
+/**
+ * What a message with no text of its own says in a preview or a notification.
+ *
+ * An all-photo message used to read "(첨부파일)", which is what a PDF says too.
+ */
+export function attachmentPreviewLabel(
+  attachments: readonly { content_type: string }[] | null | undefined,
+): string {
+  if (!attachments?.length) return "";
+  if (!attachments.every((item) => isInlineImage(item.content_type))) return "(첨부파일)";
+  return attachments.length === 1 ? "사진" : `사진 ${attachments.length}장`;
+}
+
+/**
  * Direction inferred from the sending client's idempotency key.
  *
  * The Android gateway mints `in_<sha256 prefix>` for anything the carrier

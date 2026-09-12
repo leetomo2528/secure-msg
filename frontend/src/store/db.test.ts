@@ -256,7 +256,7 @@ describe("conversation summaries", () => {
     expect(summaries["c_blk"].unread).toBe(1);
   });
 
-  it("falls back to the subject, then to an attachment marker", async () => {
+  it("falls back to the subject, then names what was attached", async () => {
     await putMessage(
       msg("c_mms", 1, { sender_sid: "dev_peer", plaintext: "", subject: "사진첨부" }),
     );
@@ -267,6 +267,17 @@ describe("conversation summaries", () => {
         plaintext: "   ",
         subject: null,
         attachments: [{ name: "a.png", content_type: "image/png", data: "", size: 0 }],
+      }),
+    );
+    // A photo says so. "(첨부파일)" is what a PDF says, and using it for both
+    // made an image-only message indistinguishable from a document.
+    expect((await conversationSummaries("dev_me"))["c_mms"].preview).toBe("사진");
+    await putMessage(
+      msg("c_mms", 3, {
+        sender_sid: "dev_peer",
+        plaintext: "",
+        subject: null,
+        attachments: [{ name: "계약서.pdf", content_type: "application/pdf", data: "", size: 0 }],
       }),
     );
     expect((await conversationSummaries("dev_me"))["c_mms"].preview).toBe("(첨부파일)");

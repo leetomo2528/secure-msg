@@ -69,6 +69,49 @@ class RelayContentTest {
         assertEquals("안녕", RelayContentCodec.decode(wire).text)
     }
 
+    /**
+     * The identity preimage of an incoming MMS, pinned literally.
+     *
+     * Byte order is the host org.json's (a HashMap, where the platform's
+     * implementation is insertion-ordered), so what this pins is the key set
+     * and every value — which is the thing that can actually move when someone
+     * edits the receive path.
+     */
+    private val FROZEN_MMS_IDENTITY = """
+        {"attachments":[{"content_type":"image/jpeg","data":"_9j_4A","size":4,"name":"attachment-11"},{"content_type":"image/png","data":"AAECAwQ","size":5,"name":"가족.png"}],"v":1,"subject":"안부","text":"사진 보냄","type":"mms"}
+    """.trimIndent()
+
+    @Test
+    fun theIncomingMmsIdentityEncodingIsFrozen() {
+        val mms = ProviderMms(
+            id = 4242L,
+            address = "+821012345678",
+            subject = "안부",
+            body = "사진 보냄",
+            date = 1_700_000_000_000L,
+            parts = listOf(
+                ProviderMmsPart("attachment-11", "image/jpeg", byteArrayOf(-1, -40, -1, -32)),
+                ProviderMmsPart("가족.png", "image/png", byteArrayOf(0, 1, 2, 3, 4)),
+            ),
+            // The payload path's view of the same message. It carries a part the
+            // identity list never saw, and it must leave the encoding below
+            // byte-identical: that is the whole of the identity/payload split.
+            relayCandidates = listOf(
+                ProviderMmsCandidate(11L, "attachment-11", "image/jpeg", 4),
+                ProviderMmsCandidate(12L, "가족.png", "image/png", 5),
+                ProviderMmsCandidate(13L, "clip.mp4", "video/mp4", 4_000_000),
+            ),
+        )
+
+        // The executable form of "the hash input did not move". The incoming mid
+        // is sha256 over this string, and ProviderIdentityResolver derives the
+        // source fingerprint and the event key from it as well, so one byte
+        // moving here re-keys every message already in processed_mms — and the
+        // APK self-installs within twelve hours of a release, so the phone would
+        // then relay the owner a duplicate of their own recent history.
+        assertEquals(FROZEN_MMS_IDENTITY, RelayContentCodec.encode(MmsProvider.identityContent(mms)))
+    }
+
     @Test
     fun legacyPlaintextRemainsTextContent() {
         val decoded = RelayContentCodec.decode("old message")

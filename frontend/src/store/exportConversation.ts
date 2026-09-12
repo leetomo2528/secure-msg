@@ -3,8 +3,8 @@
  * has to neutralize attacker-controlled SMS text, and closed over component
  * state it could not be tested at all.
  */
-import type { MessageRow } from "./db";
-import { messageDirection } from "./helpers";
+import type { MessageAttachment, MessageRow } from "./db";
+import { attachmentPreviewLabel, messageDirection } from "./helpers";
 
 const DIRECTION_LABEL = { out: "sent", in: "received", unknown: "unknown" } as const;
 
@@ -21,6 +21,21 @@ export interface ConversationExport {
  */
 function esc(value: string): string {
   return `"${(/^[=+\-@\t\r]/.test(value) ? `'${value}` : value).replace(/"/g, '""')}"`;
+}
+
+function attachmentsOf(attachments: MessageAttachment[] | undefined) {
+  return attachments?.map((item) => ({
+    name: item.name,
+    content_type: item.content_type,
+    size: item.size,
+  }));
+}
+
+/** One CSV cell: what was attached, without the bytes. */
+function attachmentSummary(attachments: MessageAttachment[] | undefined): string {
+  if (!attachments?.length) return "";
+  const label = attachmentPreviewLabel(attachments);
+  return `${label}: ${attachments.map((item) => `${item.name} (${Math.round(item.size / 1024)}KB)`).join(", ")}`;
 }
 
 export function buildConversationExport(
@@ -49,6 +64,11 @@ export function buildConversationExport(
       text: m.plaintext,
       subject: m.subject ?? undefined,
       content_type: m.content_type ?? "text",
+      // Metadata only, never the bytes: a conversation of photos would turn a
+      // text export into tens of megabytes of base64. Naming them is still the
+      // point — an export that mentions nothing reads as a thread that never
+      // had pictures in it.
+      attachments: attachmentsOf(m.attachments),
       carrier_status: m.carrier_status,
       created_at: new Date(m.created_at).toISOString(),
     }));
@@ -62,12 +82,13 @@ export function buildConversationExport(
     };
   }
   const lines = [
-    ["seq", "direction", "subject", "text", "carrier_status", "created_at"].join(","),
+    ["seq", "direction", "subject", "text", "attachments", "carrier_status", "created_at"].join(","),
     ...visible.map((m) => [
       String(m.seq),
       DIRECTION_LABEL[messageDirection(m, mySid, myUid)],
       esc(m.subject ?? ""),
       esc(m.plaintext),
+      esc(attachmentSummary(m.attachments)),
       m.carrier_status ?? "",
       new Date(m.created_at).toISOString(),
     ].join(",")),

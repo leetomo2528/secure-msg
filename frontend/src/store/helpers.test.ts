@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  attachmentPreviewLabel,
   conversationDisplayName,
   directionFromMid,
+  isInlineImage,
   matchesBlockedSender,
   messageDirection,
   recordedDirection,
@@ -121,5 +123,43 @@ describe("what direction gets recorded", () => {
     expect(messageDirection({ sender_sid: "sid-peer", sender_id: 9 }, "sid-me", ME)).toBe("in");
     expect(messageDirection({ sender_sid: "sid-mine-2", sender_id: ME }, "sid-me", ME)).toBe("unknown");
     expect(messageDirection({ sender_sid: "sid-me", sender_id: ME }, "sid-me", ME)).toBe("out");
+  });
+});
+
+describe("attachmentPreviewLabel", () => {
+  const of = (...types: string[]) => types.map((content_type) => ({ content_type }));
+
+  it("names a photo as a photo and counts several", () => {
+    expect(attachmentPreviewLabel(of("image/jpeg"))).toBe("사진");
+    expect(attachmentPreviewLabel(of("image/jpeg", "image/png", "image/gif"))).toBe("사진 3장");
+  });
+
+  it("falls back to the generic label as soon as one attachment is not a picture", () => {
+    expect(attachmentPreviewLabel(of("image/jpeg", "application/pdf"))).toBe("(첨부파일)");
+    expect(attachmentPreviewLabel(of("text/x-vcard"))).toBe("(첨부파일)");
+  });
+
+  it("says nothing when there is nothing attached", () => {
+    expect(attachmentPreviewLabel([])).toBe("");
+    expect(attachmentPreviewLabel(null)).toBe("");
+    expect(attachmentPreviewLabel(undefined)).toBe("");
+  });
+});
+
+describe("isInlineImage", () => {
+  it("accepts the whitelist regardless of case or charset parameter", () => {
+    for (const mime of ["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/bmp"]) {
+      expect(isInlineImage(mime)).toBe(true);
+    }
+    expect(isInlineImage("IMAGE/PNG")).toBe(true);
+    expect(isInlineImage("image/jpeg; charset=binary")).toBe(true);
+  });
+
+  it("refuses anything outside it, including image types a browser may not render safely", () => {
+    // Relayed content is written by whoever sent the SMS, so this stays a
+    // whitelist: image/svg+xml is a script container, not a picture.
+    for (const mime of ["image/svg+xml", "image/heic", "application/pdf", "", null, undefined]) {
+      expect(isInlineImage(mime)).toBe(false);
+    }
   });
 });

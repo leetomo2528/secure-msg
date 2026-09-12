@@ -18,13 +18,46 @@ data class ProviderMmsPart(
     val bytes: ByteArray,
 )
 
+/**
+ * One non-text part row as the relay path sees it, recorded without reading a
+ * single byte of it.
+ *
+ * [ProviderMms.parts] and this list are deliberately not the same thing. parts
+ * is the identity preimage and may never move; this is everything the message
+ * actually carried, including the rows parts dropped for being over budget or
+ * past [RelayContentCodec.MAX_ATTACHMENTS] -- which is exactly the set that
+ * used to disappear without a word.
+ */
+data class ProviderMmsCandidate(
+    val partId: Long,
+    val name: String,
+    val contentType: String,
+    /** From openAssetFileDescriptor().length, or -1 when the provider will not say. */
+    val declaredSize: Int,
+)
+
 data class ProviderMms(
     val id: Long,
     val address: String,
     val subject: String?,
     val body: String,
     val date: Long,
+    /**
+     * The identity part list. Feeds [identityContent] and, through it, the mid
+     * and the provider fingerprint. Nothing may change what lands here.
+     */
     val parts: List<ProviderMmsPart>,
+    /**
+     * Every non-text part row, for the payload path alone. Never reaches an
+     * identity hash -- see [identityContent].
+     */
+    val relayCandidates: List<ProviderMmsCandidate> = emptyList(),
+)
+
+/** What one incoming MMS relays: the parts that fit, and the ones that did not. */
+data class RelayMaterial(
+    val parts: List<ProviderMmsPart>,
+    val omissions: List<IncomingOmissionNotice.Omission>,
 )
 
 /** Reads MMS rows and parts owned by the default SMS app. */
@@ -32,6 +65,20 @@ object MmsProvider {
     private const val TAG = "MmsProvider"
     private const val MAX_PART_BYTES = RelayContentCodec.MAX_ATTACHMENT_BYTES
     private const val MMS_FROM_TYPE = 137
+
+    /**
+     * How much of one part the *relay* reader will pull into memory before it
+     * gives up, four times the largest ceiling any MMSC in service enforces
+     * (see [MmsAttachmentBudget.MAX_MAX_MESSAGE_SIZE]).
+     *
+     * It has to be far above [MAX_PART_BYTES]: a photo can only be re-encoded
+     * down to the budget if its original bytes are in hand, and the identity
+     * reader's 512 KiB ceiling is precisely what made every real camera photo
+     * unreadable. It still has to be bounded -- this runs inside the default
+     * SMS app, and a malformed row claiming to be a gigabyte must not take the
+     * process down with an OOM.
+     */
+    internal const val RELAY_SOURCE_MAX_BYTES = 8 * 1024 * 1024
 
     internal fun normalizePartContentType(value: String?): String {
         val mediaType = value.orEmpty().substringBefore(';').trim().lowercase(Locale.ROOT)
@@ -210,6 +257,7 @@ object MmsProvider {
             }.orEmpty()
 
             val parts = mutableListOf<ProviderMmsPart>()
+            val candidates = mutableListOf<ProviderMmsCandidate>()
             val body = StringBuilder()
             var attachmentBytes = 0
             val partUri = Telephony.Mms.Part.getPartUriForMessage(id.toString())
@@ -271,11 +319,23 @@ object MmsProvider {
                         }
                         continue
                     }
-                    if (parts.size >= RelayContentCodec.MAX_ATTACHMENTS) continue
                     val name = listOf(
                         if (nameCol >= 0) cursor.getString(nameCol) else null,
                         if (fileCol >= 0) cursor.getString(fileCol) else null,
                     ).firstOrNull { !it.isNullOrBlank() } ?: "attachment-$partId"
+                    // Recorded BEFORE the MAX_ATTACHMENTS early-out below, on
+                    // purpose: a row the identity list refuses is exactly a row
+                    // the user was never told about, and only the payload path
+                    // can still announce it. Metadata alone -- no part byte is
+                    // read here, so a message that is about to be deduped away
+                    // pays nothing beyond one descriptor open per part.
+                    candidates += ProviderMmsCandidate(
+                        partId = partId,
+                        name = name,
+                        contentType = contentType,
+                        declaredSize = declaredPartSize(context, partContentUri(partId)),
+                    )
+                    if (parts.size >= RelayContentCodec.MAX_ATTACHMENTS) continue
                     val bytes = readPart(context, partContentUri(partId))
                     if (bytes.isNotEmpty() && bytes.size <= MAX_PART_BYTES - attachmentBytes) {
                         parts += ProviderMmsPart(name, contentType, bytes)
@@ -283,7 +343,7 @@ object MmsProvider {
                     }
                 }
             }
-            ProviderMms(id, address, subject, body.toString(), date, parts)
+            ProviderMms(id, address, subject, body.toString(), date, parts, candidates)
         } catch (e: Exception) {
             Log.e(TAG, "failed to read MMS id=$id", e)
             null
@@ -328,6 +388,291 @@ object MmsProvider {
      */
     private fun partContentUri(partId: Long): android.net.Uri =
         ContentUris.withAppendedId(Telephony.Mms.Part.CONTENT_URI, partId)
+
+    /**
+     * The content whose encoding is the incoming-MMS identity preimage.
+     *
+     * It lives next to the list it reads because this exact expression --
+     * [ProviderMms.parts] in provider order, each part's name and normalized
+     * MIME as read, base64 of the bytes as stored -- is what every message
+     * already in `processed_mms` on the owner's phone was keyed by. Change what
+     * goes in and every one of them re-keys at the upgrade boundary, and the
+     * gateway relays a duplicate burst of messages the owner already has; the
+     * APK installs itself unattended within twelve hours of a release, so that
+     * is a certainty, not a risk. RelayContentTest pins the encoding against a
+     * frozen literal for that reason.
+     *
+     * [ProviderMms.relayCandidates] is deliberately not consulted here.
+     */
+    fun identityContent(mms: ProviderMms): RelayContent = RelayContent(
+        type = RelayContentCodec.TYPE_MMS,
+        text = mms.body,
+        subject = mms.subject,
+        attachments = mms.parts.map {
+            RelayAttachment(
+                it.name,
+                it.contentType,
+                RelayContentCodec.encodeBytes(it.bytes),
+                it.bytes.size,
+            )
+        },
+    )
+
+    /**
+     * The parts this message can actually relay, plus one omission per part it
+     * cannot -- the payload half of the identity/payload split.
+     *
+     * Runs only after the dedupe and blocklist gates have passed: it decodes
+     * and re-encodes multi-megapixel bitmaps, and the caller holds the mutex
+     * that serializes every incoming carrier event while it does.
+     *
+     * Never throws. A failure here must degrade to exactly today's behaviour --
+     * the message relays with whatever the identity list already held -- rather
+     * than abort a message the gateway could otherwise deliver.
+     */
+    fun materializeRelayParts(context: Context, mms: ProviderMms, budget: Int): RelayMaterial = try {
+        materialize(
+            candidates = mms.relayCandidates,
+            budget = budget,
+            read = { readRelayPart(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES) },
+            readTruncated = {
+                readRelayPartPrefix(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES)
+            },
+            shrink = { candidate, bytes, allowance ->
+                ImageShrinker.shrink(bytes, candidate.contentType, allowance)?.let {
+                    // The name is kept as the sender wrote it even when the
+                    // re-encode changed the MIME: both clients render by
+                    // content_type and use the name only as a download file
+                    // name, and rewriting it would make the same photo look
+                    // like a different attachment to a user comparing devices.
+                    ProviderMmsPart(candidate.name, it.contentType, it.bytes)
+                }
+            },
+        )
+    } catch (e: Exception) {
+        Log.e(TAG, "failed to materialize relay parts for MMS id=${mms.id}", e)
+        RelayMaterial(emptyList(), emptyList())
+    }
+
+    /**
+     * The decision table, with every framework call hoisted into a lambda so the
+     * whole thing runs in the host unit suite.
+     *
+     * @param read pulls a part's bytes, distinguishing "too big to hold" from
+     *   "not there yet"; see [ImageShrinkPolicy.PartRead].
+     * @param readTruncated best-effort prefix of a part that blew past the read
+     *   ceiling, empty when nothing could be read. A truncated JPEG still
+     *   decodes to a partial image on Android, and a partial photo beats
+     *   announcing a loss.
+     * @param shrink re-encodes one image into an allowance, or returns null when
+     *   it cannot.
+     */
+    internal fun materialize(
+        candidates: List<ProviderMmsCandidate>,
+        budget: Int,
+        read: (ProviderMmsCandidate) -> ImageShrinkPolicy.PartRead,
+        readTruncated: (ProviderMmsCandidate) -> ByteArray,
+        shrink: (ProviderMmsCandidate, ByteArray, Int) -> ProviderMmsPart?,
+    ): RelayMaterial {
+        // Clamped to the codec cap whatever the caller asked for: everything
+        // below guarantees the relayed total fits `cap`, and that guarantee is
+        // what keeps RelayContentCodec.encode from throwing on the payload and
+        // taking a deliverable message down with it.
+        val cap = budget.coerceIn(0, RelayContentCodec.MAX_ATTACHMENT_BYTES)
+        val allowances = ImageShrinkPolicy.allocate(
+            candidates.map { ImageShrinkPolicy.Candidate(it.contentType, it.declaredSize) },
+            cap,
+        )
+        val parts = mutableListOf<ProviderMmsPart>()
+        val omissions = mutableListOf<IncomingOmissionNotice.Omission>()
+        var used = 0
+
+        fun accept(part: ProviderMmsPart): Boolean {
+            if (part.bytes.isEmpty()) return false
+            if (parts.size >= RelayContentCodec.MAX_ATTACHMENTS) return false
+            if (part.bytes.size > cap - used) return false
+            parts += part
+            used += part.bytes.size
+            return true
+        }
+
+        fun omit(contentType: String, bytes: Int?) {
+            omissions += IncomingOmissionNotice.Omission(
+                ImageShrinkPolicy.omissionKind(contentType),
+                bytes,
+            )
+        }
+
+        candidates.forEachIndexed { index, candidate ->
+            val type = candidate.contentType
+            // The MMS layout script: consumes no budget, takes no slot, and is
+            // never announced. Telling the user a smil was lost would report a
+            // failure on a message that arrived complete.
+            if (ImageShrinkPolicy.isIgnorable(type)) return@forEachIndexed
+            val allowance = allowances.getOrElse(index) { 0 }
+            val passThrough = ImageShrinkPolicy.isPassThrough(type)
+            val shrinkable = ImageShrinkPolicy.isShrinkable(type)
+            // Video, audio and documents cannot be made smaller here, but they
+            // can still FIT: the previous build relayed any part under the wire
+            // cap, and the web renders it as a download link. Judging one by its
+            // type alone dropped a 40 KB voice clip that had eight times the
+            // room it needed -- and told the owner it was lost, on a phone whose
+            // own MMS store still held it.
+            //
+            // The descriptor's declared size is what keeps this cheap: a clip
+            // too big to carry is omitted without ever being opened, so reading
+            // a 30 MB video to learn it is 30 MB remains a cost this path does
+            // not pay.
+            if (!passThrough && !shrinkable && candidate.declaredSize > allowance) {
+                omit(type, candidate.declaredSize)
+                return@forEachIndexed
+            }
+
+            val outcome = read(candidate)
+            // An empty successful read is a part that opened but held nothing:
+            // a placeholder the download has not filled in. It is treated as
+            // Failed rather than as a loss, for the same reason -- there is no
+            // photo to mourn yet.
+            if (outcome is ImageShrinkPolicy.PartRead.Ok && outcome.bytes.isEmpty()) {
+                return@forEachIndexed
+            }
+            // What the notice may honestly claim was weighed. A truncated read
+            // measures the prefix, not the part, so it does not count; the
+            // provider's own declared size does.
+            val measured = when (outcome) {
+                is ImageShrinkPolicy.PartRead.Ok -> outcome.bytes.size
+                ImageShrinkPolicy.PartRead.TooLarge -> candidate.declaredSize.takeIf { it >= 0 }
+                ImageShrinkPolicy.PartRead.Failed -> null
+            }
+            val source = when (outcome) {
+                is ImageShrinkPolicy.PartRead.Ok -> outcome.bytes
+                // Still downloading, or an I/O error: say nothing at all and
+                // let the caller keep deferring. Announcing a loss seconds
+                // before the part lands would tell the owner a photo is gone
+                // when it is not, and this being the default SMS app there is
+                // no second copy to check it against.
+                ImageShrinkPolicy.PartRead.Failed -> return@forEachIndexed
+                ImageShrinkPolicy.PartRead.TooLarge ->
+                    if (shrinkable) readTruncated(candidate) else ByteArray(0)
+            }
+
+            if (passThrough || !shrinkable) {
+                // Verbatim or not at all. A GIF because both encoders flatten
+                // an animation to its first frame, so "shrinking" one destroys
+                // the only thing it was; a clip or a document because nothing
+                // here can re-encode it at all.
+                //
+                // Judged against what is actually left rather than against the
+                // pre-split allowance: these bytes cannot be made to fit a
+                // share, so a share is the wrong question, and the allocator
+                // reserves nothing for a part whose size the provider would not
+                // declare. `accept` enforces the same bound again.
+                if (!accept(ProviderMmsPart(candidate.name, type, source))) omit(type, measured)
+                return@forEachIndexed
+            }
+
+            if (source.isEmpty()) {
+                omit(type, measured)
+                return@forEachIndexed
+            }
+            // A part that fits as it stands travels as it stands -- but only if
+            // it is whole. A truncated prefix is a corrupt file, and relaying
+            // one byte for byte would put a broken image in the bubble, which
+            // is a worse lie than the omission notice: only a re-encode can
+            // turn what was salvaged back into something that opens.
+            val whole = outcome !is ImageShrinkPolicy.PartRead.TooLarge
+            if (whole && source.size <= allowance &&
+                accept(ProviderMmsPart(candidate.name, type, source))
+            ) {
+                return@forEachIndexed
+            }
+            // Aim at what is actually left, not merely at what was allocated:
+            // a rung chosen for an allowance the running total can no longer
+            // hold would spend a full decode and encode on a photo that is
+            // then refused anyway.
+            val room = minOf(allowance, cap - used)
+            val shrunk = if (room > 0) shrink(candidate, source, room) else null
+            if (shrunk == null || !accept(shrunk)) omit(type, measured)
+        }
+        return RelayMaterial(parts, omissions)
+    }
+
+    /** Declared byte length of a part, or -1 when the provider will not say. */
+    private fun declaredPartSize(context: Context, uri: android.net.Uri): Int = try {
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+            val length = descriptor.length
+            // UNKNOWN_LENGTH is -1, and a length past Int range is a provider
+            // lying about a part no phone ever received; both mean "unmeasured".
+            if (length in 0..Int.MAX_VALUE.toLong()) length.toInt() else -1
+        } ?: -1
+    } catch (_: Exception) {
+        // A part that has not finished downloading has no file yet, which is
+        // an expected state here and not worth a log line per sweep.
+        -1
+    }
+
+    /**
+     * The relay path's own reader. Deliberately NOT [readPart]: that one feeds
+     * the identity hash and must keep returning exactly what it always has,
+     * empty ByteArray and all.
+     *
+     * The three outcomes are the point. Today an oversized photo, an I/O error
+     * and a part the carrier is still downloading all collapse into one empty
+     * array, which is why a message could never tell "lost" from "not here
+     * yet" -- and why it silently chose the wrong one.
+     */
+    private fun readRelayPart(
+        context: Context,
+        uri: android.net.Uri,
+        limit: Int,
+    ): ImageShrinkPolicy.PartRead = try {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            var total = 0
+            var overran = false
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > limit) {
+                    overran = true
+                    break
+                }
+                out.write(buf, 0, n)
+            }
+            if (overran) {
+                ImageShrinkPolicy.PartRead.TooLarge
+            } else {
+                ImageShrinkPolicy.PartRead.Ok(out.toByteArray())
+            }
+        } ?: ImageShrinkPolicy.PartRead.Failed
+    } catch (e: Exception) {
+        Log.w(TAG, "failed to read MMS part for relay", e)
+        ImageShrinkPolicy.PartRead.Failed
+    }
+
+    /**
+     * At most [limit] bytes of a part, for the one case worth a second open: a
+     * part that overran the ceiling but is still an image. The decoder can
+     * usually make a partial bitmap out of a truncated JPEG, and half a photo
+     * is worth more to the owner than a line saying it is gone.
+     */
+    private fun readRelayPartPrefix(context: Context, uri: android.net.Uri, limit: Int): ByteArray = try {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            while (out.size() < limit) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, minOf(n, limit - out.size()))
+            }
+            out.toByteArray()
+        } ?: ByteArray(0)
+    } catch (e: Exception) {
+        Log.w(TAG, "failed to read truncated MMS part for relay", e)
+        ByteArray(0)
+    }
 
     private fun readPart(context: Context, uri: android.net.Uri): ByteArray {
         return try {

@@ -622,15 +622,13 @@ class SmsBridgeService : Service() {
         }
         checkNotNull(mms)
         val phone = PhoneNumberNormalizer.normalize(mms.address)
-        val content = RelayContent(
-            type = RelayContentCodec.TYPE_MMS,
-            text = mms.body,
-            subject = mms.subject,
-            attachments = mms.parts.map {
-                RelayAttachment(it.name, it.contentType, RelayContentCodec.encodeBytes(it.bytes), it.bytes.size)
-            },
-        )
-        val encodedContent = RelayContentCodec.encode(content)
+        // The identity half of the split: the provider's own part list, encoded
+        // exactly as every build before this one encoded it. Every gate below
+        // keys off this and nothing else. The payload — shrunk photos, the
+        // omission notice — is built further down, after those gates, and never
+        // touches a hash.
+        val identityContent = MmsProvider.identityContent(mms)
+        val encodedContent = RelayContentCodec.encode(identityContent)
         val identity = ProviderIdentityResolver.resolve(
             db, ProviderIdentity.MMS, id, phone, mms.date, encodedContent,
         )
@@ -664,17 +662,37 @@ class SmsBridgeService : Service() {
             Log.i(TAG, "MMS quarantined id=$id: ${decision.reason}")
             return
         }
+        // Only here, once every gate above has passed. Materializing decodes
+        // and re-encodes multi-megapixel bitmaps while this coroutine holds
+        // incomingMutex, which serializes every incoming carrier event; doing
+        // it for a message that is about to be deduped away or quarantined
+        // would be pure waste on the phone's critical receive path.
+        val material = MmsProvider.materializeRelayParts(
+            this, mms, ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
+        )
+        val payloadContent = identityContent.copy(
+            // The notice rides inside `text` rather than in a new key because
+            // every already-deployed decoder ignores a key it does not know:
+            // an additive field would render as nothing at all until the last
+            // device updated, which is the silent loss this path exists to end.
+            text = IncomingOmissionNotice.appendTo(mms.body, material.omissions),
+            attachments = material.parts.map {
+                RelayAttachment(it.name, it.contentType, RelayContentCodec.encodeBytes(it.bytes), it.bytes.size)
+            },
+        )
         val persisted = incomingRepository.persistCarrier(
             kind = ProviderIdentity.MMS,
             direction = "incoming_mms",
             phoneNumber = phone,
-            content = content,
+            content = identityContent,
             providerId = id,
             receivedAt = mms.date,
+            payload = payloadContent,
         )
         // A logout clears the processed-MMS ledger, so without the age gate the
         // next startup sweep would re-notify every inbox row it can still see.
-        notifyIfLive(persisted, rescan, IncomingNotificationPolicy.preview(content), mms.date)
+        // The preview describes the payload: it is what the user will open.
+        notifyIfLive(persisted, rescan, IncomingNotificationPolicy.preview(payloadContent), mms.date)
         flushOutbox()
     }
 
@@ -749,8 +767,36 @@ class SmsBridgeService : Service() {
                     // API, retry it here so the outbox cannot become a relay-only
                     // phantom. A crash in that narrow window is inherently
                     // at-least-once at the carrier boundary.
-                    val dispatched = if (content.type == RelayContentCodec.TYPE_MMS) {
-                        MmsSender.send(this@SmsBridgeService, row.phoneNumber, content, row.mid, row.cid, 0)
+                    //
+                    // The fit is computed here rather than inside MmsSender.send
+                    // so a message no encoding can get past the carrier's
+                    // ceiling is named with its own reason instead of the
+                    // catch-all below. `content` itself is never reassigned: the
+                    // outbox payload and the local row keep the original photo,
+                    // and only the PDU carries the shrunk one.
+                    val fit = if (content.type == RelayContentCodec.TYPE_MMS) {
+                        MmsSender.fit(this@SmsBridgeService, content)
+                    } else {
+                        null
+                    }
+                    if (fit is MmsSender.Fit.TooLarge) {
+                        Log.e(TAG, "Carrier cannot carry mid=${row.mid}: ${fit.reason}")
+                        db.relayOutboxDao().markCarrierState(row.id, "failed", fit.reason)
+                        row.localMessageId?.let { localId ->
+                            db.messageDao().setCarrierStatusById(localId, "failed", fit.reason)
+                        }
+                        continue
+                    }
+                    val dispatched = if (fit is MmsSender.Fit.Ready) {
+                        MmsSender.send(
+                            this@SmsBridgeService,
+                            row.phoneNumber,
+                            content,
+                            fit,
+                            row.mid,
+                            row.cid,
+                            0,
+                        )
                     } else {
                         SmsSender.send(this@SmsBridgeService, row.phoneNumber, content.text, row.mid, row.cid, 0)
                     }
@@ -1289,7 +1335,18 @@ class SmsBridgeService : Service() {
             }
         }
 
-        val rejection = predispatchRejection(content)
+        // Computed before the 'attempting' write, because it is the last thing
+        // that can still refuse this message cheaply: past that write the only
+        // exits are a carrier callback or an owner-visible frozen cursor. Note
+        // that `content` is never reassigned from the fit -- the MessageRow
+        // inserted below and the copy re-encrypted for this account's other
+        // devices keep the full-size photo the web composed.
+        val fit = if (content.type == RelayContentCodec.TYPE_MMS) {
+            MmsSender.fit(this@SmsBridgeService, content)
+        } else {
+            null
+        }
+        val rejection = predispatchRejection(content, fit)
         if (rejection != null) {
             // The carrier API is never reached for these, so no callback can
             // ever resolve the receipt. Left 'attempting' — deliberately not
@@ -1313,8 +1370,18 @@ class SmsBridgeService : Service() {
             "Carrier dispatch outcome pending callback; explicit retry required if unresolved",
         )
         val dispatchId = "relay-${cid.take(32)}-$seq"
-        val dispatched = if (content.type == RelayContentCodec.TYPE_MMS) {
-            MmsSender.send(this@SmsBridgeService, thread.phoneNumber, content, dispatchId, cid, seq)
+        // Every MMS reaching this line has a Ready fit: predispatchRejection
+        // returns a reason for every TooLarge one, and that branch returned above.
+        val dispatched = if (fit is MmsSender.Fit.Ready) {
+            MmsSender.send(
+                this@SmsBridgeService,
+                thread.phoneNumber,
+                content,
+                fit,
+                dispatchId,
+                cid,
+                seq,
+            )
         } else {
             SmsSender.send(this@SmsBridgeService, thread.phoneNumber, content.text, dispatchId, cid, seq)
         }
@@ -1377,8 +1444,15 @@ class SmsBridgeService : Service() {
      * Naming the deterministic cases here keeps one over-long message (the web
      * composer accepts 20_000 characters, the carrier 20 segments) from
      * freezing the SMS thread it was sent to.
+     *
+     * @param fit the MMS size decision from [MmsSender.fit], or null for an SMS.
+     *   An attachment set the carrier's own MMS ceiling cannot carry is the
+     *   same deterministic class of refusal as an over-long SMS, and it arrives
+     *   with a Korean reason rather than the carrier result integer a
+     *   dispatched-then-refused MMS would come back with.
      */
-    private fun predispatchRejection(content: RelayContent): String? {
+    private fun predispatchRejection(content: RelayContent, fit: MmsSender.Fit?): String? {
+        if (fit is MmsSender.Fit.TooLarge) return fit.reason
         if (content.type == RelayContentCodec.TYPE_MMS) return null
         if (content.text.isBlank()) return "SMS body is empty"
         val segments = runCatching {

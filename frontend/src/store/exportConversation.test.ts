@@ -106,6 +106,39 @@ describe("JSON export", () => {
   });
 });
 
+describe("attachments in an export", () => {
+  it("names what was attached in the CSV without embedding the bytes", () => {
+    const [line] = csvCells([row({
+      plaintext: "봐봐",
+      attachments: [
+        { name: "IMG.jpg", content_type: "image/jpeg", data: "AAAA", size: 183368 },
+        { name: "shot.png", content_type: "image/png", data: "BBBB", size: 2048 },
+      ],
+    })]);
+    expect(line).toContain("사진 2장: IMG.jpg (179KB), shot.png (2KB)");
+    // The bytes stay out: a thread of photos would otherwise turn a text export
+    // into tens of megabytes of base64.
+    expect(line).not.toContain("AAAA");
+  });
+
+  it("carries attachment metadata in the JSON and still omits the bytes", () => {
+    const out = buildConversationExport(
+      [row({ attachments: [{ name: "IMG.jpg", content_type: "image/jpeg", data: "AAAA", size: 100 }] })],
+      MY_SID, MY_UID, "엄마", "json", AT,
+    );
+    const parsed = JSON.parse(out.body);
+    expect(parsed.messages[0].attachments).toEqual([
+      { name: "IMG.jpg", content_type: "image/jpeg", size: 100 },
+    ]);
+    expect(out.body).not.toContain("AAAA");
+  });
+
+  it("leaves the column empty for a message that had none", () => {
+    const [line] = csvCells([row()]);
+    expect(line).toContain(',"",');
+  });
+});
+
 describe("export filename", () => {
   it("keeps Korean letters and digits, replacing everything else", () => {
     const out = buildConversationExport([], MY_SID, MY_UID, "엄마 (집)", "csv", AT);

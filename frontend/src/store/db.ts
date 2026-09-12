@@ -17,7 +17,7 @@ import { serverDirectoryHash } from "../crypto/deviceTrust";
 import { isSecurityMode, type SecurityMode } from "../net/api";
 import { normalizePhone } from "./conversationPolicy";
 // Type-only in the other direction, so this stays a one-way dependency.
-import { messageDirection } from "./helpers";
+import { attachmentPreviewLabel, messageDirection } from "./helpers";
 
 interface MetaRow {
   key: "current";
@@ -745,7 +745,7 @@ function previewOf(row: MessageRow): string {
   const text = row.plaintext.trim();
   if (text) return row.subject ? `${row.subject} — ${text}` : text;
   if (row.subject) return row.subject;
-  return row.attachments?.length ? "(첨부파일)" : "";
+  return attachmentPreviewLabel(row.attachments);
 }
 
 /** Lowest sequence in `cid` this device pulled but could not decrypt. */

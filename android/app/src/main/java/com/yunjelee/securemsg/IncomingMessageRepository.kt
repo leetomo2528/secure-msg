@@ -24,6 +24,21 @@ class IncomingMessageRepository(
      * and nothing here can check that: a mismatched pair forks the mid and
      * re-delivers a message that was already claimed. [persistCarrier] is the one
      * caller and derives both from the same value.
+     *
+     * [content] is what the message is *identified* by; [payload] is what the
+     * devices actually render, and the two are allowed to differ. For an
+     * incoming MMS they do: the payload carries photos re-encoded down to a
+     * relayable size plus one Korean line naming what could not be carried,
+     * while the identity keeps hashing the provider's own part list byte for
+     * byte. That split is not a convenience. Everything derived from [encoded]
+     * — the mid, the source fingerprint, the event key — must keep seeing
+     * [content] alone, or every message already in the processed ledger re-keys
+     * at the upgrade boundary and this gateway relays a duplicate of the
+     * owner's entire recent history; the APK installs itself unattended within
+     * twelve hours of a release, so that is a certainty rather than a risk. The
+     * only columns allowed to follow [payload] are the ones the relay re-reads
+     * but never re-hashes: the outbox plaintext, the attachment rows, and the
+     * locally rendered message body.
      */
     private suspend fun persist(
         direction: String,
@@ -32,7 +47,12 @@ class IncomingMessageRepository(
         encoded: String,
         providerIdentity: ProviderIdentity,
         receivedAt: Long,
+        payload: RelayContent = content,
     ): Persisted? {
+        // The type is the one field both halves write: the visible row takes it
+        // from the payload and the outbox row from the identity, and a
+        // disagreement would file one as text and its twin as MMS.
+        require(payload.type == content.type) { "payload/content type mismatch" }
         val phone = PhoneNumberNormalizer.normalize(phoneNumber)
         require(phone.isNotBlank()) { "phone number is blank" }
         val mid = IncomingMessageIdentity.mid(direction, providerIdentity, phone, receivedAt, encoded)
@@ -57,17 +77,17 @@ class IncomingMessageRepository(
             ).also { db.threadDao().upsert(it) }
             db.threadDao().touch(thread.cid, receivedAt)
 
-            val attachmentsJson = RelayContentCodec.attachmentsJson(content)
+            val attachmentsJson = RelayContentCodec.attachmentsJson(payload)
             val localMessageId = db.messageDao().insert(
                 MessageRow(
                     cid = thread.cid,
                     seq = 0,
                     senderSid = "",
-                    plaintext = content.text,
+                    plaintext = payload.text,
                     createdAt = receivedAt,
                     mine = false,
-                    contentType = content.type,
-                    subject = content.subject,
+                    contentType = payload.type,
+                    subject = payload.subject,
                     attachmentsJson = attachmentsJson,
                 ),
             )
@@ -77,15 +97,16 @@ class IncomingMessageRepository(
                     cid = thread.cid,
                     payload = "",
                     // Deliberately NOT `encoded`: the relayed body carries the
-                    // sealed direction, while the identity above must keep
-                    // hashing the direction-less encoding. Feeding `dir` into
-                    // the mid would re-key every incoming message at the
+                    // sealed direction and the payload's own text and
+                    // attachments, while the identity above must keep hashing
+                    // the direction-less encoding of `content`. Feeding either
+                    // into the mid would re-key every incoming message at the
                     // upgrade boundary and let an in-flight one relay twice.
                     // Nothing downstream re-hashes this column — it is read
                     // only to encrypt (SmsBridgeService) and to re-read the
                     // content for a carrier send — so the two may diverge.
                     plaintext = RelayContentCodec.encode(
-                        content.copy(direction = RelayContentCodec.DIR_IN),
+                        payload.copy(direction = RelayContentCodec.DIR_IN),
                     ),
                     contentType = content.type,
                     subject = content.subject,
@@ -120,6 +141,12 @@ class IncomingMessageRepository(
         content: RelayContent,
         providerId: Long?,
         receivedAt: Long,
+        /**
+         * What the devices render, when that is not what the message is keyed
+         * by. Defaults to [content] so every caller that has only one of them
+         * keeps behaving exactly as before.
+         */
+        payload: RelayContent = content,
     ): Persisted? = db.withTransaction {
         val encoded = RelayContentCodec.encode(content)
         // eventKey does not depend on the provider epoch/id. Check the durable
@@ -153,7 +180,7 @@ class IncomingMessageRepository(
             val aliased = db.relayOutboxDao().getByMid(existing.mid) ?: existing
             return@withTransaction alreadyClaimed(aliased)
         }
-        persist(direction, phoneNumber, content, encoded, identity, receivedAt)
+        persist(direction, phoneNumber, content, encoded, identity, receivedAt, payload)
     }
 
     /** Commits all incoming-event dedupe records before removing retry state. */

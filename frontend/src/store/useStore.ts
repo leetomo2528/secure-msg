@@ -89,6 +89,7 @@ import {
   isSafeMimeType,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
+  attachmentPreviewLabel,
   MAX_SUBJECT_CHARS,
   MAX_TEXT_CHARS,
   matchesBlockedSender,
@@ -810,7 +811,8 @@ export const useStore = create<State>((set, get) => ({
           && messageDirection(
             { direction, sender_sid: sm.sender_sid, sender_id: sm.sender_id }, mySid, context.uid,
           ) !== "out") {
-          notifyBody = content.text || content.subject || "(첨부파일)";
+          notifyBody = content.text || content.subject
+            || attachmentPreviewLabel(content.attachments);
           notifyIsIncoming = true;
         }
         if (!canUseCrypto(context)) return;
