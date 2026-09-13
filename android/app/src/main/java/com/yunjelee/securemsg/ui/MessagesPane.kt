@@ -1,7 +1,11 @@
 package com.yunjelee.securemsg.ui
 
 import android.content.Context
+import android.util.Log
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.core.tween
@@ -84,6 +88,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
+import kotlin.coroutines.cancellation.CancellationException
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -228,6 +233,7 @@ fun ColumnScope.MessagesPane(
     listHeader: @Composable () -> Unit,
     composeTarget: ComposeTarget? = null,
     onComposeTargetConsumed: () -> Unit = {},
+    sendPhotos: SendPhotoMessage? = null,
 ) {
     val context = LocalContext.current
     val db = AppDatabase.get(context)
@@ -248,6 +254,14 @@ fun ColumnScope.MessagesPane(
     var reply by remember { mutableStateOf("") }
     var newPhone by remember { mutableStateOf("") }
     var newMsg by remember { mutableStateOf("") }
+    // Pictures picked for the surface that is up, staged until 보내기. Held per
+    // surface for the same reason the drafts are: a conversation and the
+    // number-entry composer are two half-written messages, not one.
+    // Deliberately not saved across process death — the picker's read grant is
+    // not persisted either, so a restored uri would be a thumbnail that cannot
+    // be decoded and a send that cannot be read.
+    var replyPhotos by remember { mutableStateOf<List<StagedPhoto>>(emptyList()) }
+    var newPhotos by remember { mutableStateOf<List<StagedPhoto>>(emptyList()) }
     var sending by remember { mutableStateOf(false) }
     // Shown above the composer where the send happened. The shell's status
     // chip is hidden while a chat or the composer is up, so setStatus alone
@@ -381,6 +395,7 @@ fun ColumnScope.MessagesPane(
         messageSearchQuery = searchQuery
         messageSearchVisible = searchQuery.isNotEmpty()
         reply = ""
+        replyPhotos = emptyList()
         sendNotice = null
     }
 
@@ -512,10 +527,12 @@ fun ColumnScope.MessagesPane(
             selectedThread = null
             newPhone = target.phone.orEmpty()
             newMsg = ""
+            newPhotos = emptyList()
             composing = true
         }
         openAfterSend = null
         reply = ""
+        replyPhotos = emptyList()
         sendNotice = null
         messageSearchQuery = ""
         messageSearchVisible = false
@@ -547,9 +564,11 @@ fun ColumnScope.MessagesPane(
             selectedThread = null
             newPhone = request.phone.orEmpty()
             newMsg = request.body.orEmpty()
+            newPhotos = emptyList()
             composing = true
             openAfterSend = null
             reply = ""
+            replyPhotos = emptyList()
             sendNotice = null
             messageSearchQuery = ""
             messageSearchVisible = false
@@ -653,6 +672,123 @@ fun ColumnScope.MessagesPane(
         // a header that reads 차단됨.
         blocked -> BLOCKED_SENDER_NOTICE to Sm.text4
         else -> null
+    }
+
+    // The modern photo picker: a separate activity that hands back only what
+    // was chosen, so it needs no storage permission on any release this app
+    // runs on and none is declared in the manifest. ImageOnly because the
+    // shrink ladder and the MMS composer handle still images alone.
+    //
+    // One launcher for both surfaces rather than one each: the picker is a
+    // different activity, so whichever composer opened it is still the one on
+    // screen when the result lands. maxItems is the message cap — a pick that
+    // overshoots what is already staged is trimmed by [PhotoStaging.merge] and
+    // says so, which is a better answer than a picker that stops selecting
+    // with no explanation.
+    val photoPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(PhotoStaging.MAX),
+    ) { picked ->
+        val intoConversation = selectedThread != null
+        val before = if (intoConversation) replyPhotos else newPhotos
+        val merged = PhotoStaging.merge(
+            before,
+            picked.map { StagedPhoto(it, it.toString()) },
+        ) { it.key }
+        if (intoConversation) replyPhotos = merged else newPhotos = merged
+        // Also clears a stale line when everything fit, so the notice above the
+        // composer always belongs to the last thing the user did.
+        sendNotice = PhotoStaging.pickNotice(before.size, picked.size, merged.size)
+            ?.let { SendNotice(it, failed = true) }
+    }
+
+    /** Opens the picker for a surface that already holds [staged] pictures. */
+    fun stagePhotos(staged: Int) {
+        // The composer disables the paperclip while a send runs; this is the
+        // same rule enforced where it is acted on.
+        if (sending) return
+        if (staged >= PhotoStaging.MAX) {
+            sendNotice = SendNotice(PhotoStaging.FULL_NOTICE, failed = true)
+            return
+        }
+        // launch() resolves an activity, and this runs from a Compose click
+        // handler on a phone that installs its own updates unattended: a device
+        // with no picker at all has to cost a line of text, not the app.
+        try {
+            photoPicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Photo picker unavailable", e)
+            sendNotice = SendNotice(PhotoStaging.PICKER_UNAVAILABLE, failed = true)
+        }
+    }
+
+    /**
+     * Runs the send [PhotoStaging.plan] chose for what is on screen and reports
+     * the outcome to [onResult] on the main thread — null for a send that went
+     * out, otherwise the Korean line already shown above the composer.
+     *
+     * Both surfaces come through here so the SMS and MMS paths share one
+     * in-flight flag: [sending] is what closes the send button and the picker,
+     * and a second copy of this logic is how the two would drift apart. A
+     * blank composer returns without a word; a refusal says why and dispatches
+     * nothing.
+     */
+    fun submit(
+        phone: String,
+        text: String,
+        photos: List<StagedPhoto>,
+        onResult: (String?) -> Unit,
+    ) {
+        if (sending) return
+        val plan = PhotoStaging.plan(text, photos.size, sendPhotos != null) ?: return
+        if (plan is SendPlan.Refused) {
+            sendNotice = SendNotice(plan.message, failed = true)
+            setStatus(plan.message)
+            return
+        }
+        val sources = photos.map { it.uri }
+        sending = true
+        sendNotice = null
+        scope.launch(Dispatchers.IO) {
+            // Nothing below may escape: this coroutine outlives the click that
+            // started it, and an uncaught throw here takes the process with it.
+            // sendSms already swallows its own failures; the MMS handler is
+            // another module's and is treated as if it does not.
+            val failure = try {
+                when (plan) {
+                    SendPlan.Text -> if (sendSms(phone, text)) null else SEND_FAILED
+                    SendPlan.Photos -> when (val outcome = sendPhotos?.invoke(phone, text, sources)) {
+                        MmsSendOutcome.Sent -> null
+                        is MmsSendOutcome.Failed -> PhotoStaging.failureLine(outcome.message)
+                        null -> PhotoStaging.PHOTOS_UNSUPPORTED
+                    }
+                    // Answered above; the branch exists so a new plan cannot be
+                    // added without deciding what it dispatches.
+                    is SendPlan.Refused -> plan.message
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: LinkageError) {
+                // Same shape as MainActivity's own guard: the crypto module is
+                // on this path and a missing native library is an Error.
+                Log.e(TAG, "Send failed: module unavailable", e)
+                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
+            } catch (e: Exception) {
+                Log.e(TAG, "Send failed", e)
+                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
+            }
+            withContext(Dispatchers.Main) {
+                if (failure != null) {
+                    sendNotice = SendNotice(failure, failed = true)
+                    setStatus(failure)
+                }
+                // After the failure line, so a surface that has more to say
+                // (the composer's queued notice) writes last.
+                onResult(failure)
+                sending = false
+            }
+        }
     }
 
     confirmBlockFor?.let { target ->
@@ -823,20 +959,45 @@ fun ColumnScope.MessagesPane(
                                 is ChatRow.DayPill -> SmDatePill(row.label)
                                 is ChatRow.Message -> {
                                     val message = row.message
-                                    ChatBubble(
-                                        mine = message.mine,
-                                        blocked = message.blocked,
-                                        text = if (message.blocked) "차단된 메시지" else message.plaintext,
-                                        statusLine = if (message.blocked) {
-                                            null
-                                        } else {
-                                            clock.clockTime(message.createdAt) + carrierStatusLabel(message.carrierStatus)
-                                        },
-                                    )
+                                    // Attachments sit above the bubble rather
+                                    // than inside it: an MMS whose only content
+                                    // is a photo has an empty body, and the
+                                    // bubble under it then carries the
+                                    // timestamp alone. A blocked row is given
+                                    // none — its bytes are exactly what the
+                                    // user asked not to see.
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        if (!message.blocked) {
+                                            MessageAttachments(
+                                                messageId = message.id,
+                                                attachmentsJson = message.attachmentsJson,
+                                                mine = message.mine,
+                                            )
+                                        }
+                                        ChatBubble(
+                                            mine = message.mine,
+                                            blocked = message.blocked,
+                                            text = if (message.blocked) "차단된 메시지" else message.plaintext,
+                                            statusLine = if (message.blocked) {
+                                                null
+                                            } else {
+                                                clock.clockTime(message.createdAt) +
+                                                    carrierStatusLabel(message.carrierStatus)
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
+                    StagedPhotoRow(
+                        photos = replyPhotos,
+                        enabled = !sending,
+                        onRemove = { photo ->
+                            replyPhotos = replyPhotos.filterNot { it.key == photo.key }
+                            sendNotice = null
+                        },
+                    )
                     composerNotice(chat.blocked)?.let { (text, color) -> ComposerNotice(text, color) }
                     SmComposer(
                         value = reply,
@@ -848,23 +1009,20 @@ fun ColumnScope.MessagesPane(
                         canSend = canSend,
                         sending = sending,
                         onSend = {
-                            val text = reply.trim()
-                            if (text.isBlank() || sending) return@SmComposer
-                            sending = true
-                            sendNotice = null
-                            scope.launch(Dispatchers.IO) {
-                                val sent = sendSms(thread.phoneNumber, text)
-                                withContext(Dispatchers.Main) {
-                                    if (sent) {
-                                        reply = ""
-                                    } else {
-                                        sendNotice = SendNotice(SEND_FAILED, failed = true)
-                                        setStatus(SEND_FAILED)
-                                    }
-                                    sending = false
+                            submit(thread.phoneNumber, reply.trim(), replyPhotos) { failure ->
+                                if (failure == null) {
+                                    reply = ""
+                                    replyPhotos = emptyList()
                                 }
                             }
                         },
+                        // Hidden outright when the host wired no MMS send: a
+                        // paperclip whose every send would be refused is worse
+                        // than none.
+                        onAttach = if (sendPhotos != null) ({ stagePhotos(replyPhotos.size) }) else null,
+                        // A picture with no caption is a whole message, so the
+                        // button must not stay grey on a blank input.
+                        hasAttachment = replyPhotos.isNotEmpty(),
                     )
                 }
                 surface == MessagesView.Composer -> {
@@ -892,6 +1050,14 @@ fun ColumnScope.MessagesPane(
                             fontSize = 12.sp,
                         )
                     }
+                    StagedPhotoRow(
+                        photos = newPhotos,
+                        enabled = !sending,
+                        onRemove = { photo ->
+                            newPhotos = newPhotos.filterNot { it.key == photo.key }
+                            sendNotice = null
+                        },
+                    )
                     composerNotice(blocked = false)?.let { (text, color) -> ComposerNotice(text, color) }
                     SmComposer(
                         value = newMsg,
@@ -904,29 +1070,24 @@ fun ColumnScope.MessagesPane(
                         sending = sending,
                         onSend = {
                             val phone = newPhone.trim()
-                            val text = newMsg.trim()
-                            if (sending || phone.isBlank() || text.isBlank()) return@SmComposer
-                            sending = true
-                            sendNotice = null
-                            scope.launch(Dispatchers.IO) {
-                                val sent = sendSms(phone, text)
-                                withContext(Dispatchers.Main) {
-                                    // Either way the thread (if the dispatcher got as
-                                    // far as creating it) is where the result shows:
-                                    // a queued bubble or a failed one.
-                                    openAfterSend = PhoneNumberNormalizer.normalize(phone)
-                                    if (sent) {
-                                        newMsg = ""
-                                        sendNotice = SendNotice(SEND_QUEUED, failed = false)
-                                        setStatus(SEND_QUEUED)
-                                    } else {
-                                        sendNotice = SendNotice(SEND_FAILED, failed = true)
-                                        setStatus(SEND_FAILED)
-                                    }
-                                    sending = false
+                            if (phone.isBlank()) return@SmComposer
+                            val photoCount = newPhotos.size
+                            submit(phone, newMsg.trim(), newPhotos) { failure ->
+                                // Either way the thread (if the dispatcher got as
+                                // far as creating it) is where the result shows:
+                                // a queued bubble or a failed one.
+                                openAfterSend = PhoneNumberNormalizer.normalize(phone)
+                                if (failure == null) {
+                                    newMsg = ""
+                                    newPhotos = emptyList()
+                                    val queued = composerQueuedNotice(photoCount)
+                                    sendNotice = SendNotice(queued, failed = false)
+                                    setStatus(queued)
                                 }
                             }
                         },
+                        onAttach = if (sendPhotos != null) ({ stagePhotos(newPhotos.size) }) else null,
+                        hasAttachment = newPhotos.isNotEmpty(),
                         modifier = Modifier.focusRequester(messageFocus),
                     )
                 }
@@ -1248,8 +1409,20 @@ private fun MessageHitRow(hit: MessageHit, time: String, onClick: () -> Unit) {
     }
 }
 
+private const val TAG = "MessagesPane"
+
 private const val SEND_FAILED = "SMS 발송 실패 — 번호·권한·메시지 길이를 확인하세요."
 private const val SEND_QUEUED = "SMS를 발송했고 동기화 대기열에 저장했습니다."
+private const val SEND_QUEUED_PHOTOS = "사진을 발송했고 동기화 대기열에 저장했습니다."
+
+/**
+ * What the number-entry composer says after a send it got away.
+ *
+ * The plain line names SMS, which is the wrong word for a message that carried
+ * pictures — it went out as MMS and the user is about to watch it upload.
+ */
+internal fun composerQueuedNotice(photoCount: Int): String =
+    if (photoCount > 0) SEND_QUEUED_PHOTOS else SEND_QUEUED
 private const val BLOCKED_SENDER_NOTICE =
     "차단한 번호입니다 — 받는 문자는 격리되고, 보내기는 계속 가능합니다."
 private const val UNBLOCK_FAILED =

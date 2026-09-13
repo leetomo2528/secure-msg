@@ -94,6 +94,9 @@ fun MainScreen(
     setStatus: (String) -> Unit,
     status: String,
     sendSms: suspend (phone: String, text: String) -> Boolean,
+    // Null until the host wires an MMS path; the composer then draws no
+    // paperclip and behaves exactly as it did before photo sending existed.
+    sendPhotos: SendPhotoMessage? = null,
     onLogout: () -> Unit,
     onSimulateSms: () -> Unit,
     onTestUpdateFlow: () -> Unit,
@@ -259,6 +262,7 @@ fun MainScreen(
                             smsPermissionsGranted = smsPermissionsGranted,
                             setStatus = setStatus,
                             sendSms = sendSms,
+                            sendPhotos = sendPhotos,
                             composeTarget = composeTarget,
                             onComposeTargetConsumed = { composeTarget = null },
                             // Handed to the pane instead of being drawn above

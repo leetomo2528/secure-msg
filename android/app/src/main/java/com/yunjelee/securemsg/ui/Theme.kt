@@ -1332,9 +1332,12 @@ fun SmConfirmDialog(
 
 /**
  * Message composer. Send is live only when [canSend] (bridge/permissions) and
- * the text is non-blank; while [sending] the button keeps its filled look but
- * swaps the arrow for a spinner and ignores taps. [onAttach] null hides the
- * paperclip — there is no attachment path yet. Sits at the very bottom of
+ * there is something to send — non-blank text, or [hasAttachment], because a
+ * picture with no caption is a whole message on its own; while [sending] the
+ * button keeps its filled look but swaps the arrow for a spinner and ignores
+ * taps, and the paperclip goes with it so a second pick cannot land on a
+ * dispatch already in flight. [onAttach] null hides the paperclip — a host
+ * with no attachment path draws no button for one. Sits at the very bottom of
  * the chat screen, so like [SmBottomNav] it pads the navigation-bar inset
  * inside its own surface; the keyboard is the screen root's inset to apply.
  */
@@ -1347,9 +1350,10 @@ fun SmComposer(
     sending: Boolean,
     onSend: () -> Unit,
     onAttach: (() -> Unit)? = null,
+    hasAttachment: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val ready = canSend && value.isNotBlank()
+    val ready = canSend && (value.isNotBlank() || hasAttachment)
     val filled = ready || sending
     val glow = Sm.sky.copy(alpha = 0.22f)
     // The mock's upward shadow has no elevation equivalent; the hairline
@@ -1372,12 +1376,15 @@ fun SmComposer(
                 SmIconCircle(
                     kind = SmIconKind.Paperclip,
                     size = 40.dp,
-                    tint = Sm.sky,
+                    tint = if (sending) Sm.text4 else Sm.sky,
                     background = Sm.accentTint,
                     iconSize = 18.dp,
                     modifier = Modifier.semantics { contentDescription = "첨부" },
                     strokeWidth = 1.7.dp,
-                    onClick = onAttach,
+                    // Null, not a no-op lambda: SmIconCircle drops the click
+                    // modifier entirely, so the disabled paperclip also stops
+                    // ripple-ing under a tap it is going to ignore.
+                    onClick = if (sending) null else onAttach,
                 )
             }
             BasicTextField(

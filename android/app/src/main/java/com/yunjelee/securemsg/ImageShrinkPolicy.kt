@@ -94,6 +94,25 @@ object ImageShrinkPolicy {
     }
 
     /**
+     * Types drawn as a picture rather than offered as a file.
+     *
+     * A fixed whitelist, mirroring `isInlineImage` in
+     * `frontend/src/store/helpers.ts`: attachment bytes come from whoever sent
+     * the message, and matching every image subtype would let them pick a type
+     * the renderer treats as something else.
+     *
+     * Deliberately NOT the same set as [isShrinkable], and neither list is
+     * wrong. GIF can be drawn but not re-encoded; HEIC can be re-encoded but
+     * neither client can draw it. They answer different questions -- and the
+     * send path needs both, because a format it can shrink but nobody can show
+     * has to be converted rather than passed through.
+     */
+    private val INLINE_IMAGE_TYPES = Regex("^image/(png|jpe?g|gif|webp|bmp)$")
+
+    fun isInlineRenderable(contentType: String?): Boolean =
+        INLINE_IMAGE_TYPES.matches(mediaType(contentType))
+
+    /**
      * The ladder as it applies to a source whose long edge is [sourceLongEdge].
      *
      * Rungs clamp down, never up: re-encoding a 900 px photo at 1600 invents
