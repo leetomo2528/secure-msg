@@ -118,6 +118,25 @@ describe("what direction gets recorded", () => {
     expect(recordedDirection(undefined, null, ME, ME)).toBeUndefined();
   });
 
+  it("reads our own gateway row off the stored id when nothing stamped it", () => {
+    // The stamp is written once, at ingest. A row that predates the field, or
+    // one a half-finished backfill never reached, still has to render on the
+    // right side — otherwise a whole thread reads as the other person's.
+    const gateway = { sender_sid: "sid-gateway", sender_id: ME };
+    expect(messageDirection({ ...gateway, client_mid: MID_OUT }, "sid-me", ME)).toBe("out");
+    expect(messageDirection({ ...gateway, client_mid: MID_IN }, "sid-me", ME)).toBe("in");
+    // A stamped direction still wins over the id.
+    expect(messageDirection({ ...gateway, client_mid: MID_OUT, direction: "in" }, "sid-me", ME)).toBe("in");
+  });
+
+  it("never reads a peer's relay id as our own direction", () => {
+    // Their browser mints UUIDs exactly as ours does, so the own-account rule
+    // has to gate the fallback as well as the stamp.
+    expect(messageDirection(
+      { sender_sid: "sid-peer", sender_id: 9, client_mid: MID_OUT }, "sid-me", ME,
+    )).toBe("in");
+  });
+
   it("reads an unrecorded peer message as received, our own device as unknown", () => {
     // The account id is the only thing left once nothing was recorded.
     expect(messageDirection({ sender_sid: "sid-peer", sender_id: 9 }, "sid-me", ME)).toBe("in");

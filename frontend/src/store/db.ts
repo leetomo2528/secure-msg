@@ -101,6 +101,18 @@ export interface MessageRow {
    * never guess, an unknown row keeps the old neutral rendering.
    */
   direction?: "in" | "out";
+  /**
+   * The relay id the sending client minted, kept so direction stays derivable
+   * from the row itself.
+   *
+   * `direction` above is decided once, at ingest. Storing the evidence next to
+   * it means a row whose direction was never stamped — because it predates the
+   * field, or because a backfill pass died halfway — can still be read
+   * correctly at render time instead of waiting for a migration that may never
+   * succeed. Outside the sealed envelope, so it is a display hint and never a
+   * security boundary; see directionFromMid.
+   */
+  client_mid?: string | null;
   blocked?: boolean;
   content_type?: "text" | "mms";
   subject?: string | null;
@@ -145,8 +157,19 @@ interface CursorRow {
    * recognisable shape. "Is anything unclassified?" stays true, so every login
    * re-downloads the whole history to write nothing.
    */
-  dir_backfilled?: boolean;
+  dir_backfilled?: boolean | number;
 }
+
+/**
+ * Backfill generation. A device that finished an EARLIER generation runs again.
+ *
+ * Generation 1 marked a conversation done even when a page fetch had failed,
+ * so one 429 from the relay's sync budget — and 59 threads pulling at once is
+ * how you get one — left that thread's whole history unclassified forever,
+ * every message rendered as if the other person had sent it. Bumping the
+ * generation is what lets an already-poisoned device repair itself.
+ */
+export const DIRECTION_BACKFILL_GENERATION = 2;
 
 export interface BlockRow {
   id: string;
@@ -663,10 +686,13 @@ export async function highestStoredSeq(cid: string): Promise<number> {
 /** True once the direction backfill has already read `cid` from the relay. */
 export async function isDirectionBackfilled(cid: string): Promise<boolean> {
   const row = await (await db()).get("cursors", cid);
-  return row?.dir_backfilled === true;
+  // `true` is generation 1, written by the build that could mark a thread done
+  // without stamping anything.
+  const done = row?.dir_backfilled === true ? 1 : Number(row?.dir_backfilled ?? 0);
+  return done >= DIRECTION_BACKFILL_GENERATION;
 }
 
-/** Record that `cid` has been through the backfill, however little it stamped. */
+/** Record that `cid` was walked to the end without a failed page. */
 export async function markDirectionBackfilled(cid: string): Promise<void> {
   const d = await db();
   const tx = d.transaction("cursors", "readwrite");
@@ -676,7 +702,7 @@ export async function markDirectionBackfilled(cid: string): Promise<void> {
     last_seq: existing?.last_seq ?? 0,
     retry_from: existing?.retry_from ?? null,
     read_seq: existing?.read_seq ?? null,
-    dir_backfilled: true,
+    dir_backfilled: DIRECTION_BACKFILL_GENERATION,
   });
   await tx.done;
 }

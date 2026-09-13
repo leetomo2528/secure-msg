@@ -220,6 +220,22 @@ describe("direction backfill marker", () => {
     expect(await getCursor("c_mark")).toBe(9);
     expect(await getUndecryptableFloor("c_mark")).toBe(4);
   });
+
+  it("re-runs on a device the first generation marked done", async () => {
+    // Generation 1 marked a thread done even when a page fetch had failed, so
+    // a single 429 left that history unclassified for good and the whole
+    // thread rendered as the other person's. A device carrying that stale
+    // marker has to walk it again.
+    await setCursor("c_gen1", 5);
+    const d = await openDB("secure-msg", 5);
+    const row = await d.get("cursors", "c_gen1");
+    await d.put("cursors", { ...row, dir_backfilled: true });
+    d.close();
+    expect(await isDirectionBackfilled("c_gen1")).toBe(false);
+
+    await markDirectionBackfilled("c_gen1");
+    expect(await isDirectionBackfilled("c_gen1")).toBe(true);
+  });
 });
 
 describe("conversation summaries", () => {

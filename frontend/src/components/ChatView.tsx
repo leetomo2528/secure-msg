@@ -328,21 +328,27 @@ export default function ChatView({ cid }: { cid: string }) {
             Safari can decode, and it puts the phone's camera roll first — but
             it would also hide every non-image, so the paperclip stays.
           */}
+          {/*
+            Labelled, not a bare icon. A muted 16px glyph in a row of muted
+            16px glyphs is not discoverable: the feature shipped and was read
+            as missing. The word is what makes it a photo button.
+          */}
           <label
-            className={`grid h-9 w-9 shrink-0 place-items-center rounded-full text-tx-3 transition hover:bg-fg/[0.06] hover:text-accent-tx ${
+            className={`flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-accent-tx/10 px-3 text-[12px] font-semibold text-accent-tx ring-1 ring-accent-tx/25 transition hover:bg-accent-tx/20 ${
               processing ? "cursor-default opacity-40" : "cursor-pointer"
             }`}
-            title="사진 첨부"
+            title="사진 보내기"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
               <rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.7" />
               <circle cx="8.5" cy="10" r="1.6" stroke="currentColor" strokeWidth="1.5" />
               <path d="M4 16.5l4.8-4.2 3.6 3.2 3-2.6L20 16.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
+            사진
             <input type="file" multiple accept="image/*" className="hidden" disabled={processing} onChange={chooseFiles} />
           </label>
           <label
-            className={`grid h-9 w-9 shrink-0 place-items-center rounded-full text-tx-3 transition hover:bg-fg/[0.06] hover:text-accent-tx ${
+            className={`grid h-9 w-9 shrink-0 place-items-center rounded-full text-tx-2 transition hover:bg-fg/[0.06] hover:text-accent-tx ${
               processing ? "cursor-default opacity-40" : "cursor-pointer"
             }`}
             title="파일 첨부"

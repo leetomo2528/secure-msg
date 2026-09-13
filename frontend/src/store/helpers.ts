@@ -135,12 +135,26 @@ export function directionFromMid(mid: string | null | undefined): "in" | "out" |
  * be exported as if we knew.
  */
 export function messageDirection(
-  message: { direction?: "in" | "out"; sender_sid: string; sender_id?: number },
+  message: {
+    direction?: "in" | "out";
+    client_mid?: string | null;
+    sender_sid: string;
+    sender_id?: number;
+  },
   mySid: string | null,
   myUid?: number | null,
 ): "in" | "out" | "unknown" {
   if (message.direction === "in" || message.direction === "out") return message.direction;
   if (mySid && message.sender_sid === mySid) return "out";
+  // The stored id, read under the same own-account rule recordedDirection
+  // applies. A stamped direction is preferred because it can come from the
+  // sealed envelope, but falling back here is what stops a thread from
+  // rendering as entirely the other person's when the one-shot backfill that
+  // was supposed to stamp it never finished.
+  if (myUid != null && message.sender_id === myUid) {
+    const fromMid = directionFromMid(message.client_mid);
+    if (fromMid) return fromMid;
+  }
   if (myUid != null && message.sender_id != null && message.sender_id !== myUid) return "in";
   return "unknown";
 }

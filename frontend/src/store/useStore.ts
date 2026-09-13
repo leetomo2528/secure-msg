@@ -819,7 +819,7 @@ export const useStore = create<State>((set, get) => ({
         const wrote = await runSessionEffect(context, () => putMessage({
           id: "", seq: sm.seq, cid, sender_id: sm.sender_id,
           sender_sid: sm.sender_sid, plaintext: content.text, created_at: sm.created_at * 1000,
-          direction,
+          direction, client_mid: sm.client_mid ?? null,
           blocked: !shouldShow, content_type: content.type, subject: content.subject ?? null,
           attachments: content.attachments, carrier_status: sm.carrier_status ?? "none",
           carrier_error: sm.carrier_error,
@@ -890,11 +890,18 @@ export const useStore = create<State>((set, get) => ({
       }
       if (skip) continue;
       let cursor = 0;
+      // Only a walk that reached the end of the thread may mark it done. The
+      // relay rate-limits this endpoint and no client backs off, so a 429 in
+      // the middle of 59 threads is ordinary — and marking anyway left that
+      // thread unclassified for good, with every message rendered as the other
+      // person's.
+      let walked = false;
       while (true) {
         if (!canUseCrypto(context)) return;
         const page = await api.fetchMessages(conv.cid, cursor, 200);
         if (!canUseCrypto(context)) return;
-        if (!page.ok || !page.messages || page.messages.length === 0) break;
+        if (!page.ok || !page.messages) break;
+        if (page.messages.length === 0) { walked = true; break; }
         const entries: { seq: number; direction: "in" | "out" }[] = [];
         let maxSeq = cursor;
         for (const sm of page.messages) {
@@ -911,9 +918,10 @@ export const useStore = create<State>((set, get) => ({
           async () => { await patchMessageDirections(conv.cid, entries); },
         );
         if (!stamped) return;
-        if (page.messages.length < 200 || maxSeq <= cursor) break;
+        if (page.messages.length < 200 || maxSeq <= cursor) { walked = true; break; }
         cursor = maxSeq;
       }
+      if (!walked) continue;
       if (!await runSessionEffect(context, () => markDirectionBackfilled(conv.cid))) return;
     }
     if (!sameContext(context)) return;
