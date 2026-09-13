@@ -7,6 +7,7 @@ import DeviceManager from "./components/DeviceManager";
 import NewConversationModal from "./components/NewConversationModal";
 import BrandMark from "./components/BrandMark";
 import NotifyToggle from "./components/NotifyToggle";
+import DirectionRepair from "./components/DirectionRepair";
 import PendingDeviceApproval from "./components/PendingDeviceApproval";
 
 export default function App() {
@@ -66,6 +67,7 @@ export default function App() {
         <div className="mt-auto space-y-1.5 border-t border-fg/5 p-3">
           <NewConversationModal />
           <NotifyToggle />
+          <DirectionRepair />
           <BlocklistEditor />
           <DeviceManager />
         </div>

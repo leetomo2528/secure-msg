@@ -50,6 +50,8 @@ import {
   getCursor,
   setCursor,
   hasUnclassifiedMessages,
+  clearDirectionBackfill,
+  countUnclassified,
   isDirectionBackfilled,
   markDirectionBackfilled,
   patchMessageDirections,
@@ -233,6 +235,7 @@ interface State {
   refreshConvMeta: () => Promise<void>;
   /** Stamp direction onto history stored before the field existed. */
   backfillDirections: () => Promise<void>;
+  repairDirections: () => Promise<string>;
   send: (cid: string, text: string) => Promise<boolean>;
   sendContent: (cid: string, content: RelayContent) => Promise<boolean>;
   addBlock: (kw: string) => Promise<void>;
@@ -926,6 +929,32 @@ export const useStore = create<State>((set, get) => ({
     }
     if (!sameContext(context)) return;
     await get().refreshConvMeta();
+  },
+
+  /**
+   * Re-classify every thread, whatever the markers say, and report what moved.
+   *
+   * The automatic pass runs once per conversation and then records that it did.
+   * When a device ends up with rows that carry no direction AND a marker saying
+   * they were handled, nothing on the relay can tell the two apart and every
+   * message in that thread renders as the other person's forever. This is the
+   * way out, and the counts it returns are the only diagnosis available for a
+   * browser that cannot be inspected from here.
+   */
+  repairDirections: async (): Promise<string> => {
+    const context = captureSecurityContext();
+    if (!canUseCrypto(context)) return "로그인 상태에서만 실행할 수 있습니다.";
+    const convs = useStore.getState().conversations;
+    let before = 0;
+    for (const conv of convs) before += await countUnclassified(conv.cid);
+    const cleared = await clearDirectionBackfill();
+    await get().backfillDirections();
+    if (!sameContext(context)) return "세션이 바뀌어 중단했습니다.";
+    let after = 0;
+    for (const conv of convs) after += await countUnclassified(conv.cid);
+    const cid = useStore.getState().activeCid;
+    if (cid) await refreshActiveMessages(cid, () => sameContext(context));
+    return `대화 ${convs.length}개 · 표시 ${cleared}개 해제 · 미분류 ${before} → ${after}`;
   },
 
   refreshConvMeta: async () => {

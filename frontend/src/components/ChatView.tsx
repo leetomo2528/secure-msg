@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
+import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
 import { Avatar } from "./ChatList";
 import {
@@ -7,9 +8,8 @@ import {
   isInlineImage,
   messageDirection,
   MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_BYTES,
 } from "../store/helpers";
-import { prepareAttachments } from "../store/imageCodec";
-import { COMPOSE_ATTACHMENT_BUDGET } from "../store/imageShrink";
 import { ownedSmsPhone } from "../store/conversationPolicy";
 import { buildConversationExport, downloadText } from "../store/exportConversation";
 
@@ -26,7 +26,6 @@ export default function ChatView({ cid }: { cid: string }) {
   const [subject, setSubject] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [sending, setSending] = useState(false);
-  const [processing, setProcessing] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<MessageAttachment | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -39,7 +38,6 @@ export default function ChatView({ cid }: { cid: string }) {
   const [nameDraft, setNameDraft] = useState("");
   const [exportMenu, setExportMenu] = useState(false);
   const renameConversation = useStore((s) => s.renameConversation);
-  const stagedBytes = attachments.reduce((sum, item) => sum + item.size, 0);
 
   const startRename = () => {
     setNameDraft(conversation?.name ?? "");
@@ -65,8 +63,7 @@ export default function ChatView({ cid }: { cid: string }) {
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (sending || processing) return;
-    if (!text.trim() && attachments.length === 0 && !subject.trim()) return;
+    if (sending || (!text.trim() && attachments.length === 0 && !subject.trim())) return;
     setSending(true);
     try {
       const isMms = attachments.length > 0 || Boolean(subject.trim());
@@ -81,72 +78,47 @@ export default function ChatView({ cid }: { cid: string }) {
         setText("");
         setSubject("");
         setAttachments([]);
-        // Otherwise a red line about the photo that was refused stays over a
-        // composer that has since sent something else successfully.
-        setAttachmentError(null);
       }
     } finally {
       setSending(false);
     }
   };
 
-  /**
-   * Read, re-encode and stage picked files.
-   *
-   * The order matters and is the opposite of what it used to be: files are
-   * decoded and shrunk FIRST, and the budget is then checked against the bytes
-   * that were actually produced. Checking File.size up front is what made a
-   * phone photo unsendable — it is the size before the resize that never ran.
-   */
-  const ingest = async (picked: File[]) => {
-    if (!picked.length || processing) return;
-    setAttachmentError(null);
-    setProcessing(true);
-    try {
-      // `attachments` here is the value this handler closed over. Re-reading it
-      // inside the updater below is what keeps two overlapping picks from both
-      // validating against the same stale snapshot.
-      const result = await prepareAttachments(picked, attachments);
-      setAttachments((current) => {
-        const room = MAX_ATTACHMENTS - current.length;
-        if (result.attachments.length > room) {
-          setAttachmentError(`첨부파일은 최대 ${MAX_ATTACHMENTS}개까지 가능합니다`);
-          return current;
-        }
-        return [...current, ...result.attachments];
-      });
-      if (result.errors.length) setAttachmentError(result.errors.join(" · "));
-    } finally {
-      setProcessing(false);
-    }
-  };
-
   const chooseFiles = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const picked = Array.from(event.target.files ?? []);
+    setAttachmentError(null);
+    const files = Array.from(event.target.files ?? []);
     event.target.value = "";
-    await ingest(picked);
-  };
-
-  /**
-   * A screenshot on the clipboard is the most common way to want a picture in
-   * a message on a desktop, and pasting one did nothing at all before.
-   */
-  const pasteFiles = (event: React.ClipboardEvent) => {
-    const picked = Array.from(event.clipboardData?.files ?? []);
-    if (!picked.length) return;
-    // A copy out of a spreadsheet or a mail client puts a rendered image in
-    // `files` ALONGSIDE the text, so files alone is not the test. Text wins:
-    // swallowing what someone meant to paste as text is worse than ignoring a
-    // picture they can still attach with the button.
-    if (event.clipboardData?.getData("text/plain")) return;
-    event.preventDefault();
-    if (processing) {
-      // preventDefault already ran, so staying silent would drop the paste
-      // with no cue at all — unlike the file inputs, which visibly disable.
-      setAttachmentError("이전 사진을 처리하는 중입니다. 잠시 후 다시 붙여넣어 주세요");
+    if (files.length + attachments.length > MAX_ATTACHMENTS) {
+      setAttachmentError(`첨부파일은 최대 ${MAX_ATTACHMENTS}개까지 가능합니다`);
       return;
     }
-    void ingest(picked);
+    const total = attachments.reduce((sum, item) => sum + item.size, 0);
+    const next: MessageAttachment[] = [];
+    let nextTotal = total;
+    for (const file of files) {
+      nextTotal += file.size;
+      if (nextTotal > MAX_ATTACHMENT_BYTES) {
+        setAttachmentError(`첨부파일 전체 크기는 ${MAX_ATTACHMENT_BYTES / 1024}KB까지 가능합니다`);
+        return;
+      }
+      let bytes: ArrayBuffer;
+      try {
+        bytes = await file.arrayBuffer();
+      } catch {
+        // Picking and reading are separate operations, and an Android/iOS
+        // content URI can be revoked in between. Rejecting here left the
+        // handler with an unhandled rejection and the picker looking inert.
+        setAttachmentError(`'${file.name}' 파일을 읽지 못했습니다`);
+        break;
+      }
+      next.push({
+        name: file.name.slice(0, 120) || "attachment",
+        content_type: file.type || "application/octet-stream",
+        data: b64u(new Uint8Array(bytes)),
+        size: file.size,
+      });
+    }
+    setAttachments((current) => [...current, ...next]);
   };
 
   return (
@@ -286,15 +258,12 @@ export default function ChatView({ cid }: { cid: string }) {
               className="field flex-1 !py-1.5 text-xs"
               maxLength={120}
             />
-            <span className="shrink-0 rounded-full bg-fg/[0.04] px-2.5 py-1 text-[10px] tabular-nums text-tx-3 ring-1 ring-fg/[0.06]">
-              첨부 {attachments.length}개 · {Math.round(stagedBytes / 1024)}/{COMPOSE_ATTACHMENT_BUDGET / 1024}KB
+            <span className="shrink-0 rounded-full bg-fg/[0.04] px-2.5 py-1 text-[10px] text-tx-3 ring-1 ring-fg/[0.06]">
+              첨부 {attachments.length}개
             </span>
           </div>
         )}
         {attachmentError && <div className="text-[11px] text-danger-tx">{attachmentError}</div>}
-        {processing && (
-          <div className="text-[11px] text-tx-3">사진을 줄이는 중…</div>
-        )}
         {attachments.length > 0 && (
           <div className="flex gap-1.5 overflow-x-auto pb-0.5">
             {attachments.map((attachment, index) => (
@@ -302,55 +271,17 @@ export default function ChatView({ cid }: { cid: string }) {
                 key={`${attachment.name}-${index}`}
                 type="button"
                 onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
-                className="group flex shrink-0 items-center gap-1.5 rounded-full bg-fg/[0.05] py-1 pl-1 pr-3 text-[11px] text-tx-2 ring-1 ring-fg/10 transition hover:bg-red-500/10 hover:text-red-500 hover:ring-red-400/30"
+                className="shrink-0 rounded-full bg-fg/[0.05] px-3 py-1.5 text-[11px] text-tx-2 ring-1 ring-fg/10 transition hover:bg-red-500/10 hover:text-red-500 hover:ring-red-400/30"
                 title="첨부 제거"
               >
-                {isInlineImage(attachment.content_type) ? (
-                  <img
-                    src={dataUrl(attachment)}
-                    alt=""
-                    className="h-6 w-6 rounded-full object-cover"
-                  />
-                ) : (
-                  <span className="grid h-6 w-6 place-items-center rounded-full bg-fg/[0.06]">📎</span>
-                )}
-                <span className="max-w-[9rem] truncate">{attachment.name}</span>
-                <span className="tabular-nums text-tx-4">{Math.round(attachment.size / 1024)}KB</span>
-                <span aria-hidden>×</span>
+                {attachment.name} ×
               </button>
             ))}
           </div>
         )}
         <div className="flex items-center gap-2 rounded-2xl bg-fg/[0.04] px-2 py-1.5 ring-1 ring-fg/10 transition focus-within:ring-2 focus-within:ring-accent-tx/40">
-          {/*
-            Two pickers, not one. `accept="image/*"` is what makes the iOS
-            Photos picker hand over a JPEG instead of a HEIC no browser but
-            Safari can decode, and it puts the phone's camera roll first — but
-            it would also hide every non-image, so the paperclip stays.
-          */}
-          {/*
-            Labelled, not a bare icon. A muted 16px glyph in a row of muted
-            16px glyphs is not discoverable: the feature shipped and was read
-            as missing. The word is what makes it a photo button.
-          */}
           <label
-            className={`flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-accent-tx/10 px-3 text-[12px] font-semibold text-accent-tx ring-1 ring-accent-tx/25 transition hover:bg-accent-tx/20 ${
-              processing ? "cursor-default opacity-40" : "cursor-pointer"
-            }`}
-            title="사진 보내기"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.7" />
-              <circle cx="8.5" cy="10" r="1.6" stroke="currentColor" strokeWidth="1.5" />
-              <path d="M4 16.5l4.8-4.2 3.6 3.2 3-2.6L20 16.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            사진
-            <input type="file" multiple accept="image/*" className="hidden" disabled={processing} onChange={chooseFiles} />
-          </label>
-          <label
-            className={`grid h-9 w-9 shrink-0 place-items-center rounded-full text-tx-2 transition hover:bg-fg/[0.06] hover:text-accent-tx ${
-              processing ? "cursor-default opacity-40" : "cursor-pointer"
-            }`}
+            className="grid h-9 w-9 shrink-0 cursor-pointer place-items-center rounded-full text-tx-3 transition hover:bg-fg/[0.06] hover:text-accent-tx"
             title="파일 첨부"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -359,19 +290,18 @@ export default function ChatView({ cid }: { cid: string }) {
                 stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"
               />
             </svg>
-            <input type="file" multiple className="hidden" disabled={processing} onChange={chooseFiles} />
+            <input type="file" multiple className="hidden" onChange={chooseFiles} />
           </label>
           <input
             value={text}
             onChange={(e) => setText(e.target.value)}
-            onPaste={pasteFiles}
             placeholder={attachments.length > 0 ? "MMS 설명(선택)…" : "메시지 입력…"}
             className="min-w-0 flex-1 bg-transparent py-2 text-sm focus:outline-none"
             maxLength={20_000}
           />
           <button
             type="submit"
-            disabled={sending || processing || (!text.trim() && attachments.length === 0 && !subject.trim())}
+            disabled={sending || (!text.trim() && attachments.length === 0 && !subject.trim())}
             aria-label={sending ? "전송 중" : "전송"}
             title={sending ? "전송 중…" : "전송"}
             className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-brand-gradient text-white shadow-glow transition hover:brightness-110 active:scale-95 disabled:opacity-40 disabled:shadow-none"

@@ -169,7 +169,7 @@ interface CursorRow {
  * every message rendered as if the other person had sent it. Bumping the
  * generation is what lets an already-poisoned device repair itself.
  */
-export const DIRECTION_BACKFILL_GENERATION = 2;
+export const DIRECTION_BACKFILL_GENERATION = 3;
 
 export interface BlockRow {
   id: string;
@@ -683,11 +683,50 @@ export async function highestStoredSeq(cid: string): Promise<number> {
   return cursor?.value.seq ?? 0;
 }
 
+/**
+ * Forget every backfill marker, so the next pass re-reads every conversation.
+ *
+ * The repair hatch for a device whose markers say a thread was classified when
+ * its rows plainly are not — the marker lives here, the rows live here, and
+ * nothing the relay can send will reconcile the two.
+ */
+export async function clearDirectionBackfill(): Promise<number> {
+  const d = await db();
+  const tx = d.transaction("cursors", "readwrite");
+  let cleared = 0;
+  let cursor = await tx.store.openCursor();
+  while (cursor) {
+    if (cursor.value.dir_backfilled) {
+      await cursor.update({ ...cursor.value, dir_backfilled: 0 });
+      cleared += 1;
+    }
+    cursor = await cursor.continue();
+  }
+  await tx.done;
+  return cleared;
+}
+
+/** Rows in `cid` carrying no direction, for the repair report. */
+export async function countUnclassified(cid: string): Promise<number> {
+  const d = await db();
+  let cursor = await d
+    .transaction("messages")
+    .store.index("by-cid")
+    .openCursor(IDBKeyRange.only(cid));
+  let n = 0;
+  while (cursor) {
+    if (cursor.value.direction == null) n += 1;
+    cursor = await cursor.continue();
+  }
+  return n;
+}
+
 /** True once the direction backfill has already read `cid` from the relay. */
 export async function isDirectionBackfilled(cid: string): Promise<boolean> {
   const row = await (await db()).get("cursors", cid);
   // `true` is generation 1, written by the build that could mark a thread done
-  // without stamping anything.
+  // without stamping anything. Generation 2 shipped the fix but left devices
+  // that had already recorded a bad pass, so 3 makes them all look once more.
   const done = row?.dir_backfilled === true ? 1 : Number(row?.dir_backfilled ?? 0);
   return done >= DIRECTION_BACKFILL_GENERATION;
 }
