@@ -920,7 +920,22 @@ class SmsBridgeService : Service() {
                         )
                     }
 
-                    db.threadDao().advanceLastSeq(row.cid, seq)
+                    // Deliberately NOT advanceLastSeq. That column is the
+                    // cursor the PULL reads (syncConversation: `var cursor =
+                    // thread.lastSeq`), and the seq the relay just assigned to
+                    // an upload says nothing about what this device has pulled.
+                    // Moving it here declared every lower seq consumed —
+                    // including a message the web composed seconds earlier and
+                    // this gateway had not fetched yet. That message was then
+                    // never offered again: it was never sent to the carrier,
+                    // never stored locally, and nothing anywhere recorded a
+                    // failure. It is why what the web sent did not reach the
+                    // phone while what the phone sent reached the web.
+                    //
+                    // The row is not lost by leaving the cursor alone: the pull
+                    // reaches it in order and processRelayEnvelope consumes it
+                    // as a self echo, which markRelaySent below is the durable
+                    // evidence for (RelaySyncPolicy.canConsumeSelfEcho).
                     db.relayOutboxDao().markRelaySent(row.id, seq)
                     if (isIncoming) {
                         // Tombstone + optional provider ledger + deletion are
@@ -933,7 +948,11 @@ class SmsBridgeService : Service() {
                 // rollback must not strand the read stamp under a dead cid.
                 mergedStaleCid?.let { LastOpened.move(this, it, row.cid) }
 
-                client.emitDelivered(row.cid, seq)
+                // Nor emitDelivered, for the same reason: it moves the
+                // relay's own per-device cursor, and telling the relay this
+                // device has consumed a seq it has not pulled is the same
+                // false claim. The pull emits it when it really consumes the
+                // row.
                 val current = if (isIncoming) null else db.relayOutboxDao().getByMid(row.mid)
                 if (current != null && current.carrierState !in setOf("unknown", "not_applicable")) {
                     syncOutboxCarrierStatus(current, client)
