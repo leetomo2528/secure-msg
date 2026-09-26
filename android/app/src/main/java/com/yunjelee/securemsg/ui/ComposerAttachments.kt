@@ -1,5 +1,6 @@
 package com.yunjelee.securemsg.ui
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageDecoder
 import android.net.Uri
@@ -296,7 +297,13 @@ private fun StagedPhotoThumbnail(
  * Keyed on the uri string rather than the [StagedPhoto]: the row recomposes on
  * every keystroke in the composer above it, and keying on an instance would
  * re-run a full decode each time the list is rebuilt.
+ *
+ * The suppression is for a lint false positive, not a real gap: the producer
+ * below does assign `value`, yet ProduceStateDoesNotAssignValue still flags it
+ * (also with the decode hoisted into a local, and without the explicit type
+ * argument), and as an error it fails lintDebug and the whole build with it.
  */
+@SuppressLint("ProduceStateDoesNotAssignValue")
 @Composable
 private fun rememberThumbnail(photo: StagedPhoto): ImageBitmap? {
     val context = LocalContext.current
