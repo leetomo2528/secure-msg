@@ -83,7 +83,9 @@ object ImageShrinkPolicy {
      * [Failed] is a part the carrier has not finished downloading -- there the
      * message must keep DEFERRING, because announcing a loss would tell the
      * user a photo is gone seconds before it arrives, and this being the
-     * default SMS app they have no second copy to check against.
+     * default SMS app they have no second copy to check against. Only once no
+     * retry can be scheduled is it announced, and then without a size: a part
+     * that could not be read was never weighed ([IncomingMmsPolicy.settle]).
      */
     sealed interface PartRead {
         class Ok(val bytes: ByteArray) : PartRead

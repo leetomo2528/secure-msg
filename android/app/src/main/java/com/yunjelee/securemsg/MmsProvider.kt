@@ -54,10 +54,20 @@ data class ProviderMms(
     val relayCandidates: List<ProviderMmsCandidate> = emptyList(),
 )
 
-/** What one incoming MMS relays: the parts that fit, and the ones that did not. */
+/**
+ * What one incoming MMS relays: the parts that fit, the ones that did not, and
+ * the ones that could not be read yet.
+ *
+ * [pending] is kept apart from [omissions] because the two call for opposite
+ * actions. An omission is a settled loss and is announced. A pending part may
+ * still be landing, so the caller holds the whole message back on it and only
+ * turns it into an omission once no retry is left -- see
+ * [IncomingMmsPolicy.settle].
+ */
 data class RelayMaterial(
     val parts: List<ProviderMmsPart>,
     val omissions: List<IncomingOmissionNotice.Omission>,
+    val pending: List<ProviderMmsCandidate> = emptyList(),
 )
 
 /** Reads MMS rows and parts owned by the default SMS app. */
@@ -426,32 +436,105 @@ object MmsProvider {
      * and re-encodes multi-megapixel bitmaps, and the caller holds the mutex
      * that serializes every incoming carrier event while it does.
      *
-     * Never throws. A failure here must degrade to exactly today's behaviour --
-     * the message relays with whatever the identity list already held -- rather
-     * than abort a message the gateway could otherwise deliver.
+     * Never throws. A failure here degrades to what every build before the
+     * split relayed -- the parts the identity list already held -- rather than
+     * abort a message the gateway could otherwise deliver; see
+     * [identityFallback].
      */
-    fun materializeRelayParts(context: Context, mms: ProviderMms, budget: Int): RelayMaterial = try {
-        materialize(
-            candidates = mms.relayCandidates,
-            budget = budget,
-            read = { readRelayPart(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES) },
-            readTruncated = {
-                readRelayPartPrefix(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES)
+    fun materializeRelayParts(context: Context, mms: ProviderMms, budget: Int): RelayMaterial =
+        materializeOrFallback(
+            mms,
+            onFailure = {
+                Log.e(TAG, "failed to materialize relay parts for MMS id=${mms.id}; relaying identity parts", it)
             },
-            shrink = { candidate, bytes, allowance ->
-                ImageShrinker.shrink(bytes, candidate.contentType, allowance)?.let {
-                    // The name is kept as the sender wrote it even when the
-                    // re-encode changed the MIME: both clients render by
-                    // content_type and use the name only as a download file
-                    // name, and rewriting it would make the same photo look
-                    // like a different attachment to a user comparing devices.
-                    ProviderMmsPart(candidate.name, it.contentType, it.bytes)
-                }
-            },
-        )
+        ) {
+            materialize(
+                candidates = mms.relayCandidates,
+                budget = budget,
+                read = { readRelayPart(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES) },
+                readTruncated = {
+                    readRelayPartPrefix(context, partContentUri(it.partId), RELAY_SOURCE_MAX_BYTES)
+                },
+                shrink = { candidate, bytes, allowance ->
+                    ImageShrinker.shrink(bytes, candidate.contentType, allowance)?.let {
+                        // The name is kept as the sender wrote it even when the
+                        // re-encode changed the MIME: both clients render by
+                        // content_type and use the name only as a download file
+                        // name, and rewriting it would make the same photo look
+                        // like a different attachment to a user comparing devices.
+                        ProviderMmsPart(candidate.name, it.contentType, it.bytes)
+                    }
+                },
+            )
+        }
+
+    /**
+     * [attempt], or [identityFallback] when it throws. Split out of
+     * [materializeRelayParts] only so the host suite can throw through it;
+     * [onFailure] is the log line, which android.util.Log cannot write there.
+     *
+     * The fallback is taken at once rather than after the deferred retries a
+     * pending part gets, deliberately. Every I/O boundary inside [materialize]
+     * already turns trouble into a value -- a part still being written comes
+     * back as [ImageShrinkPolicy.PartRead.Failed] and lands on
+     * [RelayMaterial.pending], and [ImageShrinker.shrink] catches its own
+     * Throwables -- so what escapes to here is a defect in the decision code
+     * itself. It would throw the same way on every retry, and waiting would
+     * only hold the message text back for the minutes the retries span while
+     * re-running the work that threw under the mutex every incoming carrier
+     * event queues on.
+     */
+    internal fun materializeOrFallback(
+        mms: ProviderMms,
+        onFailure: (Exception) -> Unit,
+        attempt: () -> RelayMaterial,
+    ): RelayMaterial = try {
+        attempt()
     } catch (e: Exception) {
-        Log.e(TAG, "failed to materialize relay parts for MMS id=${mms.id}", e)
-        RelayMaterial(emptyList(), emptyList())
+        onFailure(e)
+        identityFallback(mms)
+    }
+
+    /**
+     * The relay material of a message whose decision table threw: the identity
+     * parts, which is what every build before the split relayed, plus one
+     * omission per part they do not carry.
+     *
+     * The parts fit the codec by construction. [read] admits at most
+     * [RelayContentCodec.MAX_ATTACHMENTS] of them inside [MAX_PART_BYTES] in
+     * total, and [identityContent] -- which encodes exactly this list -- has
+     * already been through [RelayContentCodec.encode] by the time the one caller
+     * gets here, so a subset of it cannot make the payload encode throw. The
+     * layout script is the subset's one difference: the normal path never
+     * relays it, and neither does this.
+     *
+     * The omissions are exact, not guessed. [read] builds both lists in one pass
+     * over the part rows, records every non-text row as a candidate before it
+     * decides whether the row joins the identity list, and gives both the same
+     * normalized MIME. The identity parts are therefore a sub-multiset of the
+     * candidates by type, and the per-type difference counts precisely the parts
+     * that do not travel. Which row that is can be ambiguous when two share a
+     * type, but the notice names only kinds and counts, so the ambiguity never
+     * reaches it. No omission carries a size: nothing here knows why a part is
+     * missing, and 용량이 커서 would be a guess about the cause.
+     */
+    internal fun identityFallback(mms: ProviderMms): RelayMaterial {
+        val carried = mms.parts.groupingBy { it.contentType }.eachCount().toMutableMap()
+        val omissions = mms.relayCandidates.mapNotNull { candidate ->
+            val type = candidate.contentType
+            if (ImageShrinkPolicy.isIgnorable(type)) return@mapNotNull null
+            val left = carried[type] ?: 0
+            if (left > 0) {
+                carried[type] = left - 1
+                null
+            } else {
+                IncomingOmissionNotice.Omission(ImageShrinkPolicy.omissionKind(type), bytes = null)
+            }
+        }
+        return RelayMaterial(
+            parts = mms.parts.filterNot { ImageShrinkPolicy.isIgnorable(it.contentType) },
+            omissions = omissions,
+        )
     }
 
     /**
@@ -485,6 +568,7 @@ object MmsProvider {
         )
         val parts = mutableListOf<ProviderMmsPart>()
         val omissions = mutableListOf<IncomingOmissionNotice.Omission>()
+        val pending = mutableListOf<ProviderMmsCandidate>()
         var used = 0
 
         fun accept(part: ProviderMmsPart): Boolean {
@@ -530,10 +614,11 @@ object MmsProvider {
 
             val outcome = read(candidate)
             // An empty successful read is a part that opened but held nothing:
-            // a placeholder the download has not filled in. It is treated as
-            // Failed rather than as a loss, for the same reason -- there is no
-            // photo to mourn yet.
+            // a placeholder the download has not filled in. It is pending like
+            // Failed below rather than a loss, for the same reason -- there is
+            // no photo to mourn yet.
             if (outcome is ImageShrinkPolicy.PartRead.Ok && outcome.bytes.isEmpty()) {
+                pending += candidate
                 return@forEachIndexed
             }
             // What the notice may honestly claim was weighed. A truncated read
@@ -546,12 +631,19 @@ object MmsProvider {
             }
             val source = when (outcome) {
                 is ImageShrinkPolicy.PartRead.Ok -> outcome.bytes
-                // Still downloading, or an I/O error: say nothing at all and
-                // let the caller keep deferring. Announcing a loss seconds
-                // before the part lands would tell the owner a photo is gone
-                // when it is not, and this being the default SMS app there is
-                // no second copy to check it against.
-                ImageShrinkPolicy.PartRead.Failed -> return@forEachIndexed
+                // Still downloading, or an I/O error: neither a part nor an
+                // omission, but pending, which the caller defers the whole
+                // message on. Announcing a loss seconds before the part lands
+                // would tell the owner a photo is gone when it is not, and this
+                // being the default SMS app there is no second copy to check it
+                // against. Dropping it without a word was worse: the message
+                // was persisted and claimed as an empty bubble, for good when
+                // the part was too big to join the identity
+                // ([IncomingMmsPolicy.settle]).
+                ImageShrinkPolicy.PartRead.Failed -> {
+                    pending += candidate
+                    return@forEachIndexed
+                }
                 ImageShrinkPolicy.PartRead.TooLarge ->
                     if (shrinkable) readTruncated(candidate) else ByteArray(0)
             }
@@ -594,7 +686,7 @@ object MmsProvider {
             val shrunk = if (room > 0) shrink(candidate, source, room) else null
             if (shrunk == null || !accept(shrunk)) omit(type, measured)
         }
-        return RelayMaterial(parts, omissions)
+        return RelayMaterial(parts, omissions, pending)
     }
 
     /** Declared byte length of a part, or -1 when the provider will not say. */

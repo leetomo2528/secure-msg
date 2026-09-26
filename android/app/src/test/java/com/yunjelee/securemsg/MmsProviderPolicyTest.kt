@@ -171,9 +171,10 @@ class MmsProviderPolicyTest {
     }
 
     @Test
-    fun `a part that has not finished downloading yields neither a part nor an omission`() {
+    fun `a part that has not finished downloading is reported pending, neither relayed nor announced`() {
+        val photo = candidate(1L, "image/jpeg", -1)
         val material = materialize(
-            listOf(candidate(1L, "image/jpeg", -1)),
+            listOf(photo),
             reads = mapOf(1L to ImageShrinkPolicy.PartRead.Failed),
         )
 
@@ -182,17 +183,50 @@ class MmsProviderPolicyTest {
         // before it lands, and the caller must be free to keep deferring.
         assertTrue(material.omissions.isEmpty())
         assertEquals("본문", IncomingOmissionNotice.appendTo("본문", material.omissions))
+        // But it is not dropped in silence either: the caller defers on this.
+        // Without it, the message was persisted as an empty bubble -- for good
+        // when the photo was too big to join the identity.
+        assertEquals(listOf(photo), material.pending)
     }
 
     @Test
     fun `an empty successful read is treated as not-here-yet, not as a loss`() {
+        val placeholder = candidate(1L, "image/jpeg", 0)
         val material = materialize(
-            listOf(candidate(1L, "image/jpeg", 0)),
+            listOf(placeholder),
             reads = mapOf(1L to ok(0)),
         )
 
         assertTrue(material.parts.isEmpty())
         assertTrue(material.omissions.isEmpty())
+        assertEquals(listOf(placeholder), material.pending)
+    }
+
+    @Test
+    fun `a pending part does not stop the parts that could be read`() {
+        val material = materialize(
+            listOf(candidate(1L, "image/jpeg", 20_000), candidate(2L, "image/jpeg", -1)),
+            reads = mapOf(1L to ok(20_000), 2L to ImageShrinkPolicy.PartRead.Failed),
+        )
+
+        assertEquals(listOf("part-1"), material.parts.map { it.name })
+        assertEquals(listOf(2L), material.pending.map { it.partId })
+        assertTrue(material.omissions.isEmpty())
+    }
+
+    @Test
+    fun `a settled loss is an omission, never pending`() {
+        // Only "cannot read it yet" may hold a message back. A part that was
+        // read and does not fit is final, and deferring on it would spend the
+        // retries on a message that is already complete.
+        val material = materialize(
+            listOf(candidate(1L, "video/mp4", 4_000_000), candidate(2L, "image/jpeg", 7_150_000)),
+            reads = mapOf(2L to ok(7_150_000)),
+            shrink = { _, _, _ -> null },
+        )
+
+        assertTrue(material.pending.isEmpty())
+        assertEquals(2, material.omissions.size)
     }
 
     @Test
@@ -380,6 +414,133 @@ class MmsProviderPolicyTest {
 
         assertEquals(RelayContentCodec.MAX_ATTACHMENTS, material.parts.size)
         assertEquals(1, material.omissions.size)
+    }
+
+    // --- fallback when the decision table throws -----------------------------
+
+    @Test
+    fun `a throwing decision table relays the identity parts rather than nothing`() {
+        val photo = ProviderMmsPart("photo.jpg", "image/jpeg", ByteArray(64) { 0x21 })
+        val row = mms(
+            parts = listOf(ProviderMmsPart("smil.xml", "application/smil", ByteArray(120)), photo),
+            relayCandidates = listOf(candidate(1L, "application/smil", 120), candidate(2L, "image/jpeg", 64)),
+        )
+        val failures = mutableListOf<Exception>()
+
+        val material = MmsProvider.materializeOrFallback(row, onFailure = { failures += it }) {
+            error("decision table bug")
+        }
+
+        // Every build before the split relayed exactly these bytes. Returning an
+        // empty list instead dropped attachments the gateway had in hand.
+        assertEquals(1, failures.size)
+        assertEquals(listOf(photo), material.parts)
+        assertTrue(material.omissions.isEmpty())
+        assertTrue(material.pending.isEmpty())
+    }
+
+    @Test
+    fun `a decision table that does not throw is returned untouched`() {
+        val expected = RelayMaterial(emptyList(), listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.VIDEO, 9)))
+        val material = MmsProvider.materializeOrFallback(
+            mms(parts = listOf(ProviderMmsPart("photo.jpg", "image/jpeg", ByteArray(64)))),
+            onFailure = { throw AssertionError("no failure happened") },
+        ) { expected }
+
+        assertEquals(expected, material)
+    }
+
+    @Test
+    fun `the fallback announces, without a size, exactly the parts the identity list lacks`() {
+        val row = mms(
+            parts = listOf(
+                ProviderMmsPart("smil.xml", "application/smil", ByteArray(120)),
+                ProviderMmsPart("small.jpg", "image/jpeg", ByteArray(64)),
+            ),
+            relayCandidates = listOf(
+                candidate(1L, "application/smil", 120),
+                candidate(2L, "image/jpeg", 64),
+                // Over the identity cap: in the candidate list, not in parts.
+                candidate(3L, "image/jpeg", 7_150_000),
+                candidate(4L, "video/mp4", 4_000_000),
+            ),
+        )
+
+        val material = MmsProvider.identityFallback(row)
+
+        assertEquals(listOf("small.jpg"), material.parts.map { it.name })
+        assertEquals(
+            listOf(
+                IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, null),
+                IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.VIDEO, null),
+            ),
+            material.omissions,
+        )
+        // Nothing here knows why they are missing, so no cause is claimed.
+        assertEquals(
+            "사진 봐\n[사진 1장은 받지 못했습니다, 동영상 1개는 받지 못했습니다]",
+            IncomingOmissionNotice.appendTo("사진 봐", material.omissions),
+        )
+    }
+
+    @Test
+    fun `the fallback counts same-type parts instead of matching them by name`() {
+        // Two photos sharing a sender-chosen name: which row the identity list
+        // kept is ambiguous, how many were left out is not.
+        val row = mms(
+            parts = listOf(ProviderMmsPart("image.jpg", "image/jpeg", ByteArray(64))),
+            relayCandidates = listOf(
+                ProviderMmsCandidate(1L, "image.jpg", "image/jpeg", 64),
+                ProviderMmsCandidate(2L, "image.jpg", "image/jpeg", 9_000_000),
+            ),
+        )
+
+        val material = MmsProvider.identityFallback(row)
+
+        assertEquals(1, material.parts.size)
+        assertEquals(
+            listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, null)),
+            material.omissions,
+        )
+    }
+
+    @Test
+    fun `a complete message falls back to no notice at all`() {
+        val row = mms(
+            parts = listOf(ProviderMmsPart("voice.amr", "audio/amr", ByteArray(40))),
+            relayCandidates = listOf(candidate(1L, "application/smil", 120), candidate(2L, "audio/amr", 40)),
+        )
+
+        assertTrue(MmsProvider.identityFallback(row).omissions.isEmpty())
+    }
+
+    @Test
+    fun `the fallback payload always encodes, even at every identity ceiling`() {
+        // The identity reader's own ceilings: MAX_ATTACHMENTS parts filling
+        // MAX_ATTACHMENT_BYTES exactly, plus a body already at the text cap and
+        // candidates the list could not take. The payload must still encode,
+        // or the fallback would take the message down after all.
+        val each = RelayContentCodec.MAX_ATTACHMENT_BYTES / RelayContentCodec.MAX_ATTACHMENTS
+        val parts = (1..RelayContentCodec.MAX_ATTACHMENTS).map {
+            ProviderMmsPart("p$it.jpg", "image/jpeg", ByteArray(each) { 0x33 })
+        }
+        val row = mms(
+            parts = parts,
+            relayCandidates = (1L..10L).map { candidate(it, "image/jpeg", each) },
+        ).copy(body = "가".repeat(IncomingOmissionNotice.MAX_TEXT_CHARS))
+        val identity = MmsProvider.identityContent(row)
+        RelayContentCodec.encode(identity)
+
+        val material = MmsProvider.identityFallback(row)
+        val payload = identity.copy(
+            text = IncomingOmissionNotice.appendTo(row.body, material.omissions),
+            attachments = material.parts.map {
+                RelayAttachment(it.name, it.contentType, RelayContentCodec.encodeBytes(it.bytes), it.bytes.size)
+            },
+        )
+
+        assertEquals(2, material.omissions.size)
+        assertEquals(RelayContentCodec.MAX_ATTACHMENTS, RelayContentCodec.decode(RelayContentCodec.encode(payload)).attachments.size)
     }
 
     private fun ok(size: Int) = ImageShrinkPolicy.PartRead.Ok(ByteArray(size) { 0x5A })

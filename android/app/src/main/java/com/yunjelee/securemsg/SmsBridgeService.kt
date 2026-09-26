@@ -21,7 +21,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -50,13 +49,8 @@ class SmsBridgeService : Service() {
     private val outboxLoopStarted = AtomicBoolean(false)
     private val sessionInvalidated = AtomicBoolean(false)
     private val lastTrustRefreshAt = AtomicLong(0L)
-    /**
-     * MMS id -> deferred retries already spent on it. Entries are never removed:
-     * the count *is* the "how often has this row been nudged" marker, and
-     * clearing an id would let a permanently malformed row reschedule itself
-     * forever.
-     */
-    private val mmsRetryAttempts = ConcurrentHashMap<Long, Int>()
+    /** Budget and queue of the deferred MMS retries; see [scheduleDeferredMmsRetry]. */
+    private val mmsRetries = DeferredMmsRetries(MMS_DEFER_RETRY_DELAYS_MS, MMS_DEFER_TRACKED_MAX)
 
     companion object {
         const val ACTION_INCOMING_SMS = "com.yunjelee.securemsg.INCOMING_SMS"
@@ -607,17 +601,23 @@ class SmsBridgeService : Service() {
      * @param rescan true when the row was found by a startup/reconnect sweep
      *   rather than by a receiver broadcast, which makes the message eligible for
      *   the age gate in [IncomingNotificationPolicy.shouldNotifyRescan]. A
-     *   deferred retry keeps the flag of the call that scheduled it, so an MMS
-     *   whose parts take minutes to land still notifies as the live message it is.
+     *   deferred retry runs live when any call that deferred the row was live,
+     *   so an MMS whose parts take minutes to land still notifies as the live
+     *   message it is; see [DeferredMmsRetries].
      */
     private suspend fun processIncomingMms(id: Long, rescan: Boolean) {
+        // A live retry still queued for this row means a broadcast announced
+        // it. A sweep that reaches the row first -- its part landed in between
+        // -- stores it as that live message, not as a bannerless import, and
+        // the retry then finds it already stored.
+        val asRescan = rescan && !mmsRetries.queuedLive(id)
         val mms = MmsProvider.read(this, id)
         if (!IncomingMmsPolicy.isReady(mms)) {
             // The platform may expose the inbox row before its address and
             // parts finish downloading. Leave it unprocessed so a later
             // receiver event or startup scan can retry without losing it.
             Log.i(TAG, "MMS not ready; deferring id=$id")
-            scheduleDeferredMmsRetry(id, rescan)
+            scheduleDeferredMmsRetry(id, asRescan)
             return
         }
         checkNotNull(mms)
@@ -667,9 +667,22 @@ class SmsBridgeService : Service() {
         // incomingMutex, which serializes every incoming carrier event; doing
         // it for a message that is about to be deduped away or quarantined
         // would be pure waste on the phone's critical receive path.
-        val material = MmsProvider.materializeRelayParts(
-            this, mms, ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
-        )
+        val material = IncomingMmsPolicy.settle(
+            MmsProvider.materializeRelayParts(this, mms, ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET),
+        ) {
+            scheduleDeferredMmsRetry(id, asRescan).also { scheduled ->
+                if (!scheduled) Log.w(TAG, "MMS part still unreadable, no retry possible; persisting id=$id with a notice")
+            }
+        } ?: run {
+            // A part could not be read yet. Nothing durable has been written
+            // for this message: every gate above either only read or returned.
+            // The one write that can precede this line is the resolver moving
+            // the provider-id namespace on reuse evidence, and that is no
+            // claim on this message -- persistCarrier re-resolves inside its
+            // own transaction on every path, exactly as the retry will.
+            Log.i(TAG, "MMS part not readable yet; deferring id=$id")
+            return
+        }
         val payloadContent = identityContent.copy(
             // The notice rides inside `text` rather than in a new key because
             // every already-deployed decoder ignores a key it does not know:
@@ -692,7 +705,7 @@ class SmsBridgeService : Service() {
         // A logout clears the processed-MMS ledger, so without the age gate the
         // next startup sweep would re-notify every inbox row it can still see.
         // The preview describes the payload: it is what the user will open.
-        notifyIfLive(persisted, rescan, IncomingNotificationPolicy.preview(payloadContent), mms.date)
+        notifyIfLive(persisted, asRescan, IncomingNotificationPolicy.preview(payloadContent), mms.date)
         flushOutbox()
     }
 
@@ -706,30 +719,90 @@ class SmsBridgeService : Service() {
      * live path until the parts land, while the attempt cap keeps a permanently
      * malformed row from spinning the service. [processRecentMms] remains the
      * backstop for anything this misses.
+     *
+     * Two causes share one budget per id: a row that is not ready at all, and a
+     * ready row with a part that cannot be read yet. Returns whether a retry
+     * will come back to the row: one queued now, or one already queued that
+     * this call joined. The not-ready caller ignores it and leaves the row to
+     * the next sweep, as it always has; the pending-part caller persists with
+     * an omission notice when this says no ([IncomingMmsPolicy.settle]).
+     *
+     * A queued retry is a delay() on this service's scope, and every stop of
+     * the service cancels it there; nothing holds a stop back for it. So a
+     * bridge start that gives up right after an MMS was deferred -- an
+     * unreachable relay is enough, through the device-trust check -- drops
+     * the retry with nothing written, the row stays in the provider, and the
+     * next sweep ([processRecentMms]: app open, relay connect, the next MMS
+     * broadcast) processes it again, as a rescan without a banner once it is
+     * past the age gate. That is the limit a not-ready row has always had,
+     * accepted here because a stop that can wait on retries proved a source of
+     * silent bridge outages in the one service every message goes through.
+     *
+     * At most one retry per id is queued at a time. The live broadcast, every
+     * sweep that sees the row (app foregrounded, relay reconnect, id-less WAP
+     * push) and each retry all land here while it is still deferred; when a
+     * retry is already queued they join it -- true, still deferred -- instead
+     * of each spending a unit of budget on a coroutine of its own. Spent per
+     * call, three callers in the first seconds used the whole budget, and the
+     * first retry to run then stored the message with a missing-photo notice
+     * fifteen seconds in rather than after the ~5 minutes the backoff spans.
      */
-    private fun scheduleDeferredMmsRetry(id: Long, rescan: Boolean) {
-        // Callers hold incomingMutex, so read-modify-write here needs no CAS.
-        val spent = mmsRetryAttempts[id] ?: 0
-        if (spent >= MMS_DEFER_RETRY_DELAYS_MS.size) return
-        if (spent == 0 && mmsRetryAttempts.size >= MMS_DEFER_TRACKED_MAX) {
-            Log.w(TAG, "deferred MMS retry table full; leaving id=$id to the next sweep")
-            return
+    private fun scheduleDeferredMmsRetry(id: Long, rescan: Boolean): Boolean {
+        val ticket = when (val decision = mmsRetries.schedule(id, rescan)) {
+            DeferredMmsRetries.Decision.Joined -> return true
+            is DeferredMmsRetries.Decision.Refused -> {
+                when (decision.reason) {
+                    DeferredMmsRetries.Refusal.SPENT -> Unit
+                    DeferredMmsRetries.Refusal.TABLE_FULL ->
+                        Log.w(TAG, "deferred MMS retry table full; not retrying id=$id")
+                }
+                return false
+            }
+            is DeferredMmsRetries.Decision.Launch -> decision.ticket
         }
-        mmsRetryAttempts[id] = spent + 1
         scope.launch {
-            delay(MMS_DEFER_RETRY_DELAYS_MS[spent])
             try {
-                // processIncomingMms flushes the outbox itself on success.
-                incomingMutex.withLock { processIncomingMms(id, rescan) }
+                delay(ticket.delayMs)
+                incomingMutex.withLock {
+                    // Off the queue before processing, so a part still missing
+                    // on this run can queue the next link of the chain.
+                    val retryRescan = mmsRetries.begin(ticket)
+                    // processIncomingMms flushes the outbox itself on success.
+                    processIncomingMms(id, retryRescan)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "deferred MMS retry failed id=$id", e)
+            } finally {
+                // Off the queue only if it never began (cancelled in its delay
+                // or while waiting for the lock). One that began is off
+                // already, and the identity match leaves alone the next link
+                // its run may have queued.
+                mmsRetries.abandon(ticket)
             }
         }
+        return true
     }
 
-    private suspend fun flushOutbox() {
+    /**
+     * Uploads every pending outbox row, then resumes the pull of each
+     * conversation it recorded an upload ack in.
+     *
+     * The resume is what keeps the ack from delaying the web's own messages.
+     * The relay fans message_new out to the uploading device too, before it
+     * answers the upload, so the pull that event triggers can reach this
+     * phone's own echo before markRelaySent below has committed. With no
+     * durable evidence yet it must refuse the echo (canConsumeSelfEcho) and
+     * stop that conversation there -- and anything queued behind the echo,
+     * such as a text the web composed for the carrier, then waited for the
+     * next trigger, which may be the 30-second loop and only runs while the
+     * relay is connected. Pulling once more after the ack commits lets the
+     * echo be consumed and what follows it go out now.
+     */
+    private suspend fun flushOutbox() = OutboxAckResume.run(
+        resume = { cid -> launchConversationSync(cid, "Post-ack") },
+    ) { acked ->
         outboxMutex.withLock {
             val client = relay ?: return@withLock
             if (!client.isConnected) return@withLock
@@ -944,6 +1017,9 @@ class SmsBridgeService : Service() {
                         incomingRepository.acknowledgeIncoming(row)
                     }
                 }
+                // Only now, with markRelaySent committed: a pull resumed before
+                // the commit would stop at the same unacknowledged echo again.
+                acked += row.cid
                 // Outside the transaction like prepareRelayOutbox's rewrite: a
                 // rollback must not strand the read stamp under a dead cid.
                 mergedStaleCid?.let { LastOpened.move(this, it, row.cid) }
@@ -1125,6 +1201,19 @@ class SmsBridgeService : Service() {
     private fun handleRelayMessage(env: JSONObject) {
         val cid = env.optString("cid")
         if (cid.isBlank()) return
+        launchConversationSync(cid, "Relay event")
+    }
+
+    /**
+     * Pulls one conversation on its own coroutine, queued on syncMutex.
+     *
+     * Launched rather than awaited, and that is what keeps the post-ack resume
+     * in [flushOutbox] deadlock-free. The caller never waits for syncMutex, so
+     * a flush reached under incomingMutex (processIncomingMms) adds no lock
+     * edge at all; the launched coroutine holds syncMutex alone, and nothing
+     * syncConversation runs takes outboxMutex or incomingMutex under it.
+     */
+    private fun launchConversationSync(cid: String, trigger: String) {
         scope.launch {
             syncMutex.withLock {
                 try {
@@ -1132,7 +1221,7 @@ class SmsBridgeService : Service() {
                     val a = apiFor(c)
                     syncConversation(cid, a, c)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Relay event sync failed for cid=$cid", e)
+                    Log.e(TAG, "$trigger sync failed for cid=$cid", e)
                 }
             }
         }
@@ -1811,6 +1900,128 @@ class SmsBridgeService : Service() {
  */
 private val DeviceSecurityView.blocksDirectoryUse: Boolean
     get() = serverUnsupported || selfPending || error != null || trustWarning != null
+
+/**
+ * Collects the conversations an outbox flush recorded upload acks in, and hands
+ * each one to [run]'s resume exactly once, after the flush has returned.
+ *
+ * After, not during: the flush takes outboxMutex inside [run]'s block, so by the
+ * time resume runs that lock is released and every recorded ack has committed.
+ * Nothing on this path can then wait on syncMutex with the outbox lock held,
+ * and the pulls resumed see every echo of the flush as acknowledged. Once per
+ * distinct conversation because a flush that uploads a burst into one thread
+ * needs one pull, not one per row: the pull reads everything from the durable
+ * cursor anyway. And also when the flush throws partway, because the acks it
+ * did commit are durable and a pull that stopped at one of those echoes is just
+ * as stuck.
+ */
+internal object OutboxAckResume {
+    suspend fun run(
+        resume: (cid: String) -> Unit,
+        flush: suspend (acked: MutableSet<String>) -> Unit,
+    ) {
+        val acked = LinkedHashSet<String>()
+        try {
+            flush(acked)
+        } finally {
+            acked.forEach(resume)
+        }
+    }
+}
+
+/**
+ * The per-id bookkeeping behind [SmsBridgeService]'s deferred MMS retries: the
+ * budget, the one retry that may be queued, and whether that retry runs live.
+ *
+ * Budget: the delays in [delaysMs], one per retry actually queued. Entries are
+ * never removed: the count *is* the "how often has this row been nudged"
+ * marker, and clearing an id would let a permanently malformed row reschedule
+ * itself forever -- or hold back, forever, a message whose one part never
+ * becomes readable, when spending the count is what finally persists it with a
+ * notice. Per service instance, so a new instance (and so a new process)
+ * starts each id with a fresh budget. That never stores a message twice by
+ * itself: whether a stored row is stored again is decided by the dedupe
+ * ledgers, never by this budget. They skip it while they hold it and it reads
+ * with the identity it was stored under; [IncomingMmsPolicy.settle] says how
+ * that identity can change later.
+ *
+ * Queue: while a retry for an id is queued, [schedule] joins it instead of
+ * queueing another, spending nothing. The retry leaves
+ * the queue when it begins processing ([begin]), so that run can queue the
+ * next link, or when it never gets there ([abandon]). Tickets are matched by
+ * identity, so a finished or cancelled ticket can never take a newer one off
+ * the queue.
+ *
+ * Liveness: a queued retry runs live (rescan = false) if any caller that
+ * deferred the row while it was queued was live. A broadcast's row found first
+ * by a sweep chain must not lose its alert to the sweep's flag.
+ *
+ * The service calls all of this under incomingMutex except [abandon], which a
+ * retry's finally reaches outside it; the lock here keeps the class correct
+ * without relying on that mutex.
+ */
+internal class DeferredMmsRetries(
+    private val delaysMs: LongArray,
+    private val trackedMax: Int,
+) {
+    /** One queued retry. [delayMs] is how long it waits before it runs. */
+    class Ticket internal constructor(val id: Long, val delayMs: Long, rescan: Boolean) {
+        /** Guarded by the owning [DeferredMmsRetries]. */
+        internal var rescan: Boolean = rescan
+    }
+
+    enum class Refusal {
+        /** Every retry this id gets has been queued already. */
+        SPENT,
+        /** A new id, and the table is at [trackedMax]. */
+        TABLE_FULL,
+    }
+
+    sealed interface Decision {
+        /** A retry was already queued for the id; it carries this caller too. */
+        data object Joined : Decision
+        /** Queue [ticket]: launch it, then [begin] it or [abandon] it. */
+        class Launch(val ticket: Ticket) : Decision
+        class Refused(val reason: Refusal) : Decision
+    }
+
+    private val spent = HashMap<Long, Int>()
+    private val queued = HashMap<Long, Ticket>()
+
+    /** Joins the queued retry for [id], or spends one unit of budget on a new one. */
+    @Synchronized
+    fun schedule(id: Long, rescan: Boolean): Decision {
+        queued[id]?.let { ticket ->
+            // Live wins: one live caller makes the retry live.
+            ticket.rescan = ticket.rescan && rescan
+            return Decision.Joined
+        }
+        val used = spent[id] ?: 0
+        if (used >= delaysMs.size) return Decision.Refused(Refusal.SPENT)
+        if (used == 0 && spent.size >= trackedMax) return Decision.Refused(Refusal.TABLE_FULL)
+        spent[id] = used + 1
+        val ticket = Ticket(id, delaysMs[used], rescan)
+        queued[id] = ticket
+        return Decision.Launch(ticket)
+    }
+
+    /** [ticket] starts processing: off the queue. Returns the rescan flag it runs with. */
+    @Synchronized
+    fun begin(ticket: Ticket): Boolean {
+        if (queued[ticket.id] === ticket) queued.remove(ticket.id)
+        return ticket.rescan
+    }
+
+    /** [ticket] ended without [begin] (cancelled); a no-op once it has begun. */
+    @Synchronized
+    fun abandon(ticket: Ticket) {
+        if (queued[ticket.id] === ticket) queued.remove(ticket.id)
+    }
+
+    /** Whether a retry is queued for [id] that will run live. */
+    @Synchronized
+    fun queuedLive(id: Long): Boolean = queued[id]?.rescan == false
+}
 
 internal object MmsRowProcessor {
     suspend fun process(

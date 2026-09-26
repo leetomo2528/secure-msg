@@ -1,6 +1,9 @@
 package com.yunjelee.securemsg
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -65,6 +68,120 @@ class IncomingMmsPolicyTest {
             ),
         )
         assertFalse(IncomingMmsPolicy.isReady(mms(address = "+821012345678")))
+    }
+
+    // --- settle: defer on a part that cannot be read yet, or persist ---------
+
+    @Test
+    fun aCompleteMessageIsPersistedAsIsAndNeverSpendsARetry() {
+        val material = RelayMaterial(
+            parts = listOf(ProviderMmsPart("photo.jpg", "image/jpeg", byteArrayOf(1))),
+            omissions = listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.VIDEO, 4_000_000)),
+        )
+        var asked = 0
+
+        val settled = IncomingMmsPolicy.settle(material) { asked += 1; true }
+
+        assertSame(material, settled)
+        assertEquals(0, asked)
+    }
+
+    @Test
+    fun aPartStillLandingHoldsTheWholeMessageBackWhileARetryCanBeScheduled() {
+        val material = RelayMaterial(
+            parts = listOf(ProviderMmsPart("photo.jpg", "image/jpeg", byteArrayOf(1))),
+            omissions = emptyList(),
+            pending = listOf(candidate("image/jpeg", -1)),
+        )
+        var asked = 0
+
+        // Null means: write nothing. Persisting here would claim the message
+        // in the dedupe ledgers with the photo missing -- for good, for a photo
+        // too big to join the identity, which no later read then changes.
+        assertNull(IncomingMmsPolicy.settle(material) { asked += 1; true })
+        assertEquals(1, asked)
+    }
+
+    @Test
+    fun withNoRetryLeftEachUnreadPartBecomesAnUnweighedOmission() {
+        val arrived = ProviderMmsPart("a.jpg", "image/jpeg", byteArrayOf(1))
+        val material = RelayMaterial(
+            parts = listOf(arrived),
+            omissions = emptyList(),
+            pending = listOf(candidate("image/jpeg", 2_000_000), candidate("audio/amr", -1)),
+        )
+
+        val settled = IncomingMmsPolicy.settle(material) { false }!!
+
+        // What did arrive is not held hostage by what did not.
+        assertEquals(listOf(arrived), settled.parts)
+        assertTrue(settled.pending.isEmpty())
+        // No size even where the provider declared one: the part was never
+        // read, so 용량이 커서 would be a guess about the cause.
+        assertEquals(
+            listOf(
+                IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, null),
+                IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.AUDIO, null),
+            ),
+            settled.omissions,
+        )
+        assertEquals(
+            "봐\n[사진 1장은 받지 못했습니다, 음성 1개는 받지 못했습니다]",
+            IncomingOmissionNotice.appendTo("봐", settled.omissions),
+        )
+    }
+
+    @Test
+    fun anUnreadPhotoSinksTheSizeClaimOfAWeighedOne() {
+        val material = RelayMaterial(
+            parts = emptyList(),
+            omissions = listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, 7_150_000)),
+            pending = listOf(candidate("image/jpeg", -1)),
+        )
+
+        val settled = IncomingMmsPolicy.settle(material) { false }!!
+
+        assertEquals("[사진 2장은 받지 못했습니다]", IncomingOmissionNotice.appendTo("", settled.omissions))
+    }
+
+    @Test
+    fun aPhotoOnlyMmsWhosePhotoNeverLandsEndsWithANoticeNotAnEmptyBubble() {
+        // The defect end to end: a photo-only MMS passes isReady on its
+        // candidate, the photo read keeps failing, and the message used to be
+        // persisted with an empty body and no attachment -- a blank bubble on
+        // every device and in the notification. Now it defers while the retry
+        // budget lasts (the real DeferredMmsRetries, with SmsBridgeService's
+        // three delays) and then persists with a line saying what is missing.
+        val row = mms(address = "+821012345678", relayCandidates = listOf(candidate("image/jpeg", -1)))
+        assertTrue(IncomingMmsPolicy.isReady(row))
+        val retries = DeferredMmsRetries(longArrayOf(15_000L, 60_000L, 240_000L), trackedMax = 512)
+        var queued: DeferredMmsRetries.Ticket? = null
+        // The broadcast, then each retry it chains, which begins before it reads.
+        val outcomes = (1..4).map {
+            queued?.let(retries::begin)
+            queued = null
+            val material = MmsProvider.materialize(
+                row.relayCandidates,
+                ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
+                read = { ImageShrinkPolicy.PartRead.Failed },
+                readTruncated = { ByteArray(0) },
+                shrink = { _, _, _ -> error("nothing was read, so nothing may be shrunk") },
+            )
+            // Decision -> "will a retry come back", as scheduleDeferredMmsRetry maps it.
+            IncomingMmsPolicy.settle(material) {
+                when (val decision = retries.schedule(row.id, rescan = false)) {
+                    DeferredMmsRetries.Decision.Joined -> true
+                    is DeferredMmsRetries.Decision.Launch -> true.also { queued = decision.ticket }
+                    is DeferredMmsRetries.Decision.Refused -> false
+                }
+            }
+        }
+
+        assertEquals(listOf(null, null, null), outcomes.take(3))
+        assertNull("the budget ran out, so nothing is left queued", queued)
+        val persisted = outcomes.last()!!
+        assertTrue(persisted.parts.isEmpty())
+        assertEquals("[사진 1장은 받지 못했습니다]", IncomingOmissionNotice.appendTo(row.body, persisted.omissions))
     }
 
     private fun candidate(contentType: String, declaredSize: Int) = ProviderMmsCandidate(
