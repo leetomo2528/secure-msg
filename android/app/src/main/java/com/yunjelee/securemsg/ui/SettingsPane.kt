@@ -89,6 +89,7 @@ import com.yunjelee.securemsg.RelayApi
 import com.yunjelee.securemsg.RelayTrustedDeviceApi
 import com.yunjelee.securemsg.SavedCredentials
 import com.yunjelee.securemsg.ServerConfig
+import com.yunjelee.securemsg.BridgeNotifications
 import com.yunjelee.securemsg.SmsNotifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -564,6 +565,23 @@ fun SettingsPane(
                 onClick = {
                     runCatching { context.startActivity(SmsNotifier.channelSettingsIntent(context)) }
                         .onFailure { Log.w("SettingsPane", "channel settings unavailable", it) }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
+        SmCard {
+            SectionTitle("상주 알림")
+            Caption(
+                "'다기기 SMS 동기화 활성' 알림은 백그라운드 동기화 중 Android가 반드시 띄우게 하는 " +
+                    "알림이라 앱에서 끌 수 없습니다. 아래에서 '상주 알림' 채널을 끄면 알림만 사라지고 " +
+                    "동기화는 그대로 계속됩니다.",
+            )
+            SmGhostButton(
+                text = "상주 알림 끄기",
+                onClick = {
+                    runCatching { context.startActivity(BridgeNotifications.channelSettingsIntent(context)) }
+                        .onFailure { Log.w("SettingsPane", "bridge channel settings unavailable", it) }
                 },
                 modifier = Modifier.fillMaxWidth(),
             )
