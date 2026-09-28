@@ -211,8 +211,11 @@ class OutgoingAttachmentPlannerTest {
     // ---- the plan ---------------------------------------------------------
 
     @Test
-    fun `a photo that already fits travels byte for byte`() {
-        val bytes = ByteArray(40_000) { 3 }
+    fun `a photo that already fits keeps its pixels byte for byte but loses its metadata`() {
+        // SM-4: the camera's EXIF (GPS, capture time, model), XMP and comment
+        // used to ride along to the carrier and the relay. Everything else --
+        // JFIF, the ICC profile, the tables, the scan -- is untouched.
+        val bytes = ImageFixtures.jpegWithMetadata(scanSize = 40_000)
         val shrinker = Shrinker()
         val plan = OutgoingAttachmentPlanner.plan(
             sources = listOf(jpeg(bytes.size)),
@@ -222,10 +225,110 @@ class OutgoingAttachmentPlannerTest {
         )
         val out = ready(plan)
         assertEquals(1, out.size)
-        assertEquals(bytes.size, out[0].size)
-        assertArrayEquals(bytes, RelayContentCodec.decodeBytes(out[0].data))
+        val expected = ImageFixtures.jpegStripped(scanSize = 40_000)
+        assertArrayEquals(expected, RelayContentCodec.decodeBytes(out[0].data))
+        assertEquals(expected.size, out[0].size)
+        assertFalse(String(RelayContentCodec.decodeBytes(out[0].data), Charsets.ISO_8859_1).contains(ImageFixtures.GPS_MARKER))
         // Re-encoding a photo that fits would cost quality for nothing.
         assertTrue(shrinker.budgets.isEmpty())
+    }
+
+    @Test
+    fun `a photo with nothing to strip travels byte for byte`() {
+        for ((type, bytes) in listOf(
+            "image/jpeg" to ImageFixtures.jpegClean(scanSize = 40_000),
+            "image/png" to ImageFixtures.pngStripped(idatSize = 40_000),
+            // Not parseable as its type: uncertain framing is sent as it is.
+            "image/jpeg" to ByteArray(40_000) { 3 },
+        )) {
+            val shrinker = Shrinker()
+            val out = ready(
+                OutgoingAttachmentPlanner.plan(
+                    sources = listOf(OutgoingAttachmentPlanner.Source(type, bytes.size)),
+                    budget = 200_000,
+                    read = { ImageShrinkPolicy.PartRead.Ok(bytes) },
+                    shrink = shrinker.fn(),
+                ),
+            )
+            assertArrayEquals(type, bytes, RelayContentCodec.decodeBytes(out.single().data))
+            assertTrue(shrinker.budgets.isEmpty())
+        }
+    }
+
+    @Test
+    fun `a PNG that fits loses its text, time and EXIF chunks`() {
+        val bytes = ImageFixtures.pngWithMetadata(idatSize = 20_000)
+        val out = ready(
+            OutgoingAttachmentPlanner.plan(
+                sources = listOf(OutgoingAttachmentPlanner.Source("image/png", bytes.size)),
+                budget = 200_000,
+                read = { ImageShrinkPolicy.PartRead.Ok(bytes) },
+                shrink = Shrinker().fn(),
+            ),
+        ).single()
+        assertEquals("image/png", out.contentType)
+        assertArrayEquals(ImageFixtures.pngStripped(idatSize = 20_000), RelayContentCodec.decodeBytes(out.data))
+    }
+
+    @Test
+    fun `a photo that only fits once stripped is not re-encoded`() {
+        // 60 KB of COM on top of a 150 KB photo against a 200 KB budget: the
+        // original is over, the stripped copy is under. Judging by the
+        // original would spend a decode and a generation of quality on
+        // metadata the send was going to drop anyway.
+        val bytes = ImageFixtures.jpegWithMetadata(scanSize = 150_000, commentSize = 60_000)
+        assertTrue(bytes.size > 200_000)
+        val shrinker = Shrinker()
+        val out = ready(
+            OutgoingAttachmentPlanner.plan(
+                sources = listOf(jpeg(bytes.size)),
+                budget = 200_000,
+                read = { ImageShrinkPolicy.PartRead.Ok(bytes) },
+                shrink = shrinker.fn(),
+            ),
+        ).single()
+        assertArrayEquals(ImageFixtures.jpegStripped(scanSize = 150_000), RelayContentCodec.decodeBytes(out.data))
+        assertTrue(shrinker.budgets.isEmpty())
+    }
+
+    @Test
+    fun `a rotated JPEG that fits is re-encoded upright at no more than its own size`() {
+        // Stripping APP1 would delete Orientation=6 and the photo would arrive
+        // sideways, so it goes through the re-encoder, which applies the
+        // rotation and writes no EXIF.
+        val bytes = ImageFixtures.jpegWithMetadata(orientation = 6, scanSize = 40_000)
+        val shrinker = Shrinker { budget -> MmsSender.ReEncoded(ByteArray(budget - 100) { 9 }, "image/jpeg") }
+        val out = ready(
+            OutgoingAttachmentPlanner.plan(
+                sources = listOf(jpeg(bytes.size)),
+                budget = 200_000,
+                read = { ImageShrinkPolicy.PartRead.Ok(bytes) },
+                shrink = shrinker.fn(),
+            ),
+        ).single()
+        assertEquals(listOf(bytes.size), shrinker.budgets)
+        assertEquals(bytes.size - 100, out.size)
+        assertEquals(9.toByte(), RelayContentCodec.decodeBytes(out.data)[0])
+    }
+
+    @Test
+    fun `a rotated JPEG whose re-encode fails is sent as it always was, never refused`() {
+        val bytes = ImageFixtures.jpegWithMetadata(orientation = 8, scanSize = 40_000)
+        for (answer in listOf<(Int) -> MmsSender.ReEncoded?>(
+            { null },
+            { budget -> MmsSender.ReEncoded(ByteArray(budget + 1), "image/jpeg") },
+            { MmsSender.ReEncoded(ByteArray(0), "image/jpeg") },
+        )) {
+            val out = ready(
+                OutgoingAttachmentPlanner.plan(
+                    sources = listOf(jpeg(bytes.size)),
+                    budget = 200_000,
+                    read = { ImageShrinkPolicy.PartRead.Ok(bytes) },
+                    shrink = Shrinker(answer).fn(),
+                ),
+            ).single()
+            assertArrayEquals(bytes, RelayContentCodec.decodeBytes(out.data))
+        }
     }
 
     @Test

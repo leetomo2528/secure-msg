@@ -150,6 +150,67 @@ class ImageShrinkerInstrumentedTest {
         assertNull(ImageShrinker.shrink(source, "image/jpeg", 0))
     }
 
+    @Test
+    fun realBytesUnderAnotherDeclaredTypeAreNeverDecoded() {
+        // SM-8: the platform would decode this PNG perfectly well -- it picks
+        // the codec from the bytes -- which is exactly why the declared type
+        // has to agree with them before ImageDecoder is ever reached.
+        val png = transparentDotPng(120)
+        assertNotNull(ImageShrinker.shrink(png, "image/png", budget))
+        assertNull(ImageShrinker.shrink(png, "image/jpeg", budget))
+        assertNull(ImageShrinker.shrink(detailedJpeg(200, 150), "image/webp", budget))
+    }
+
+    @Test
+    fun anAnimatedWebpIsNeverFlattenedToItsFirstFrame() {
+        // SM-9: a minimal VP8X header with the animation flag, then an ANIM
+        // chunk. The shrinker must refuse on the bytes before decoding.
+        fun le32(v: Int) = byteArrayOf(v.toByte(), (v ushr 8).toByte(), (v ushr 16).toByte(), (v ushr 24).toByte())
+        fun chunk(tag: String, payload: ByteArray) = tag.toByteArray(Charsets.US_ASCII) + le32(payload.size) + payload
+        val body = chunk("VP8X", byteArrayOf(0x12, 0, 0, 0, 63, 0, 0, 63, 0, 0)) + chunk("ANIM", ByteArray(6))
+        val webp = "RIFF".toByteArray(Charsets.US_ASCII) + le32(4 + body.size) + "WEBP".toByteArray(Charsets.US_ASCII) + body
+        assertNull(ImageShrinker.shrink(webp, "image/webp", budget))
+    }
+
+    @Test
+    fun anExifRotatedJpegComesOutUprightAndWithoutExif() {
+        // SM-4: a rotated JPEG that fits is re-encoded rather than stripped,
+        // because stripping APP1 deletes the Orientation tag. This pins the
+        // device half of that promise: ImageDecoder applies Orientation=6
+        // (rotate 90 degrees clockwise), so a 400x300 source comes out 300x400,
+        // and Bitmap.compress writes no EXIF behind it.
+        val plain = detailedJpeg(400, 300)
+        val rotated = withOrientation(plain, 6)
+        assertEquals(ImageMetadataStripper.Orientation.ROTATED, ImageMetadataStripper.jpegOrientation(rotated))
+        assertTrue(
+            ImageMetadataStripper.forPassThrough(rotated, "image/jpeg") ===
+                ImageMetadataStripper.PassThrough.Reencode,
+        )
+
+        val shrunk = ImageShrinker.shrink(rotated, "image/jpeg", rotated.size)
+
+        assertNotNull(shrunk)
+        assertEquals(300, shrunk!!.width)
+        assertEquals(400, shrunk.height)
+        assertTrue(shrunk.bytes.size <= rotated.size)
+        assertEquals(ImageMetadataStripper.Orientation.NORMAL, ImageMetadataStripper.jpegOrientation(shrunk.bytes))
+        assertFalse(String(shrunk.bytes, Charsets.ISO_8859_1).contains("Exif"))
+    }
+
+    /** [jpeg] with a little-endian EXIF APP1 carrying only Orientation=[value], inserted after SOI. */
+    private fun withOrientation(jpeg: ByteArray, value: Int): ByteArray {
+        val tiff = byteArrayOf(
+            'I'.code.toByte(), 'I'.code.toByte(), 42, 0, 8, 0, 0, 0,
+            1, 0,
+            0x12, 0x01, 3, 0, 1, 0, 0, 0, value.toByte(), 0, 0, 0,
+            0, 0, 0, 0,
+        )
+        val payload = "Exif".toByteArray(Charsets.US_ASCII) + byteArrayOf(0, 0) + tiff
+        val length = payload.size + 2
+        val app1 = byteArrayOf(0xFF.toByte(), 0xE1.toByte(), (length ushr 8).toByte(), length.toByte()) + payload
+        return jpeg.copyOfRange(0, 2) + app1 + jpeg.copyOfRange(2, jpeg.size)
+    }
+
     /**
      * A JPEG expensive enough to walk the ladder: a smooth gradient under a
      * repeating block of per-pixel noise, which is roughly the local entropy of

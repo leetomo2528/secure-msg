@@ -1,5 +1,6 @@
 package com.yunjelee.securemsg
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -94,6 +95,8 @@ class MmsSenderTest {
 
     @Test
     fun aMessageThatAlreadyFitsIsHandedToTheComposerUntouched() {
+        // Nothing to strip (the payload does not even parse as a JPEG, so its
+        // framing is uncertain and it travels as it is) and nothing to shrink.
         val content = mms(attachments = listOf(attachment("photo.jpg", "image/jpeg", 120 * 1024)))
         val shrinks = fits()
 
@@ -103,10 +106,120 @@ class MmsSenderTest {
             shrinks.fn(),
         ) as MmsSender.Fit.Ready
 
-        // Identical instance: the common path must not decode, re-encode, or
-        // even rebuild the list.
+        // Identical instance: with nothing to strip, the common path must not
+        // re-encode or even rebuild the list.
         assertSame(content.attachments, fit.attachments)
         assertTrue("nothing may be re-encoded when it already fits", shrinks.budgets.isEmpty())
+    }
+
+    @Test
+    fun aMetadataFreePhotoThatFitsIsStillTheIdenticalList() {
+        val content = mms(
+            attachments = listOf(
+                attachmentOf("a.jpg", "image/jpeg", ImageFixtures.jpegClean(scanSize = 60 * 1024)),
+                attachmentOf("b.png", "image/png", ImageFixtures.pngStripped(idatSize = 20 * 1024)),
+                attachment("note.pdf", "application/pdf", 10 * 1024),
+            ),
+        )
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, fits().fn()) as MmsSender.Fit.Ready
+        assertSame(content.attachments, fit.attachments)
+    }
+
+    @Test
+    fun aPhotoThatFitsReachesTheCarrierWithoutItsMetadata() {
+        // SM-4, the web 📎 and relayed-send case: this is the carrier boundary
+        // every outgoing MMS crosses. GPS, capture time, model, XMP and the
+        // comment are removed from the PDU copy; the pixels are not touched.
+        val jpeg = ImageFixtures.jpegWithMetadata(scanSize = 60 * 1024)
+        val png = ImageFixtures.pngWithMetadata(idatSize = 20 * 1024)
+        val pdf = attachment("note.pdf", "application/pdf", 10 * 1024)
+        val content = mms(
+            attachments = listOf(attachmentOf("a.jpg", "image/jpeg", jpeg), attachmentOf("b.png", "image/png", png), pdf),
+        )
+        val before = content.attachments.toList()
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn()) as MmsSender.Fit.Ready
+
+        assertArrayEquals(
+            ImageFixtures.jpegStripped(scanSize = 60 * 1024),
+            RelayContentCodec.decodeBytes(fit.attachments[0].data),
+        )
+        assertEquals(ImageFixtures.jpegStripped(scanSize = 60 * 1024).size, fit.attachments[0].size)
+        assertEquals("a.jpg", fit.attachments[0].name)
+        assertEquals("image/jpeg", fit.attachments[0].contentType)
+        assertArrayEquals(ImageFixtures.pngStripped(idatSize = 20 * 1024), RelayContentCodec.decodeBytes(fit.attachments[1].data))
+        // A non-image is never decoded or rebuilt.
+        assertSame(pdf, fit.attachments[2])
+        assertTrue(shrinks.budgets.isEmpty())
+        // The Room row and relay payload are built from `content`: untouched.
+        assertEquals(before, content.attachments)
+        assertArrayEquals(jpeg, RelayContentCodec.decodeBytes(content.attachments[0].data))
+    }
+
+    @Test
+    fun aPhotoWithinItsShareIsStrippedEvenWhenAnotherIsShrunk() {
+        // The per-part branch: the message is over the ceiling, the big photo
+        // is re-encoded, and the small one that fits its share keeps its
+        // pixels but not its metadata.
+        val small = ImageFixtures.jpegWithMetadata(scanSize = 20 * 1024)
+        val content = mms(
+            attachments = listOf(
+                attachment("big.jpg", "image/jpeg", 400 * 1024),
+                attachmentOf("small.jpg", "image/jpeg", small),
+            ),
+        )
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn()) as MmsSender.Fit.Ready
+
+        assertEquals(1, shrinks.budgets.size)
+        assertArrayEquals(ImageFixtures.jpegStripped(scanSize = 20 * 1024), RelayContentCodec.decodeBytes(fit.attachments[1].data))
+        val budget = budgetFor(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE)
+        assertTrue(fit.attachments.sumOf { it.size } <= budget)
+    }
+
+    @Test
+    fun aMessageThatOnlyFitsOnceStrippedIsNotReEncoded() {
+        val bloated = ImageFixtures.jpegWithMetadata(scanSize = 260 * 1024, commentSize = 60 * 1024)
+        val content = mms(attachments = listOf(attachmentOf("a.jpg", "image/jpeg", bloated)))
+        val budget = budgetFor(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE)
+        assertTrue(bloated.size > budget)
+        assertTrue(ImageFixtures.jpegStripped(scanSize = 260 * 1024).size <= budget)
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn()) as MmsSender.Fit.Ready
+
+        assertTrue(shrinks.budgets.isEmpty())
+        assertArrayEquals(ImageFixtures.jpegStripped(scanSize = 260 * 1024), RelayContentCodec.decodeBytes(fit.attachments[0].data))
+    }
+
+    @Test
+    fun aRotatedPhotoThatFitsIsTurnedUprightNotStrippedSideways() {
+        val rotated = ImageFixtures.jpegWithMetadata(orientation = 6, scanSize = 60 * 1024)
+        val content = mms(attachments = listOf(attachmentOf("r.jpg", "image/jpeg", rotated)))
+        val shrinks = Shrinks { budget -> MmsSender.ReEncoded(ByteArray(budget - 10) { 9 }, "image/jpeg") }
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn()) as MmsSender.Fit.Ready
+
+        // Re-encoded at no more than its own size, so the total that fit still fits.
+        assertEquals(listOf(rotated.size), shrinks.budgets)
+        assertEquals(rotated.size - 10, fit.attachments.single().size)
+        assertEquals(9.toByte(), RelayContentCodec.decodeBytes(fit.attachments.single().data)[0])
+    }
+
+    @Test
+    fun aRotatedPhotoWhoseReEncodeFailsTravelsAsItAlwaysDid() {
+        val rotated = attachmentOf("r.jpg", "image/jpeg", ImageFixtures.jpegWithMetadata(orientation = 3, scanSize = 60 * 1024))
+        val content = mms(attachments = listOf(rotated))
+        for (answer in listOf<(Int) -> MmsSender.ReEncoded?>(
+            { null },
+            { budget -> MmsSender.ReEncoded(ByteArray(budget + 1), "image/jpeg") },
+        )) {
+            val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, Shrinks(answer).fn())
+            assertTrue(fit is MmsSender.Fit.Ready)
+            assertSame(content.attachments, (fit as MmsSender.Fit.Ready).attachments)
+        }
     }
 
     @Test

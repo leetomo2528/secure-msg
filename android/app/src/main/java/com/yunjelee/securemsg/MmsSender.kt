@@ -33,9 +33,10 @@ object MmsSender {
     sealed interface Fit {
         /**
          * @param attachments what to compose with: the content's own list when
-         *   nothing needed shrinking (identical instance, so the common path
-         *   decodes and re-encodes nothing), otherwise the same list with the
-         *   over-budget images replaced by their re-encodes.
+         *   nothing needed stripping, rotating or shrinking (identical
+         *   instance), otherwise the same list with JPEG/PNG metadata removed,
+         *   EXIF-rotated JPEGs turned upright, and over-budget images replaced
+         *   by their re-encodes.
          * @param maxMessageSize the ceiling those bytes were fitted to, kept so
          *   the composed PDU can be measured against the estimate that chose it.
          */
@@ -121,15 +122,34 @@ object MmsSender {
             // than there are attachments.
             partCount = attachments.size + 1,
         )
-        val total = attachments.sumOf { it.size.toLong() }
-        // The overwhelmingly common case, and it must stay free: no base64
-        // decode, no bitmap, no re-encode. A message that already fits is
+        // Metadata first (SM-4). This is the carrier boundary every outgoing
+        // MMS crosses -- phone picks, web 📎 attachments, relayed sends -- so
+        // whatever travels as-is is stripped here of EXIF/XMP/COM and PNG text
+        // and time chunks before the carrier sees it. Only image/jpeg and
+        // image/png payloads are decoded to do it; everything else is left
+        // untouched, and an attachment with nothing to remove keeps its own
+        // instance. Only the PDU copy changes: the Room row and the relay
+        // payload are built from `content`, as the Fit docs say.
+        //
+        // The totals below are the STRIPPED sizes, and stripping only ever
+        // removes bytes, so a message whose original total fit still fits.
+        val stripped = attachments.map(::stripForCarrier)
+        val total = stripped.sumOf { it.attachment.size.toLong() }
+        // Still the overwhelmingly common case, and still free of bitmaps: no
+        // decode, no re-encode, unless a JPEG's EXIF says it must be rotated
+        // before its metadata can go (then [upright] re-encodes it at no more
+        // than its own size). A message with nothing to strip or rotate is
         // handed to the composer as the identical list it arrived as.
-        if (total <= budget) return Fit.Ready(attachments, maxMessageSize)
+        if (total <= budget) {
+            val ready = stripped.map { upright(it, shrink) }
+            val unchanged = ready.indices.all { ready[it] === attachments[it] }
+            return Fit.Ready(if (unchanged) attachments else ready, maxMessageSize)
+        }
 
         val shrinkable = mutableListOf<Int>()
         var reserved = 0L
-        attachments.forEachIndexed { index, attachment ->
+        stripped.forEachIndexed { index, part ->
+            val attachment = part.attachment
             if (ImageShrinkPolicy.isShrinkable(attachment.contentType) && !isAnimatedWebp(attachment)) {
                 shrinkable += index
             } else {
@@ -143,17 +163,25 @@ object MmsSender {
 
         val budgets = ImageShrinkPolicy.allocate(
             shrinkable.map {
-                ImageShrinkPolicy.Candidate(attachments[it].contentType, attachments[it].size)
+                ImageShrinkPolicy.Candidate(stripped[it].attachment.contentType, stripped[it].attachment.size)
             },
             (budget - reserved).toInt(),
         )
-        val out = attachments.toMutableList()
+        // Reserved parts travel as stripped; the shrinkable ones are replaced
+        // below. Re-encodes come from the (possibly stripped) bytes, which is
+        // safe for orientation: only a JPEG whose Orientation is 1 or absent
+        // was stripped, and a rotated one kept its EXIF for the decoder.
+        val out = stripped.map { it.attachment }.toMutableList()
         shrinkable.forEachIndexed { slot, index ->
-            val original = attachments[index]
+            val original = stripped[index].attachment
             val room = budgets[slot]
-            // Already within its share: left byte-for-byte alone. Re-encoding a
-            // photo that fits would cost quality for nothing.
-            if (original.size <= room) return@forEachIndexed
+            // Already within its share: its pixels are left alone -- re-encoding
+            // a photo that fits would cost quality for nothing -- but its
+            // metadata is not, and a rotated JPEG is turned upright.
+            if (original.size <= room) {
+                out[index] = upright(stripped[index], shrink)
+                return@forEachIndexed
+            }
             if (room <= 0) return Fit.TooLarge(unshrinkableReason(total, budget))
             val source = runCatching { RelayContentCodec.decodeBytes(original.data) }.getOrNull()
                 // Not a size problem, but it is deterministic: the composer
@@ -266,6 +294,71 @@ object MmsSender {
         } catch (e: Exception) {
             Log.w(TAG, "failed to delete temporary MMS PDU", e)
         }
+    }
+
+    /**
+     * One attachment after the lossless pass, and whether its EXIF still has
+     * to be applied to the pixels before its metadata can go.
+     *
+     * @param source the decoded payload, kept only when [needsRotation] so
+     *   [upright] does not decode it a second time.
+     */
+    private class Stripped(
+        val attachment: RelayAttachment,
+        val needsRotation: Boolean = false,
+        val source: ByteArray? = null,
+    )
+
+    /**
+     * [attachment] with its metadata removed when that is safe (SM-4).
+     *
+     * Undecodable base64 is left exactly as it was: the composer, or the
+     * shrink branch below, names it as unreadable just as before.
+     */
+    private fun stripForCarrier(attachment: RelayAttachment): Stripped {
+        if (!ImageMetadataStripper.handles(attachment.contentType)) return Stripped(attachment)
+        val bytes = runCatching { RelayContentCodec.decodeBytes(attachment.data) }.getOrNull()
+            ?: return Stripped(attachment)
+        return when (val pass = ImageMetadataStripper.forPassThrough(bytes, attachment.contentType)) {
+            ImageMetadataStripper.PassThrough.Reencode -> Stripped(attachment, needsRotation = true, source = bytes)
+            is ImageMetadataStripper.PassThrough.Send ->
+                if (pass.bytes === bytes || pass.bytes.size >= bytes.size) {
+                    Stripped(attachment)
+                } else {
+                    Stripped(
+                        attachment.copy(
+                            data = RelayContentCodec.encodeBytes(pass.bytes),
+                            size = pass.bytes.size,
+                        ),
+                    )
+                }
+        }
+    }
+
+    /**
+     * [part] ready to travel as-is: itself, unless its EXIF Orientation is not
+     * 1, in which case it is re-encoded -- ImageDecoder applies the rotation,
+     * Bitmap.compress writes no EXIF -- at no more than its current size, so
+     * a total that fit still fits. A re-encode that fails or does not come in
+     * under that size leaves the original, metadata and all, which is what
+     * every build before SM-4 sent: a message is never newly refused for it.
+     */
+    private fun upright(
+        part: Stripped,
+        shrink: (ByteArray, String, Int) -> ReEncoded?,
+    ): RelayAttachment {
+        val original = part.attachment
+        val source = part.source
+        if (!part.needsRotation || source == null) return original
+        val turned = shrink(source, original.contentType, original.size)
+            ?.takeIf { it.bytes.isNotEmpty() && it.bytes.size <= original.size }
+            ?: return original
+        return RelayAttachment(
+            name = renamed(original.name, original.contentType, turned.contentType),
+            contentType = turned.contentType,
+            data = RelayContentCodec.encodeBytes(turned.bytes),
+            size = turned.bytes.size,
+        )
     }
 
     /**

@@ -256,10 +256,44 @@ object OutgoingAttachmentPlanner {
             // out a JPEG because the shrinker touched it, while a 300 KB one
             // arrived as a download chip the owner could not view on their own
             // phone or on the web, with nothing reporting a problem.
-            if (bytes.size <= room && ImageShrinkPolicy.isInlineRenderable(source.contentType)) {
-                out += attachment(index, source.contentType, bytes)
-                used += bytes.size
-                return@forEachIndexed
+            //
+            // Byte for byte in its pixels, not in its metadata (SM-4): the
+            // copy that travels is stripped of EXIF/XMP/COM (JPEG) and
+            // eXIf/tEXt/iTXt/zTXt/tIME (PNG) -- GPS, capture time, device
+            // model -- exactly as the web composer strips its own picks. These
+            // bytes are both the carrier's copy and the relay copy
+            // (RelayOutbox.plaintext and the Room row are built from this
+            // plan), so stripping here covers both. The fit is judged on the
+            // STRIPPED size: a photo that only fits once its metadata is gone
+            // must not be re-encoded for it.
+            if (ImageShrinkPolicy.isInlineRenderable(source.contentType)) {
+                when (val pass = ImageMetadataStripper.forPassThrough(bytes, source.contentType)) {
+                    is ImageMetadataStripper.PassThrough.Send -> if (pass.bytes.size <= room) {
+                        out += attachment(index, source.contentType, pass.bytes)
+                        used += pass.bytes.size
+                        return@forEachIndexed
+                    }
+                    // A JPEG whose EXIF says to rotate it. Stripping would drop
+                    // that instruction and the photo would arrive sideways, so
+                    // it goes through the re-encoder (which applies the
+                    // rotation and writes no EXIF) at no more than its own
+                    // size, so the running total can only come out smaller
+                    // than it did before. If that fails, the original bytes go
+                    // exactly as they did before this change: a pick that
+                    // used to pass is never newly refused over its metadata.
+                    ImageMetadataStripper.PassThrough.Reencode -> if (bytes.size <= room) {
+                        val upright = shrink(source, bytes, bytes.size)
+                            ?.takeIf { it.bytes.isNotEmpty() && it.bytes.size <= bytes.size }
+                        if (upright != null) {
+                            out += attachment(index, upright.contentType, upright.bytes)
+                            used += upright.bytes.size
+                        } else {
+                            out += attachment(index, source.contentType, bytes)
+                            used += bytes.size
+                        }
+                        return@forEachIndexed
+                    }
+                }
             }
             // A GIF and a video are the same problem here: both encoders flatten
             // an animation to its first frame, and nothing in this app re-encodes
