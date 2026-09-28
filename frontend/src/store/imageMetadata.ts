@@ -28,7 +28,14 @@ export function buildAttachment(name: string, contentType: string, bytes: Uint8A
   };
 }
 
-/** APP1 contains EXIF/XMP; COM contains comments. APP0 and APP2 stay intact. */
+/**
+ * APP1 contains EXIF/XMP; COM contains comments. APP0 and APP2 stay intact.
+ *
+ * Known limits of the owner's rule (everything from SOS on is kept verbatim):
+ * trailers after the primary image — MPF secondary images addressed from
+ * APP2, Samsung's SEFT block after EOI — keep whatever metadata they carry,
+ * and dropping APP1 also drops the EXIF Orientation tag.
+ */
 function stripJpeg(bytes: Uint8Array): Uint8Array {
   if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) return bytes;
 

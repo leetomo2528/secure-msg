@@ -13,6 +13,7 @@ import {
   putBlockKeywordRow,
   putBlockedSenderRow,
   putMessage,
+  removeBlockKeyword,
   type MessageRow,
 } from "./db";
 import { decodeRelayContent, useStore } from "./useStore";
@@ -393,7 +394,12 @@ describe("register password policy", () => {
 });
 
 describe("closed-thread block-rule metadata", () => {
-  afterEach(() => {
+  afterEach(async () => {
+    // A failure between addBlock and removeBlock must not leave the rule
+    // hiding rows in later tests of this file.
+    for (const row of await listBlockKeywords()) {
+      if (row.keyword === "광고") await removeBlockKeyword(row.id);
+    }
     vi.restoreAllMocks();
     api.setToken(null);
     useStore.setState({

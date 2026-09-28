@@ -1355,8 +1355,20 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   // newly discovered cids. postLogin deduplicates this security generation.
   await me.refreshConvMeta();
   if (!canUseCrypto(context)) return;
+  const listBeforeLogin = useStore.getState().conversations;
   await me.refreshConversations();
   if (!canUseCrypto(context)) return;
+  // Pin the initial pass to the list fetched here, before the socket handlers
+  // exist: no message_new can have added a thread to it yet, so an armed
+  // marker becomes exactly the history this login imports (an empty fetched
+  // list ends the pass outright). refreshConversations replaces the array
+  // only on success; a failed fetch leaves the marker armed for syncAll.
+  if (useStore.getState().conversations !== listBeforeLogin) {
+    const listed = useStore.getState().conversations.map((conv) => conv.cid);
+    const pinned = await runSessionEffect(context, () => beginInitialSyncPass(listed, true))
+      .catch(() => canUseCrypto(context));
+    if (!pinned) return;
+  }
   // Before the socket: the sidebar and every thread read direction off the
   // stored rows, so history that predates the field should be classified
   // before the user can look at it. Costs nothing once it has run.
@@ -1370,6 +1382,12 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     if (!canUseCrypto(context)) return;
     const state = useStore.getState();
     useStore.setState({ error: null });
+    // Normally postLogin already turned an armed marker into a pending set (or
+    // dropped it) from the list it fetched before any socket event could run;
+    // here a pending set is only narrowed. The rest covers a login whose list
+    // fetch failed, leaving the marker armed. Residual gap in that case only:
+    // a brand-new thread whose message_new lands during the refresh below and
+    // whose sync has not written a cursor row yet is counted as history.
     // An armed initial-sync marker (logout, or a store with no read state)
     // becomes the set of listed conversations without a cursor row, whose
     // history is then imported as read; conversations that appear later, via

@@ -144,6 +144,12 @@ describe("stripImageMetadata", () => {
     const before = join(SOI, filledApp0, filledApp1, sos, entropy);
     const after = stripImageMetadata(before, "image/jpeg");
     expect(after).toEqual(join(SOI, filledApp0, sos, entropy));
+
+    // Longer fill runs, including one directly before SOS, keep the same framing.
+    const runApp1 = join(Uint8Array.from([0xff, 0xff, 0xff]), app1);
+    const runSos = join(Uint8Array.from([0xff, 0xff]), sos);
+    const longer = join(SOI, app0, runApp1, comment, runSos, entropy);
+    expect(stripImageMetadata(longer, "image/jpeg")).toEqual(join(SOI, app0, runSos, entropy));
   });
 
   it("returns malformed or incomplete PNG framing unchanged", () => {
