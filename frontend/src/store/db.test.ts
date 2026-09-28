@@ -180,13 +180,19 @@ describe("cursors", () => {
   });
 
   it("seeds read_seq from the pre-advance cursor so old threads are not unread", async () => {
-    // The upgrade case: a row written before unread counts existed.
-    await setCursor("c_read", 4);
+    // A legacy cursor row has no read_seq; setCursor must seed it from 4, not 5.
+    await db();
+    const d = await openDB("secure-msg", 5);
+    await d.put("cursors", { cid: "c_read", last_seq: 4, retry_from: null });
+    d.close();
     await putMessage(msg("c_read", 5, { sender_sid: "dev_peer" }));
     await setCursor("c_read", 5);
     const summaries = await conversationSummaries("dev_me");
     expect(summaries["c_read"].unread).toBe(1);
     expect(summaries["c_read"].lastSeq).toBe(5);
+    const check = await openDB("secure-msg", 5);
+    expect((await check.get("cursors", "c_read")).read_seq).toBe(4);
+    check.close();
   });
 
   it("clears the unread count once the conversation is marked read", async () => {
