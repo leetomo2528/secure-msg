@@ -53,6 +53,40 @@ object BridgeLifecyclePolicy {
      * both start the bridge on every open; [urgent] (credentials just
      * appeared, or a send just queued outbox work) always goes through.
      */
+    /**
+     * HTTP answers that say "the relay (or something in front of it) is not
+     * serving right now", not "you are refused": timeout, rate limit, and every
+     * 5xx a reverse proxy or tunnel returns while the backend restarts.
+     */
+    fun isTransientHttpStatus(status: Int): Boolean =
+        status == 408 || status == 425 || status == 429 || status in 500..599
+
+    /**
+     * `startBridge`'s auth check: null when the call threw (unreachable), else
+     * RelayApi's parsed body, which carries `_http_status` on any failure.
+     */
+    fun isTransientAuthCheck(response: org.json.JSONObject?): Boolean =
+        response == null || isTransientHttpStatus(response.optInt("_http_status"))
+
+    /**
+     * A REST call that threw because the relay could not be reached at all
+     * (DNS, refused, reset, timeout — all IOExceptions in OkHttp), as opposed
+     * to a parse or verification failure that retrying will not change.
+     */
+    fun isTransientFailure(t: Throwable): Boolean = t is java.io.IOException
+
+    /**
+     * Whether `startBridge` should return and leave the running service with
+     * its existing relay client when its REST preflight (the auth check or the
+     * key-directory refresh) failed. Only for a [transient] failure, and only
+     * when a client exists ([hasClient]) to keep retrying: stopping there
+     * would turn every relay outage the reconnect watchdog runs into into a
+     * dead bridge that nothing restarts once the relay is back. A refusal or a
+     * failed trust verification is never transient and still stops.
+     */
+    fun keepClientAfterFailedPreflight(hasClient: Boolean, transient: Boolean): Boolean =
+        hasClient && transient
+
     fun shouldStartBridge(nowElapsed: Long, lastStartElapsed: Long?, urgent: Boolean): Boolean {
         if (urgent || lastStartElapsed == null) return true
         return nowElapsed - lastStartElapsed >= START_DEBOUNCE_MS

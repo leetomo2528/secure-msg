@@ -379,14 +379,19 @@ class SmsBridgeService : Service() {
             invalidateSession("REST authentication rejected")
             return
         }
-        if (authCheck == null && relay != null) {
-            // Relay unreachable, but a client already exists and Socket.IO is
-            // retrying it on its own. Falling through would fail the trust
-            // refresh below with the same outage and stopSelf() the bridge —
-            // which the reconnect watchdog would otherwise do after every 90s
-            // of server downtime. Keep the client; the next kick retries.
+        // Relay unreachable (threw) or answering 408/429/5xx, but a client
+        // already exists and Socket.IO is retrying it on its own. Falling
+        // through would fail the trust refresh below with the same outage and
+        // stopSelf() the bridge — which the reconnect watchdog would otherwise
+        // do after every 90s of server downtime. Keep the client; the next
+        // kick retries. The directory is not used on this path.
+        val authTransient = BridgeLifecyclePolicy.isTransientAuthCheck(authCheck)
+        if (BridgeLifecyclePolicy.keepClientAfterFailedPreflight(relay != null, authTransient)) {
             Log.w(TAG, "Relay unreachable; keeping the existing client")
-            Diagnostics.record("bridge_start_skipped", "cause=unreachable n=${relay?.ordinal}")
+            Diagnostics.record(
+                "bridge_start_skipped",
+                "cause=unreachable http=${authCheck?.optInt("_http_status") ?: 0} n=${relay?.ordinal}",
+            )
             return
         }
         val trustView = DeviceSecurityController(
@@ -395,6 +400,15 @@ class SmsBridgeService : Service() {
             DeviceTrustRepository(db),
         ).refresh()
         if (trustView.blocksDirectoryUse) {
+            // The same outage can also land between the two calls (auth check
+            // answered, key-directory 502s or the network drops). That view
+            // learned nothing about trust; keep the client rather than stop.
+            // Trust warnings, a pending self and 401/403/404 still stop.
+            if (BridgeLifecyclePolicy.keepClientAfterFailedPreflight(relay != null, trustView.transient)) {
+                Log.w(TAG, "Key directory unreachable; keeping the existing client")
+                Diagnostics.record("bridge_start_skipped", "cause=directory_unreachable n=${relay?.ordinal}")
+                return
+            }
             Log.e(TAG, "Bridge blocked by device trust: $trustView")
             recordStop("trust_blocked")
             stopSelf()

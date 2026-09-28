@@ -80,12 +80,13 @@ class DiagnosticsFormatTest {
     }
 
     @Test
-    fun `throwable summary carries class names and a frame but never the message`() {
+    fun `throwable summary is the class chain only, never the message or a frame`() {
         val cause = IOException("sms to 010-1234-5678 body=secret token=abc")
         val error = IllegalStateException("wrapped 01012345678", cause)
         val summary = DiagnosticsFormat.throwableSummary(error)
-        assertTrue(summary, summary.startsWith("chain=java.lang.IllegalStateException>java.io.IOException"))
-        assertTrue(summary, summary.contains(" at="))
+        assertEquals("chain=java.lang.IllegalStateException>java.io.IOException", summary)
+        assertFalse(summary, summary.contains(" at="))
+        assertFalse(summary, summary.contains("DiagnosticsFormatTest"))
         assertFalse(summary, summary.contains("secret"))
         assertFalse(summary, summary.contains("token"))
         assertFalse(summary, summary.contains("1234"))

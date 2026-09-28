@@ -368,9 +368,9 @@ object DiagnosticsFormat {
     }
 
     /**
-     * Class names of [error] and its causes (outermost first) plus the top
-     * frame of [error]. Deliberately no message: exception messages can carry
-     * phone numbers, bodies or URLs with tokens.
+     * Class names of [error] and its causes (outermost first), and nothing
+     * else. Deliberately no message (exception messages can carry phone
+     * numbers, bodies or URLs with tokens) and no stack frames.
      */
     fun throwableSummary(error: Throwable, maxDepth: Int = 6): String {
         val names = mutableListOf<String>()
@@ -380,11 +380,7 @@ object DiagnosticsFormat {
             names += current.javaClass.name
             current = current.cause
         }
-        val frame = error.stackTrace.firstOrNull()?.let { "${it.className}.${it.methodName}:${it.lineNumber}" }
-        return buildString {
-            append("chain=").append(names.joinToString(">"))
-            if (frame != null) append(" at=").append(frame)
-        }
+        return "chain=" + names.joinToString(">")
     }
 
     fun exitReasonName(reason: Int): String = when (reason) {

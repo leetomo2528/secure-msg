@@ -305,6 +305,13 @@ data class DeviceSecurityView(
      * a directory that verified, so a caller that gates on it fails closed.
      */
     val activeSids: Set<String> = emptySet(),
+    /**
+     * Set only alongside [error], when the directory could not be fetched at
+     * all: a network failure, or a relay answering 408/429/5xx. The directory
+     * is still unusable, but nothing about trust was learned, so a caller that
+     * already runs a relay client may wait for the relay instead of stopping.
+     */
+    val transient: Boolean = false,
 )
 
 class DeviceSecurityController(
@@ -326,7 +333,10 @@ class DeviceSecurityController(
                     )
                 }
             }
-            return DeviceSecurityView(error = directoryResponse.optString("error", "키 디렉터리 조회 실패"))
+            return DeviceSecurityView(
+                error = directoryResponse.optString("error", "키 디렉터리 조회 실패"),
+                transient = BridgeLifecyclePolicy.isTransientHttpStatus(directoryResponse.optInt("_http_status")),
+            )
         }
         val identity = directoryResponse.optString("identity_sig_pub")
         val epoch = directoryResponse.optLong("security_epoch", -1)
@@ -401,7 +411,10 @@ class DeviceSecurityController(
             )
         }
         } catch (e: Exception) {
-            DeviceSecurityView(error = e.message ?: "기기 보안 조회 실패")
+            DeviceSecurityView(
+                error = e.message ?: "기기 보안 조회 실패",
+                transient = BridgeLifecyclePolicy.isTransientFailure(e),
+            )
         }
     }
 
