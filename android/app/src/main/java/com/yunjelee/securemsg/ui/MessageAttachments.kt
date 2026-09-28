@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.yunjelee.securemsg.ImageBytes
 import com.yunjelee.securemsg.ImageShrinkPolicy
 import com.yunjelee.securemsg.RelayContentCodec
 import kotlinx.coroutines.Dispatchers
@@ -142,7 +143,7 @@ private object AttachmentBitmaps {
         cache.get(key)?.let { return it }
         return try {
             val row = MessageAttachmentPolicy.parse(json).getOrNull(index) ?: return null
-            val bitmap = decodeBounded(RelayContentCodec.decodeBytes(row.data)) ?: return null
+            val bitmap = decodeBounded(RelayContentCodec.decodeBytes(row.data), row.contentType) ?: return null
             cache.put(key, bitmap)
             bitmap
         } catch (t: Throwable) {
@@ -178,13 +179,30 @@ private object AttachmentBitmaps {
      *
      * An animated GIF arrives as its first frame; the alternative is refusing
      * to show a GIF the web client displays.
+     *
+     * Nothing is decoded unless the bytes sniff as the format [contentType]
+     * declares ([ImageBytes.matchesDeclared]). ImageDecoder picks its codec
+     * from the bytes, so a row declared image/jpeg that is really a DNG, ICO,
+     * WBMP or AVIF would otherwise reach that parser the moment the thread
+     * scrolls it into view -- in the process that holds the E2E keys. A
+     * mismatch is a null, which the bubble already shows as a picture it
+     * cannot open. The header callback repeats the check against the codec
+     * the decoder actually chose and refuses sources past
+     * [ImageBytes.MAX_DECODE_PIXELS]; a throw there lands in the catch below.
      */
-    private fun decodeBounded(bytes: ByteArray): Bitmap? {
+    private fun decodeBounded(bytes: ByteArray, contentType: String): Bitmap? {
         if (bytes.isEmpty()) return null
+        if (!ImageBytes.matchesDeclared(bytes, contentType)) return null
         return try {
             ImageDecoder.decodeBitmap(
                 ImageDecoder.createSource(ByteBuffer.wrap(bytes)),
             ) { decoder, info, _ ->
+                check(ImageBytes.decoderMimeMatches(contentType, info.mimeType)) {
+                    "decoder chose a codec the declared type does not name"
+                }
+                check(ImageBytes.withinPixelCap(info.size.width, info.size.height)) {
+                    "source exceeds the decode pixel cap"
+                }
                 val target = ImageShrinkPolicy.targetSize(
                     info.size.width,
                     info.size.height,

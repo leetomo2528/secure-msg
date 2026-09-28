@@ -50,8 +50,21 @@ object ImageShrinkPolicy {
     /** Pixel dimensions of a re-encode target. */
     data class Size(val width: Int, val height: Int)
 
-    /** One part offered to [allocate]: what it is, and how big it claims to be. */
-    data class Candidate(val contentType: String, val declaredSize: Int)
+    /**
+     * One part offered to [allocate]: what it is, and how big it claims to be.
+     *
+     * @param passThrough the caller has read the bytes and knows this part must
+     *   travel verbatim whatever its type says -- an animated WebP, whose type
+     *   is shrinkable but whose re-encode would be its first frame. Reserved at
+     *   [declaredSize] like a GIF instead of being handed a share to shrink
+     *   into, so an animation that fits is never refused where a GIF of the
+     *   same size would pass.
+     */
+    data class Candidate(
+        val contentType: String,
+        val declaredSize: Int,
+        val passThrough: Boolean = false,
+    )
 
     /**
      * The shared ladder, highest rung first.
@@ -265,7 +278,7 @@ object ImageShrinkPolicy {
                 // fit. Giving a non-image nothing was what dropped a 40 KB
                 // audio part that the previous build carried without trouble,
                 // and announced it as a loss.
-                isShrinkable(mime) -> {
+                isShrinkable(mime) && !candidate.passThrough -> {
                     pending += index
                     slots += 1
                 }
@@ -317,6 +330,13 @@ object ImageShrinkPolicy {
      * travels untouched at its measured size or it does not travel.
      */
     fun isPassThrough(mime: String?): Boolean = mediaType(mime) == "image/gif"
+
+    /**
+     * Declared as WebP -- the one shrinkable type that may also be an
+     * animation. The type alone cannot say which; callers that see one read the
+     * bytes and ask [ImageBytes.isAnimatedWebp] before re-encoding it.
+     */
+    fun isWebp(mime: String?): Boolean = mediaType(mime) == "image/webp"
 
     /**
      * A part whose loss costs the user nothing.
