@@ -769,6 +769,50 @@ export interface ConversationSummary {
   unread: number;
 }
 
+export const UNREAD_CAP = 100;
+
+/** Indexed arrival state for one conversation, without loading other bodies. */
+export async function conversationSummary(
+  cid: string,
+  mySid: string,
+  myUid?: number | null,
+): Promise<ConversationSummary | null> {
+  const d = await db();
+  const tx = d.transaction(["messages", "cursors"], "readonly");
+  const readRow = await tx.objectStore("cursors").get(cid);
+  const readSeq = readRow?.read_seq ?? readRow?.last_seq ?? 0;
+  const messages = tx.objectStore("messages").index("by-cid-seq");
+  const bounds = IDBKeyRange.bound(
+    [cid, Number.NEGATIVE_INFINITY], [cid, Number.POSITIVE_INFINITY],
+  );
+  let newest = await messages.openCursor(bounds, "prev");
+  while (newest?.value.blocked) newest = await newest.continue();
+  if (!newest) {
+    await tx.done;
+    return null;
+  }
+
+  const row = newest.value;
+  const summary: ConversationSummary = {
+    lastSeq: row.seq,
+    lastAt: row.created_at,
+    preview: messageDirection(row, mySid, myUid) === "out"
+      ? `나: ${previewOf(row)}` : previewOf(row),
+    unread: 0,
+  };
+  let cursor = await messages.openCursor(
+    IDBKeyRange.bound([cid, readSeq + 1], [cid, Number.POSITIVE_INFINITY]),
+  );
+  while (cursor && summary.unread < UNREAD_CAP) {
+    if (!cursor.value.blocked && messageDirection(cursor.value, mySid, myUid) !== "out") {
+      summary.unread += 1;
+    }
+    if (summary.unread < UNREAD_CAP) cursor = await cursor.continue();
+  }
+  await tx.done;
+  return summary;
+}
+
 /**
  * Per-conversation arrival state for the sidebar, read straight from the rows.
  *
@@ -801,7 +845,9 @@ export async function conversationSummaries(
     // Only what someone else sent can be unread. A text the owner typed on
     // their own phone comes back through the gateway under its sid, and the
     // sender check alone would badge the owner's own messages.
-    if (!outgoing && row.seq > (readSeq.get(row.cid) ?? 0)) summary.unread += 1;
+    if (!outgoing && row.seq > (readSeq.get(row.cid) ?? 0)) {
+      summary.unread = Math.min(UNREAD_CAP, summary.unread + 1);
+    }
   }
   return out;
 }
