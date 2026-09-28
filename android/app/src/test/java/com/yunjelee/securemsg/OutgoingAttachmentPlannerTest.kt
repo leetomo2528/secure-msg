@@ -413,6 +413,101 @@ class OutgoingAttachmentPlannerTest {
     }
 
     @Test
+    fun `an animated WebP travels whole, like a GIF, and is never re-encoded`() {
+        val sticker = ImageFixtures.animatedWebp(60_000)
+        val shrinker = Shrinker()
+        val plan = OutgoingAttachmentPlanner.plan(
+            sources = listOf(OutgoingAttachmentPlanner.Source("image/webp", sticker.size)),
+            budget = 200_000,
+            read = { ImageShrinkPolicy.PartRead.Ok(sticker) },
+            shrink = shrinker.fn(),
+        )
+        val out = ready(plan).single()
+        assertEquals("image/webp", out.contentType)
+        assertArrayEquals(sticker, RelayContentCodec.decodeBytes(out.data))
+        assertTrue(shrinker.budgets.isEmpty())
+    }
+
+    @Test
+    fun `an animated WebP over budget is refused rather than flattened to its first frame`() {
+        // The defect: 600 KB of sticker went to the shrinker as "image/webp",
+        // came back as a JPEG of frame one, and was reported as sent.
+        val sticker = ImageFixtures.animatedWebp(600_000)
+        val shrinker = Shrinker()
+        val plan = OutgoingAttachmentPlanner.plan(
+            sources = listOf(OutgoingAttachmentPlanner.Source("image/webp", sticker.size)),
+            budget = 200_000,
+            read = { ImageShrinkPolicy.PartRead.Ok(sticker) },
+            shrink = shrinker.fn(),
+        )
+        assertKorean(refusal(plan))
+        assertTrue(shrinker.budgets.isEmpty())
+
+        // Inside the wire cap but over this carrier's budget: same answer.
+        val midSized = ImageFixtures.animatedWebp(300_000)
+        val refused = OutgoingAttachmentPlanner.plan(
+            sources = listOf(OutgoingAttachmentPlanner.Source("image/webp", midSized.size)),
+            budget = 200_000,
+            read = { ImageShrinkPolicy.PartRead.Ok(midSized) },
+            shrink = shrinker.fn(),
+        )
+        assertKorean(refusal(refused))
+        assertTrue(shrinker.budgets.isEmpty())
+    }
+
+    @Test
+    fun `an animated WebP beside photos passes wherever a GIF of the same size would`() {
+        // Three big photos and a 150 KB animation in a 300 KB budget. An even
+        // split would give the animation 75 KB it can never be squeezed into;
+        // a GIF is reserved whole. The WebP must get the GIF's answer.
+        val size = 150_000
+        val budget = 300_000
+        val photos = List(3) { jpeg(2_000_000) }
+        fun planWith(type: String, bytes: ByteArray): OutgoingAttachmentPlanner.Plan =
+            OutgoingAttachmentPlanner.plan(
+                sources = listOf(OutgoingAttachmentPlanner.Source(type, bytes.size)) + photos,
+                budget = budget,
+                read = { index -> if (index == 0) ImageShrinkPolicy.PartRead.Ok(bytes) else ok(2_000_000) },
+                shrink = Shrinker().fn(),
+            )
+        val gif = ready(planWith("image/gif", ByteArray(size) { 0x47 }))
+        val reader = Reader(
+            listOf(ImageShrinkPolicy.PartRead.Ok(ImageFixtures.animatedWebp(size))) + List(3) { ok(2_000_000) },
+        )
+        val shrinker = Shrinker()
+        val webp = ready(
+            OutgoingAttachmentPlanner.plan(
+                sources = listOf(OutgoingAttachmentPlanner.Source("image/webp", size)) + photos,
+                budget = budget,
+                read = reader.fn(),
+                shrink = shrinker.fn(),
+            ),
+        )
+        assertEquals(size, gif[0].size)
+        assertEquals(size, webp[0].size)
+        assertEquals(gif.map { it.size }, webp.map { it.size })
+        assertTrue(webp.sumOf { it.size } <= budget)
+        // The animation is read once, in the pre-pass, and never re-encoded:
+        // three shrinks for three photos.
+        assertEquals(listOf(0, 1, 2, 3), reader.indices)
+        assertEquals(3, shrinker.budgets.size)
+    }
+
+    @Test
+    fun `a still WebP is still shrunk like any photo`() {
+        val still = ImageFixtures.stillWebp(400_000)
+        val shrinker = Shrinker()
+        val plan = OutgoingAttachmentPlanner.plan(
+            sources = listOf(OutgoingAttachmentPlanner.Source("image/webp", still.size)),
+            budget = 200_000,
+            read = { ImageShrinkPolicy.PartRead.Ok(still) },
+            shrink = shrinker.fn(),
+        )
+        assertEquals("image/jpeg", ready(plan).single().contentType)
+        assertEquals(listOf(200_000), shrinker.budgets)
+    }
+
+    @Test
     fun `an unreadable pick is named rather than dropped`() {
         val plan = OutgoingAttachmentPlanner.plan(
             sources = listOf(jpeg(30_000)),

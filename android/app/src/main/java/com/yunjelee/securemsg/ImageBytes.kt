@@ -118,6 +118,71 @@ object ImageBytes {
         return width.toLong() * height.toLong() <= MAX_DECODE_PIXELS
     }
 
+    /** VP8X flags byte, bit 1: the file is an animation (WebP container spec, "Extended File Format"). */
+    private const val VP8X_ANIMATION_FLAG = 0x02
+
+    /** Upper bound on chunks walked; a real still WebP has a handful, and a longer list is not proof of anything. */
+    private const val MAX_WEBP_CHUNKS = 1024
+
+    /**
+     * Whether [bytes] are a WebP that may be animated -- i.e. one that must
+     * never be handed to a re-encoder, because Bitmap.compress keeps frame one
+     * and drops the animation without a word (SM-9).
+     *
+     * False for anything that is not a RIFF/WEBP container at all: those are
+     * not this function's question, and the byte gate refuses them anyway.
+     *
+     * For a WebP, false only when the file is PROVABLY still:
+     *  - its first chunk is `VP8 ` or `VP8L` (the simple formats, which cannot
+     *    carry animation), or
+     *  - its first chunk is a complete `VP8X` whose animation flag is clear and
+     *    a complete walk of every chunk inside the RIFF finds no `ANIM` or
+     *    `ANMF`.
+     * Everything else -- the flag set, an ANIM/ANMF chunk anywhere, a VP8X
+     * shorter than its 10-byte payload, a chunk running past the data, an
+     * unknown first chunk, more than [MAX_WEBP_CHUNKS] chunks -- answers true.
+     * Conservative on purpose: calling a still image animated costs a pass
+     * through or an announced omission; calling an animation still silently
+     * turns a sticker into a JPEG of its first frame.
+     *
+     * A truncated prefix of a VP8X file therefore reads as animated even when
+     * it is not, which is the intended answer for the incoming path's
+     * over-limit read: it cannot prove the rest is still.
+     */
+    fun isAnimatedWebp(bytes: ByteArray): Boolean {
+        if (!isRiffWebp(bytes)) return false
+        // Not even a complete first chunk header.
+        if (bytes.size < 20) return true
+        when (fourcc(bytes, 12)) {
+            "VP8 ", "VP8L" -> return false
+            "VP8X" -> Unit
+            else -> return true
+        }
+        val vp8xSize = le32(bytes, 16)
+        if (vp8xSize < 10 || 20 + 10 > bytes.size) return true
+        if ((u8(bytes, 20) and VP8X_ANIMATION_FLAG) != 0) return true
+        // The RIFF size counts from offset 8. Walk only what the container
+        // claims AND the bytes actually hold: a claim past the data is a
+        // truncated file, and trailing bytes past the claim are not chunks.
+        val end = 8L + le32(bytes, 4)
+        if (end > bytes.size) return true
+        var at = 12L
+        var walked = 0
+        while (at < end) {
+            if (walked++ >= MAX_WEBP_CHUNKS) return true
+            if (at + 8 > end) return true
+            val tag = fourcc(bytes, at.toInt())
+            if (tag == "ANIM" || tag == "ANMF") return true
+            val size = le32(bytes, at.toInt() + 4)
+            val payloadEnd = at + 8 + size
+            if (payloadEnd > end) return true
+            // Chunks are padded to an even length; a missing final pad byte is
+            // tolerated, a missing payload byte is not.
+            at = minOf(payloadEnd + (size and 1L), end)
+        }
+        return false
+    }
+
     private fun isJpeg(bytes: ByteArray): Boolean =
         bytes.size >= 3 && u8(bytes, 0) == 0xFF && u8(bytes, 1) == 0xD8 && u8(bytes, 2) == 0xFF
 

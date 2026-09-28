@@ -405,6 +405,89 @@ class MmsProviderPolicyTest {
     }
 
     @Test
+    fun `an animated WebP travels byte-identical or is announced, never flattened`() {
+        val neverShrink: (ProviderMmsCandidate, ByteArray, Int) -> ProviderMmsPart? =
+            { _, _, _ -> error("an animated WebP must never be re-encoded") }
+        val sticker = ImageFixtures.animatedWebp(120_000)
+        val fits = materialize(
+            listOf(candidate(1L, "image/webp", sticker.size)),
+            reads = mapOf(1L to ImageShrinkPolicy.PartRead.Ok(sticker)),
+            shrink = neverShrink,
+        )
+        assertArrayEquals(sticker, fits.parts.single().bytes)
+        assertEquals("image/webp", fits.parts.single().contentType)
+        assertTrue(fits.omissions.isEmpty())
+
+        // Over the relay allowance: the defect relayed a first-frame JPEG here.
+        val big = ImageFixtures.animatedWebp(700_000)
+        val tooBig = materialize(
+            listOf(candidate(2L, "image/webp", big.size)),
+            reads = mapOf(2L to ImageShrinkPolicy.PartRead.Ok(big)),
+            shrink = neverShrink,
+        )
+        assertTrue(tooBig.parts.isEmpty())
+        assertEquals(
+            listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, big.size)),
+            tooBig.omissions,
+        )
+    }
+
+    @Test
+    fun `an animated WebP beside a photo is judged against what is left, not an even share`() {
+        // A photo that takes an even share and a 300 KB animation: the
+        // animation's share is 256 KiB, but it cannot be shrunk into it, so it
+        // travels whole as long as the running total still has room.
+        val sticker = ImageFixtures.animatedWebp(300_000)
+        val material = materialize(
+            listOf(candidate(1L, "image/webp", sticker.size), candidate(2L, "image/jpeg", 3_000_000)),
+            reads = mapOf(1L to ImageShrinkPolicy.PartRead.Ok(sticker), 2L to ok(3_000_000)),
+            shrink = { c, _, room ->
+                assertEquals("only the photo may be re-encoded", "image/jpeg", c.contentType)
+                ProviderMmsPart(c.name, "image/jpeg", ByteArray(room))
+            },
+        )
+        assertArrayEquals(sticker, material.parts[0].bytes)
+        assertTrue(material.parts.sumOf { it.bytes.size } <= RelayContentCodec.MAX_ATTACHMENT_BYTES)
+    }
+
+    @Test
+    fun `a truncated WebP that cannot be proven still is announced rather than shrunk`() {
+        val prefix = ImageFixtures.animatedWebp(700_000).copyOf(8_192)
+        val animated = materialize(
+            listOf(candidate(1L, "image/webp", 9_000_000)),
+            reads = mapOf(1L to ImageShrinkPolicy.PartRead.TooLarge),
+            truncated = mapOf(1L to prefix),
+            shrink = { _, _, _ -> error("a partial animation must never be re-encoded") },
+        )
+        assertTrue(animated.parts.isEmpty())
+        assertEquals(
+            listOf(IncomingOmissionNotice.Omission(IncomingOmissionNotice.Kind.IMAGE, 9_000_000)),
+            animated.omissions,
+        )
+
+        // A simple-format prefix cannot be an animation, so it is salvaged by
+        // re-encoding exactly as a truncated JPEG is.
+        val still = ImageFixtures.stillWebp(700_000).copyOf(8_192)
+        val salvaged = materialize(
+            listOf(candidate(2L, "image/webp", 9_000_000)),
+            reads = mapOf(2L to ImageShrinkPolicy.PartRead.TooLarge),
+            truncated = mapOf(2L to still),
+            shrink = { c, bytes, _ -> ProviderMmsPart(c.name, "image/jpeg", bytes.copyOf(100)) },
+        )
+        assertEquals("image/jpeg", salvaged.parts.single().contentType)
+    }
+
+    @Test
+    fun `a still WebP over its allowance is still shrunk`() {
+        val still = ImageFixtures.stillWebp(700_000)
+        val material = materialize(
+            listOf(candidate(1L, "image/webp", still.size)),
+            reads = mapOf(1L to ImageShrinkPolicy.PartRead.Ok(still)),
+        )
+        assertEquals("image/jpeg", material.parts.single().contentType)
+    }
+
+    @Test
     fun `a ninth attachment is announced rather than silently refused by the codec`() {
         val candidates = (1L..9L).map { candidate(it, "image/jpeg", 1_000) }
         val material = materialize(

@@ -169,6 +169,89 @@ class ImageBytesTest {
         assertNull(ImageShrinker.shrink(jpeg, "image/webp", 100_000))
     }
 
+    // ---- SM-9: animated WebP is never flattened ---------------------------
+
+    @Test
+    fun `a VP8X with the animation flag is animated`() {
+        val flagOnly = ImageFixtures.webp(
+            ImageFixtures.vp8x(ImageFixtures.VP8X_ANIMATION),
+            ImageFixtures.webpChunk("VP8 ", ByteArray(32)),
+        )
+        assertTrue(ImageBytes.isAnimatedWebp(flagOnly))
+        assertTrue(ImageBytes.isAnimatedWebp(ImageFixtures.animatedWebp()))
+    }
+
+    @Test
+    fun `an ANIM or ANMF chunk marks it animated even with the flag clear`() {
+        for (tag in listOf("ANIM", "ANMF")) {
+            val chunk = ImageFixtures.webp(
+                ImageFixtures.vp8x(ImageFixtures.VP8X_ALPHA),
+                ImageFixtures.webpChunk(tag, ByteArray(6)),
+                ImageFixtures.webpChunk("VP8 ", ByteArray(32)),
+            )
+            assertTrue(tag, ImageBytes.isAnimatedWebp(chunk))
+        }
+    }
+
+    @Test
+    fun `simple and still extended WebPs are static`() {
+        assertFalse(ImageBytes.isAnimatedWebp(ImageFixtures.stillWebp()))
+        assertFalse(
+            ImageBytes.isAnimatedWebp(ImageFixtures.webp(ImageFixtures.webpChunk("VP8L", ByteArray(31)))),
+        )
+        // VP8X, flag clear, alpha + image + trailing EXIF (odd length, padded).
+        val extendedStill = ImageFixtures.webp(
+            ImageFixtures.vp8x(ImageFixtures.VP8X_ALPHA or ImageFixtures.VP8X_EXIF),
+            ImageFixtures.webpChunk("ALPH", ByteArray(9)),
+            ImageFixtures.webpChunk("VP8 ", ByteArray(40)),
+            ImageFixtures.webpChunk("EXIF", ByteArray(13)),
+        )
+        assertFalse(ImageBytes.isAnimatedWebp(extendedStill))
+        // Trailing bytes past the RIFF size are not chunks.
+        assertFalse(ImageBytes.isAnimatedWebp(extendedStill + ascii("ANIM")))
+        // A simple-format WebP cannot carry animation, even as a truncated prefix.
+        assertFalse(ImageBytes.isAnimatedWebp(ImageFixtures.stillWebp().copyOf(64)))
+    }
+
+    @Test
+    fun `truncated or malformed WebP is treated as animated`() {
+        val extendedStill = ImageFixtures.webp(
+            ImageFixtures.vp8x(ImageFixtures.VP8X_ALPHA),
+            ImageFixtures.webpChunk("VP8 ", ByteArray(400)),
+        )
+        assertFalse(ImageBytes.isAnimatedWebp(extendedStill))
+        // Cut anywhere past the header: the walk cannot prove the rest is still.
+        for (cut in listOf(12, 16, 19, 20, 25, 29, 30, 38, 100, extendedStill.size - 1)) {
+            assertTrue("cut to $cut", ImageBytes.isAnimatedWebp(extendedStill.copyOf(cut)))
+        }
+        // A VP8X that declares fewer than its 10 payload bytes.
+        val shortVp8x = ImageFixtures.webp(ImageFixtures.webpChunk("VP8X", ByteArray(4)))
+        assertTrue(ImageBytes.isAnimatedWebp(padded(shortVp8x, 64)))
+        // A chunk claiming more bytes than the container holds.
+        val overlong = ImageFixtures.webp(
+            ImageFixtures.vp8x(0),
+            ImageFixtures.ascii("VP8 ") + ImageFixtures.le32(10_000) + ByteArray(8),
+        )
+        assertTrue(ImageBytes.isAnimatedWebp(overlong))
+        // An unknown first chunk.
+        assertTrue(ImageBytes.isAnimatedWebp(ImageFixtures.webp(ImageFixtures.webpChunk("JUNK", ByteArray(16)))))
+    }
+
+    @Test
+    fun `bytes that are not a WebP container are not this detector's question`() {
+        assertFalse(ImageBytes.isAnimatedWebp(ByteArray(0)))
+        assertFalse(ImageBytes.isAnimatedWebp(jpeg))
+        assertFalse(ImageBytes.isAnimatedWebp(gif89))
+        assertFalse(ImageBytes.isAnimatedWebp(ascii("RIFF") + le32(4) + ascii("AVI ")))
+    }
+
+    @Test
+    fun `the shrinker refuses an animated WebP before touching a decoder`() {
+        // Same stub argument as the byte gate above: a null with no error is
+        // proof the animation never reached ImageDecoder.
+        assertNull(ImageShrinker.shrink(ImageFixtures.animatedWebp(), "image/webp", 100_000))
+    }
+
     // ---- second defence: the decoder's own verdict and the pixel cap ------
 
     @Test

@@ -130,7 +130,7 @@ object MmsSender {
         val shrinkable = mutableListOf<Int>()
         var reserved = 0L
         attachments.forEachIndexed { index, attachment ->
-            if (ImageShrinkPolicy.isShrinkable(attachment.contentType)) {
+            if (ImageShrinkPolicy.isShrinkable(attachment.contentType) && !isAnimatedWebp(attachment)) {
                 shrinkable += index
             } else {
                 reserved += attachment.size
@@ -266,6 +266,22 @@ object MmsSender {
         } catch (e: Exception) {
             Log.w(TAG, "failed to delete temporary MMS PDU", e)
         }
+    }
+
+    /**
+     * Whether this attachment is an animated WebP, which is reserved whole like
+     * a GIF instead of being offered to the re-encoder (SM-9): Bitmap.compress
+     * would keep its first frame and the carrier would get a still.
+     *
+     * Only a part DECLARED image/webp is decoded to ask; everything else is
+     * answered from its type without touching the payload. Base64 that will not
+     * decode answers false, so the part stays on the shrinkable path whose own
+     * decode names it as unreadable exactly as before.
+     */
+    private fun isAnimatedWebp(attachment: RelayAttachment): Boolean {
+        if (!ImageShrinkPolicy.isWebp(attachment.contentType)) return false
+        val bytes = runCatching { RelayContentCodec.decodeBytes(attachment.data) }.getOrNull() ?: return false
+        return ImageBytes.isAnimatedWebp(bytes)
     }
 
     /**

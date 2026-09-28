@@ -190,8 +190,42 @@ object OutgoingAttachmentPlanner {
         val cap = budget.coerceIn(0, RelayContentCodec.MAX_ATTACHMENT_BYTES)
         if (cap <= 0) return Plan.Refused(NO_ROOM_REASON)
 
+        // A WebP is the one type whose bytes decide how it may be budgeted: a
+        // still one shrinks like any photo, an animated one travels whole or not
+        // at all, exactly like a GIF (SM-9). The allocator has to know which
+        // BEFORE it splits the pool, or an animation that fits is handed an even
+        // share it can never be re-encoded into and refused where a GIF of the
+        // same size would pass. So WebPs alone are read first. Bytes that can
+        // still travel (inside the wire cap) are kept for the main pass rather
+        // than read twice; an animation already past the cap is refused here,
+        // because nothing below could ever send it.
+        val preread = arrayOfNulls<ByteArray>(sources.size)
+        val animated = BooleanArray(sources.size)
+        sources.forEachIndexed { index, source ->
+            if (!ImageShrinkPolicy.isWebp(source.contentType)) return@forEachIndexed
+            val bytes = readOrRefuse(index, source, read) { return it }
+            animated[index] = ImageBytes.isAnimatedWebp(bytes)
+            if (animated[index] && bytes.size > cap) {
+                return Plan.Refused(unshrinkableReason(bytes.size.toLong(), cap))
+            }
+            if (bytes.size <= cap) preread[index] = bytes
+        }
+
         val allowances = ImageShrinkPolicy.allocate(
-            sources.map { ImageShrinkPolicy.Candidate(it.contentType, it.declaredSize) },
+            sources.mapIndexed { index, source ->
+                if (animated[index]) {
+                    // Measured, not declared: the bytes are in hand, and a
+                    // resolver that declared -1 must not cost the animation its
+                    // reservation.
+                    ImageShrinkPolicy.Candidate(
+                        source.contentType,
+                        preread[index]?.size ?: source.declaredSize,
+                        passThrough = true,
+                    )
+                } else {
+                    ImageShrinkPolicy.Candidate(source.contentType, source.declaredSize)
+                }
+            },
             cap,
         )
         val out = mutableListOf<RelayAttachment>()
@@ -201,18 +235,16 @@ object OutgoingAttachmentPlanner {
             // rung chosen for an allowance the running total can no longer hold
             // would spend a full decode and encode on a photo refused anyway.
             val room = minOf(allowances.getOrElse(index) { 0 }, cap - used)
-            val bytes = when (val outcome = read(index)) {
-                is ImageShrinkPolicy.PartRead.Ok -> outcome.bytes
-                // The reader hit SOURCE_MAX_BYTES on a source that declared
-                // nothing. Same refusal as the declared-length gate above.
-                ImageShrinkPolicy.PartRead.TooLarge ->
-                    return Plan.Refused(oversizeSourceReason(source.declaredSize.toLong()))
-                // Revoked URI, deleted file, a cloud provider that will not
-                // download. Deterministic and worth naming: the composer would
-                // meet the same failure and report it as a bare false.
-                ImageShrinkPolicy.PartRead.Failed -> return Plan.Refused(UNREADABLE_REASON)
+            val bytes = preread[index]?.also { preread[index] = null }
+                ?: readOrRefuse(index, source, read) { return it }
+            // Verbatim or refused, never re-encoded: the shrinker would keep
+            // frame one and report success.
+            if (animated[index]) {
+                if (bytes.size > room) return Plan.Refused(unshrinkableReason(bytes.size.toLong(), cap))
+                out += attachment(index, source.contentType, bytes)
+                used += bytes.size
+                return@forEachIndexed
             }
-            if (bytes.isEmpty()) return Plan.Refused(UNREADABLE_REASON)
             // Already inside its share AND in a format both ends draw: travels
             // byte for byte, because re-encoding a photo that fits costs
             // quality for nothing.
@@ -248,6 +280,31 @@ object OutgoingAttachmentPlanner {
             used += shrunk.bytes.size
         }
         return Plan.Ready(out)
+    }
+
+    /**
+     * One source's bytes, or the refusal its read earns, handed to [refuse] --
+     * which every caller makes a non-local `return` out of [plan].
+     */
+    private inline fun readOrRefuse(
+        index: Int,
+        source: Source,
+        read: (Int) -> ImageShrinkPolicy.PartRead,
+        refuse: (Plan.Refused) -> Nothing,
+    ): ByteArray {
+        val bytes = when (val outcome = read(index)) {
+            is ImageShrinkPolicy.PartRead.Ok -> outcome.bytes
+            // The reader hit SOURCE_MAX_BYTES on a source that declared
+            // nothing. Same refusal as the declared-length gate in [plan].
+            ImageShrinkPolicy.PartRead.TooLarge ->
+                refuse(Plan.Refused(oversizeSourceReason(source.declaredSize.toLong())))
+            // Revoked URI, deleted file, a cloud provider that will not
+            // download. Deterministic and worth naming: the composer would
+            // meet the same failure and report it as a bare false.
+            ImageShrinkPolicy.PartRead.Failed -> refuse(Plan.Refused(UNREADABLE_REASON))
+        }
+        if (bytes.isEmpty()) refuse(Plan.Refused(UNREADABLE_REASON))
+        return bytes
     }
 
     /**

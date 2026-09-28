@@ -647,12 +647,28 @@ object MmsProvider {
                 ImageShrinkPolicy.PartRead.TooLarge ->
                     if (shrinkable) readTruncated(candidate) else ByteArray(0)
             }
+            val whole = outcome !is ImageShrinkPolicy.PartRead.TooLarge
 
-            if (passThrough || !shrinkable) {
-                // Verbatim or not at all. A GIF because both encoders flatten
-                // an animation to its first frame, so "shrinking" one destroys
-                // the only thing it was; a clip or a document because nothing
-                // here can re-encode it at all.
+            // A WebP that is (or cannot be proven not to be) an animation is a
+            // GIF by another name: the re-encoder keeps frame one and the owner
+            // is relayed a still dressed up as the sticker they were sent
+            // (SM-9). Decided from the bytes, because the type cannot say. A
+            // truncated prefix cannot prove the rest of the file is still, and
+            // a partial animation cannot be relayed verbatim, so that is an
+            // omission. Only the relay copy is affected: identity was derived
+            // from MmsProvider.read's own parts before this ran.
+            val animatedWebp = shrinkable && ImageShrinkPolicy.isWebp(type) &&
+                ImageBytes.isAnimatedWebp(source)
+            if (animatedWebp && !whole) {
+                omit(type, measured)
+                return@forEachIndexed
+            }
+
+            if (passThrough || !shrinkable || animatedWebp) {
+                // Verbatim or not at all. A GIF (or an animated WebP) because
+                // both encoders flatten an animation to its first frame, so
+                // "shrinking" one destroys the only thing it was; a clip or a
+                // document because nothing here can re-encode it at all.
                 //
                 // Judged against what is actually left rather than against the
                 // pre-split allowance: these bytes cannot be made to fit a
@@ -672,7 +688,6 @@ object MmsProvider {
             // one byte for byte would put a broken image in the bubble, which
             // is a worse lie than the omission notice: only a re-encode can
             // turn what was salvaged back into something that opens.
-            val whole = outcome !is ImageShrinkPolicy.PartRead.TooLarge
             if (whole && source.size <= allowance &&
                 accept(ProviderMmsPart(candidate.name, type, source))
             ) {

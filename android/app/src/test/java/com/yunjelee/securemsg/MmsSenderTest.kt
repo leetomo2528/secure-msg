@@ -202,6 +202,56 @@ class MmsSenderTest {
         assertTrue(shrinks.budgets.isEmpty())
     }
 
+    private fun attachmentOf(name: String, contentType: String, bytes: ByteArray) = RelayAttachment(
+        name = name,
+        contentType = contentType,
+        data = RelayContentCodec.encodeBytes(bytes),
+        size = bytes.size,
+    )
+
+    @Test
+    fun anAnimatedWebpOverTheCeilingIsRejectedNeverFlattened() {
+        // image/webp is a shrinkable TYPE, so before SM-9 this went to the
+        // re-encoder and the carrier got a JPEG of frame one.
+        val content = mms(attachments = listOf(attachmentOf("s.webp", "image/webp", ImageFixtures.animatedWebp(400 * 1024))))
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn())
+
+        assertTrue(fit is MmsSender.Fit.TooLarge)
+        assertTrue((fit as MmsSender.Fit.TooLarge).reason.any { it in '가'..'힣' })
+        assertTrue("an animation must never reach the re-encoder", shrinks.budgets.isEmpty())
+    }
+
+    @Test
+    fun anAnimatedWebpBesideAPhotoIsReservedWholeAndThePhotoPaysForIt() {
+        val sticker = attachmentOf("s.webp", "image/webp", ImageFixtures.animatedWebp(60 * 1024))
+        val content = mms(attachments = listOf(sticker, attachment("photo.jpg", "image/jpeg", 400 * 1024)))
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(
+            content,
+            MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE,
+            shrinks.fn(),
+        ) as MmsSender.Fit.Ready
+
+        val budget = budgetFor(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE)
+        assertSame(sticker, fit.attachments[0])
+        assertEquals(listOf("image/jpeg"), shrinks.types)
+        assertEquals(budget - sticker.size, fit.attachments[1].size)
+    }
+
+    @Test
+    fun aStillWebpOverTheCeilingIsStillShrunk() {
+        val content = mms(attachments = listOf(attachmentOf("p.webp", "image/webp", ImageFixtures.stillWebp(400 * 1024))))
+        val shrinks = fits()
+
+        val fit = MmsSender.plan(content, MmsAttachmentBudget.DEFAULT_MAX_MESSAGE_SIZE, shrinks.fn())
+
+        assertTrue(fit is MmsSender.Fit.Ready)
+        assertEquals(listOf("image/webp"), shrinks.types)
+    }
+
     @Test
     fun aReEncoderThatCannotReachTheBudgetIsRejectedRatherThanDispatched() {
         val content = mms(attachments = listOf(attachment("photo.jpg", "image/jpeg", 400 * 1024)))

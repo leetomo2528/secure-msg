@@ -94,6 +94,11 @@ object ImageShrinker {
         // the process that holds the E2E keys. A mismatch is an omission, never
         // a decode.
         if (!ImageBytes.matchesDeclared(bytes, contentType)) return null
+        // An animated WebP is a GIF by another name: the decoder hands back
+        // frame one and the animation is gone. Every caller already routes one
+        // around this (planner, carrier fit, incoming materialize); this is the
+        // backstop, so a caller that forgets gets an omission, not a still.
+        if (ImageBytes.isAnimatedWebp(bytes)) return null
         return try {
             walkLadder(bytes, contentType, budget)
         } catch (t: Throwable) {
