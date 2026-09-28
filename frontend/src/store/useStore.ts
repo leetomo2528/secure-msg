@@ -1355,6 +1355,11 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   // newly discovered cids. postLogin deduplicates this security generation.
   await me.refreshConvMeta();
   if (!canUseCrypto(context)) return;
+  // Threads this session first learned of from a live message_new while
+  // they were missing from its conversation list. Only an armed marker can
+  // still take them for history (a login whose list fetch failed); see
+  // beginInitialSyncPass.
+  const liveThreads = new Set<string>();
   const listBeforeLogin = useStore.getState().conversations;
   await me.refreshConversations();
   if (!canUseCrypto(context)) return;
@@ -1385,9 +1390,10 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     // Normally postLogin already turned an armed marker into a pending set (or
     // dropped it) from the list it fetched before any socket event could run;
     // here a pending set is only narrowed. The rest covers a login whose list
-    // fetch failed, leaving the marker armed. Residual gap in that case only:
-    // a brand-new thread whose message_new lands during the refresh below and
-    // whose sync has not written a cursor row yet is counted as history.
+    // fetch failed, leaving the marker armed. A thread whose message_new
+    // arrived before it was listed is kept out of the pending set
+    // (`liveThreads`), so one created while the refresh below is in flight
+    // still badges.
     // An armed initial-sync marker (logout, or a store with no read state)
     // becomes the set of listed conversations without a cursor row, whose
     // history is then imported as read; conversations that appear later, via
@@ -1406,6 +1412,7 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     const beginPass = (fetched = false) => runSessionEffect(context, () => beginInitialSyncPass(
       useStore.getState().conversations.map((conv) => conv.cid),
       fetched,
+      liveThreads,
     )).catch(() => canUseCrypto(context));
     if (!await beginPass()) return;
     await state.syncBlockRules().catch(() => undefined);
@@ -1438,8 +1445,11 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     if (!canUseCrypto(context)) return;
     // A conversation created on another device (e.g. the Android gateway
     // opening a new SMS thread) is not in our list yet — refresh so the
-    // sidebar shows the thread the incoming message belongs to.
+    // sidebar shows the thread the incoming message belongs to. Recorded
+    // before any await: the connect pass may be turning an armed marker into
+    // its pending set from a list fetched while this event was in flight.
     if (!useStore.getState().conversations.some((c) => c.cid === env.cid)) {
+      liveThreads.add(env.cid);
       await useStore.getState().refreshConversations();
       if (!canUseCrypto(context)) return;
     }

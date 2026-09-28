@@ -420,6 +420,39 @@ describe("initial sync after logout / on a new browser (SM-11)", () => {
     expect(await getInitialSync()).toBeNull();
   });
 
+  it("badges a new thread that races the connect pass after the login's list fetch failed", async () => {
+    // New browser with history. postLogin's list fetch fails, so the marker is
+    // still armed when the connect pass re-fetches the list; a peer opens a
+    // thread during that fetch, and its sync is still waiting on the key
+    // directory when the pass turns the marker into its pending set.
+    holdThread("c-hist", 20);
+    let listCalls = 0;
+    let racing: Promise<void> | null = null;
+    const listConversations = vi.mocked(api.listConversations).getMockImplementation()!;
+    vi.mocked(api.listConversations).mockImplementation(async () => {
+      listCalls += 1;
+      if (listCalls === 1) return { ok: false, error: "offline" } as never;
+      if (listCalls === 2) {
+        holdThread("c-new", 3);
+        racing = messageNew(fromPeer("c-new", 3));
+      }
+      return await listConversations();
+    });
+    const convMembers = vi.mocked(api.convMembers).getMockImplementation()!;
+    vi.mocked(api.convMembers).mockImplementation(async (cid) => {
+      if (cid === "c-new") await new Promise((resolve) => setTimeout(resolve, 30));
+      return await convMembers(cid);
+    });
+
+    await login();
+    await racing;
+
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+    expect(await summary("c-hist")).toMatchObject({ lastSeq: 20, unread: 0 });
+    expect(await summary("c-new")).toMatchObject({ lastSeq: 3, unread: 3 });
+    expect(await getInitialSync()).toBeNull();
+  });
+
   it("keeps the marker armed while the conversation list cannot be fetched", async () => {
     holdThread("c-hist", 20);
     const listConversations = vi.mocked(api.listConversations).getMockImplementation()!;

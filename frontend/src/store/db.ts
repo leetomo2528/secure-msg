@@ -391,8 +391,19 @@ export async function armInitialSyncIfFresh(): Promise<void> {
  * new. Otherwise an empty list may just be a conversation fetch that failed,
  * and disarming on it would let the real list arrive unseeded, so the marker
  * is left as it is.
+ *
+ * `live` names conversations this session first saw through a live
+ * message_new, before any list it could check them against. Turning `armed`
+ * into `pending` leaves them out: a list fetched after such an event already
+ * contains the thread, and counting it as history would mark the very
+ * messages that announced it as read. A `pending` set that already exists was
+ * built from an earlier list and is not re-filtered.
  */
-export async function beginInitialSyncPass(cids: string[], fetched = false): Promise<void> {
+export async function beginInitialSyncPass(
+  cids: string[],
+  fetched = false,
+  live: ReadonlySet<string> = new Set(),
+): Promise<void> {
   if (!cids.length && !fetched) return;
   const d = await db();
   const tx = d.transaction(["meta", "cursors"], "readwrite");
@@ -403,7 +414,7 @@ export async function beginInitialSyncPass(cids: string[], fetched = false): Pro
     if ("armed" in row.value) {
       const cursors = tx.objectStore("cursors");
       const known = await Promise.all(cids.map((cid) => cursors.getKey(cid)));
-      pending = cids.filter((_, index) => known[index] === undefined);
+      pending = cids.filter((cid, index) => known[index] === undefined && !live.has(cid));
     } else {
       const listed = new Set(cids);
       pending = row.value.pending.filter((cid) => listed.has(cid));
