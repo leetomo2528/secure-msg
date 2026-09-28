@@ -85,8 +85,18 @@ internal object OutboxRowBudget {
 internal class OutboxRowTooLargeException(val largeColumnBytes: Long) :
     IllegalStateException("relay row exceeds the cursor window")
 
+/** Position of a ref in the outbox's (createdAt, id) order; a flush resumes after it. */
+data class OutboxPageKey(val createdAt: Long, val id: Long) {
+    fun isAfter(other: OutboxPageKey): Boolean =
+        createdAt > other.createdAt || (createdAt == other.createdAt && id > other.id)
+}
+
+internal val RelayOutboxRef.pageKey: OutboxPageKey
+    get() = OutboxPageKey(createdAt, id)
+
 /**
- * Walks a page of [RelayOutboxRef]s and loads each full row on its own.
+ * Walks the pending outbox in (createdAt, id) order, a page of
+ * [RelayOutboxRef]s at a time, and loads each full row on its own.
  *
  * One row that cannot be read -- over the window budget, or throwing for any
  * other reason -- is handed to [skip] (the flush records the attempt) and the
@@ -94,18 +104,53 @@ internal class OutboxRowTooLargeException(val largeColumnBytes: Long) :
  * bad one, and flushReceiptStatuses after the flush, still run. Rows are loaded
  * one at a time on purpose; a page of 100 near-cap rows held at once would be
  * close to 200 MB of strings.
+ *
+ * The walk is keyset-paged and round-robin rather than one fixed `LIMIT`
+ * window, because a skipped or deferred row stays pending: a hundred of them
+ * at the head of a fixed oldest-first window were the whole window on every
+ * flush, and nothing behind them was ever reached again. Two budgets keep one
+ * flush bounded -- [maxRows] rows handed to the caller (each may cost a relay
+ * round trip) and [maxRefs] refs examined (a skip costs one small write). When
+ * either runs out, [resumeAfter] names where the next flush picks up. A walk
+ * that began at [start] continues past the end of the set from the oldest row
+ * up to [start], so one pass covers every pending row exactly once; after a
+ * complete pass [resumeAfter] is null and the next flush begins at the head.
+ * Every pending row is therefore reached within ceil(pending / [maxRefs])
+ * flushes at worst, whatever sits in front of it.
  */
 internal class OutboxRowCursor<R : Any>(
-    private val refs: List<RelayOutboxRef>,
+    private val page: suspend (after: OutboxPageKey?, limit: Int) -> List<RelayOutboxRef>,
     private val read: suspend (id: Long) -> R?,
     private val skip: suspend (ref: RelayOutboxRef, reason: String) -> Unit,
+    private val start: OutboxPageKey? = null,
+    private val pageSize: Int = PAGE_SIZE,
+    private val maxRows: Int = MAX_ROWS_PER_FLUSH,
+    private val maxRefs: Int = MAX_REFS_PER_FLUSH,
 ) {
+    private var refs: List<RelayOutboxRef> = emptyList()
     private var index = 0
+    private var after: OutboxPageKey? = start
+    private var endOfSet = false
+    private var wrapped = false
+    private var complete = false
+    private var rows = 0
+    private var examined = 0
 
-    /** The next readable row, or null when the page is exhausted. */
+    /**
+     * Where the next flush should start: null once this walk has covered the
+     * whole pending set, otherwise the last ref it examined. Meaningful after
+     * [next] returned null.
+     */
+    val resumeAfter: OutboxPageKey?
+        get() = if (complete) null else after
+
+    /** The next readable row, or null when the walk is done for this flush. */
     suspend fun next(): R? {
-        while (index < refs.size) {
+        while (rows < maxRows && examined < maxRefs) {
+            if (index >= refs.size && !loadPage()) return null
             val ref = refs[index++]
+            after = ref.pageKey
+            examined += 1
             if (!OutboxRowBudget.fits(ref.largeColumnBytes)) {
                 skip(ref, OVERSIZED)
                 continue
@@ -120,13 +165,55 @@ internal class OutboxRowCursor<R : Any>(
             }
             // Null: the row was deleted since the page was listed. Nothing to
             // record, nothing to relay.
-            if (row != null) return row
+            if (row != null) {
+                rows += 1
+                return row
+            }
         }
+        // A budget ran out. If it did so on the round's very last ref, the
+        // round is complete all the same.
+        if (index >= refs.size && endOfSet && (wrapped || start == null)) complete = true
         return null
+    }
+
+    /** Loads the next non-empty page; false once the pass is complete. */
+    private suspend fun loadPage(): Boolean {
+        while (!complete) {
+            if (!endOfSet) {
+                var fetched = page(after, pageSize)
+                endOfSet = fetched.size < pageSize
+                if (wrapped) {
+                    // Past [start] lies what this walk already examined.
+                    val boundary = start!!
+                    val kept = fetched.filter { !it.pageKey.isAfter(boundary) }
+                    if (kept.size < fetched.size) endOfSet = true
+                    fetched = kept
+                }
+                refs = fetched
+                index = 0
+                if (refs.isNotEmpty()) return true
+                endOfSet = true
+            }
+            if (start != null && !wrapped) {
+                wrapped = true
+                after = null
+                endOfSet = false
+            } else {
+                complete = true
+            }
+        }
+        return false
     }
 
     companion object {
         const val OVERSIZED = "relay row exceeds cursor window"
         const val UNREADABLE = "relay row unreadable"
+
+        const val PAGE_SIZE = 100
+
+        /** What one flush used to handle with its single `LIMIT 100` page. */
+        const val MAX_ROWS_PER_FLUSH = 100
+
+        const val MAX_REFS_PER_FLUSH = 1_000
     }
 }

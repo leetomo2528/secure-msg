@@ -120,7 +120,14 @@ class OutboxRowBudgetInstrumentedTest {
 
         val skipped = mutableListOf<Long>()
         val cursor = OutboxRowCursor(
-            refs = refs,
+            page = { after, limit ->
+                db.relayOutboxDao().pendingRefs(
+                    Long.MAX_VALUE,
+                    afterCreatedAt = after?.createdAt ?: Long.MIN_VALUE,
+                    afterId = after?.id ?: Long.MIN_VALUE,
+                    limit = limit,
+                )
+            },
             read = { id -> db.relayOutboxDao().getById(id) },
             skip = { ref, reason -> skipped += ref.id; db.relayOutboxDao().recordAttempt(ref.id, reason) },
         )
@@ -135,6 +142,41 @@ class OutboxRowBudgetInstrumentedTest {
         assertEquals(big, healed.payload)
         assertEquals(1, healed.attempts)
         assertEquals(OutboxRowCursor.OVERSIZED, healed.lastError)
+    }
+
+    @Test
+    fun rowsThatStayPendingDoNotHideTheRowsBehindThem() = runBlocking {
+        // The review's reproduction against the real query: 100 rows that a
+        // flush skips (they stay pending) ahead of a good one. The old single
+        // `LIMIT 100` page returned only the 100 on every flush.
+        val stuck = (1..100).map { i ->
+            db.relayOutboxDao().insert(legacyRow("stuck-row-%04d-padding".format(i), null).copy(createdAt = i.toLong()))
+        }.toSet()
+        val good = db.relayOutboxDao().insert(
+            legacyRow("good-row-after-stuck", null).copy(createdAt = 101L),
+        )
+        repeat(3) {
+            val handed = mutableListOf<Long>()
+            val cursor = OutboxRowCursor(
+                page = { after, limit ->
+                    db.relayOutboxDao().pendingRefs(
+                        Long.MAX_VALUE,
+                        afterCreatedAt = after?.createdAt ?: Long.MIN_VALUE,
+                        afterId = after?.id ?: Long.MIN_VALUE,
+                        limit = limit,
+                    )
+                },
+                read = { id ->
+                    if (id in stuck) throw IllegalStateException("Row too big to fit into CursorWindow")
+                    db.relayOutboxDao().getById(id)
+                },
+                skip = { ref, reason -> db.relayOutboxDao().recordAttempt(ref.id, reason) },
+            )
+            while (true) handed += (cursor.next() ?: break).id
+            assertEquals(listOf(good), handed)
+            assertNull(cursor.resumeAfter)
+        }
+        assertEquals(3, db.relayOutboxDao().getById(stuck.first())!!.attempts)
     }
 
     /**

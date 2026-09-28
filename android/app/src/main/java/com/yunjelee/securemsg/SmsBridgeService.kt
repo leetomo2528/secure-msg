@@ -800,6 +800,14 @@ class SmsBridgeService : Service() {
      * relay is connected. Pulling once more after the ack commits lets the
      * echo be consumed and what follows it go out now.
      */
+    /**
+     * Where the next [flushOutbox] resumes its walk of the pending outbox
+     * (OutboxRowCursor.resumeAfter); null starts from the oldest row. Read
+     * and written only under outboxMutex. Kept in memory on purpose: a
+     * restart simply begins a fresh pass from the head.
+     */
+    private var outboxResumeAfter: OutboxPageKey? = null
+
     private suspend fun flushOutbox() = OutboxAckResume.run(
         resume = { cid -> launchConversationSync(cid, "Post-ack") },
     ) { acked ->
@@ -810,8 +818,20 @@ class SmsBridgeService : Service() {
             // CursorWindow can hold is recorded and stepped over instead of
             // failing the page -- and with it every later row and the
             // receipt-status flush -- on every pass (OutboxRowCursor).
+            //
+            // Paged by (createdAt, id) and resumed where the last flush
+            // stopped, so rows that stay pending -- skipped, deferred, retried
+            // -- cannot fill every flush and hide the rows behind them.
+            val unknownCutoff = System.currentTimeMillis() - 30_000L
             val rows = OutboxRowCursor(
-                refs = db.relayOutboxDao().pendingRefs(System.currentTimeMillis() - 30_000L),
+                page = { after, limit ->
+                    db.relayOutboxDao().pendingRefs(
+                        unknownCutoff,
+                        afterCreatedAt = after?.createdAt ?: Long.MIN_VALUE,
+                        afterId = after?.id ?: Long.MIN_VALUE,
+                        limit = limit,
+                    )
+                },
                 read = { id -> db.relayOutboxDao().getById(id) },
                 skip = { ref, reason ->
                     // Sizes and ids only: the row holds a message body and a
@@ -823,9 +843,16 @@ class SmsBridgeService : Service() {
                     )
                     db.relayOutboxDao().recordAttempt(ref.id, reason)
                 },
+                start = outboxResumeAfter,
             )
+            // Set before the loop ends too: a flush that throws part-way
+            // resumes after its last row rather than repeating the head.
+            fun rememberPosition() {
+                outboxResumeAfter = rows.resumeAfter
+            }
             while (true) {
                 val queuedRow = rows.next() ?: break
+                rememberPosition()
                 val content = RelayContentCodec.decode(queuedRow.plaintext)
                 var row = queuedRow
                 if (row.payload.isBlank() || row.cid.startsWith(SmsThread.LOCAL_CID_PREFIX)) {
@@ -1074,6 +1101,7 @@ class SmsBridgeService : Service() {
                 }
                 Log.i(TAG, "Relay outbox delivered mid=${row.mid} seq=$seq")
             }
+            rememberPosition()
             if (acked.isNotEmpty()) pruneRelayAcks()
         }
     }
@@ -1352,33 +1380,31 @@ class SmsBridgeService : Service() {
         a: RelayApi,
         c: SavedCredentials,
     ): Boolean {
-        val cid = env.optString("cid")
+        // Keyed by the thread being pulled, never by the row alone: a history
+        // row carries no cid (the page does, and syncConversation checked it).
+        // Keyed by that blank, no own-upload ack evidence -- all of it written
+        // under the real cid -- was ever found, so the pull stopped at this
+        // phone's first own upload in every conversation; and every carrier
+        // receipt, rendered row, cursor move and status report below went to
+        // cid "", where one conversation's receipt answered for another's row
+        // at the same seq. LegacyRelayReceipt carries those blank-cid
+        // receipts over without dispatching anything twice.
+        val cid = RelaySyncPolicy.rowConversation(thread.cid, env.optString("cid")) ?: return false
         val senderSid = env.optString("sender_sid")
         val seq = env.optInt("seq", -1)
         if (senderSid == c.sid) {
-            // Keyed by the thread being pulled, never by the row: a history
-            // row carries no cid (the page does, and syncConversation checked
-            // it), so `cid` is blank here. Keyed by that blank, no ack
-            // evidence -- all of it written under the real cid -- was ever
-            // found, and the pull stopped at this phone's first own upload in
-            // every conversation. The carrier path below still reads `cid`
-            // from the row, and so keys its relay_receipts by the blank value;
-            // re-keying those re-dispatches every row already sent under the
-            // blank key, so that change needs its own transition and is
-            // deliberately not made here.
-            val echoCid = thread.cid
             val evidence = RelaySyncPolicy.SelfEchoEvidence(
-                hasLocalServerKey = db.messageDao().hasServerKey("$echoCid:$seq"),
-                hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(echoCid, seq),
-                hasDurableAck = db.relayAckDao().contains(echoCid, seq),
-                hasUnackedUpload = db.relayOutboxDao().hasUnackedUpload(echoCid),
+                hasLocalServerKey = db.messageDao().hasServerKey("$cid:$seq"),
+                hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(cid, seq),
+                hasDurableAck = db.relayAckDao().contains(cid, seq),
+                hasUnackedUpload = db.relayOutboxDao().hasUnackedUpload(cid),
             )
             if (!RelaySyncPolicy.canConsumeSelfEcho(evidence)) {
-                Log.w(TAG, "Self echo for $echoCid/$seq waits for a pending upload ack; retrying batch")
+                Log.w(TAG, "Self echo for $cid/$seq waits for a pending upload ack; retrying batch")
                 return false
             }
             val status = env.optString("carrier_status", "none")
-            val local = db.messageDao().getByServerKey("$echoCid:$seq")
+            val local = db.messageDao().getByServerKey("$cid:$seq")
             // The history page is fetched from a cursor captured before
             // flushOutbox ACKed this row, so it can carry a carrier status
             // older than the SENT/DELIVERED callback already applied locally,
@@ -1387,7 +1413,7 @@ class SmsBridgeService : Service() {
                 CarrierState.canAdvance(local.carrierStatus, status)
             ) {
                 db.messageDao().setCarrierStatus(
-                    echoCid,
+                    cid,
                     seq,
                     status,
                     // optString over a JSON null returns "null" on the
@@ -1399,8 +1425,8 @@ class SmsBridgeService : Service() {
                         ?: System.currentTimeMillis(),
                 )
             }
-            db.threadDao().advanceLastSeq(echoCid, seq)
-            relay?.emitDelivered(echoCid, seq)
+            db.threadDao().advanceLastSeq(cid, seq)
+            relay?.emitDelivered(cid, seq)
             return true
         }
 
@@ -1483,6 +1509,29 @@ class SmsBridgeService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Relay content decode failed for seq=$seq", e)
             return false
+        }
+
+        // A row this gateway may already have dispatched under the blank cid
+        // (up to v0.23.1) must not reach the carrier a second time.
+        when (
+            LegacyRelayReceipt.carryOver(
+                cid = cid,
+                seq = seq,
+                // Exactly what the rendered row below stores as createdAt.
+                rowCreatedAtMs = env.optLong("created_at").takeIf { it > 0 }?.times(1000),
+                rowText = content.text,
+                store = RoomLegacyReceiptStore(db),
+            )
+        ) {
+            LegacyRelayReceipt.Decision.WAIT -> {
+                Log.w(TAG, "Pre-update carrier dispatch for $cid/$seq is unresolved; retrying batch")
+                return false
+            }
+            LegacyRelayReceipt.Decision.ADOPT ->
+                Log.i(TAG, "Carried the pre-update carrier receipt over to $cid/$seq")
+            LegacyRelayReceipt.Decision.UNCERTAIN ->
+                Log.w(TAG, "Pre-update receipt at seq=$seq is ambiguous; $cid/$seq recorded as failed, not re-sent")
+            LegacyRelayReceipt.Decision.UNRELATED -> Unit
         }
 
         // Claim before the irreversible carrier side effect. Repeated socket

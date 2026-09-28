@@ -27,6 +27,20 @@ object RelaySyncPolicy {
         else -> RowAction.PROCESS
     }
 
+    /**
+     * The conversation a pulled row belongs to: the thread being pulled. A
+     * history row carries no cid of its own (the page does, and
+     * syncConversation checks it once per page), so the row's value is blank
+     * and must never be used as a key -- receipts, rendered rows, the cursor
+     * and every status report would all land under "". A row that does name
+     * a different conversation is refused (null), as [rowAction] refuses it.
+     */
+    fun rowConversation(threadCid: String, rowCid: String): String? = when {
+        threadCid.isEmpty() -> null
+        rowCid.isEmpty() || rowCid == threadCid -> threadCid
+        else -> null
+    }
+
     /** What the pull knows about one row this device's own sid uploaded. */
     data class SelfEchoEvidence(
         /** `messages.serverKey` "<cid>:<seq>" exists (cleared by logout). */

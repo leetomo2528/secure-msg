@@ -137,4 +137,45 @@ class SelfEchoRecoveryInstrumentedTest {
         assertTrue(dao.contains(cid, 3))
         assertTrue(dao.contains(cid, 4))
     }
+
+    @Test
+    fun aBlankCidReceiptIsCarriedOverToItsOwnRowOnly() = runBlocking {
+        // What v0.23.1 left after dispatching sms-live/3: ("", 3) and ":3".
+        db.relayReceiptDao().claim(
+            RelayReceipt(LegacyRelayReceipt.CID, 3, claimedAt = 1_757_000_001_000L, status = "sent"),
+        )
+        db.messageDao().insert(
+            MessageRow(
+                cid = LegacyRelayReceipt.CID,
+                seq = 3,
+                senderSid = "web-sid",
+                plaintext = "to live",
+                createdAt = 1_757_000_000_000L,
+                mine = true,
+                serverKey = LegacyRelayReceipt.serverKey(3),
+            ),
+        )
+        val store = RoomLegacyReceiptStore(db)
+
+        assertEquals(
+            LegacyRelayReceipt.Decision.ADOPT,
+            LegacyRelayReceipt.carryOver(cid, 3, 1_757_000_000_000L, "to live", store),
+        )
+        // The pull's own claim then finds the adopted receipt: no second send.
+        assertEquals(-1L, db.relayReceiptDao().claim(RelayReceipt(cid, 3)))
+        val adopted = db.relayReceiptDao().get(cid, 3)!!
+        assertEquals("sent", adopted.status)
+        assertFalse(adopted.statusSynced)
+        assertTrue(db.relayReceiptDao().pendingStatuses().any { it.cid == cid && it.seq == 3 })
+
+        // Another conversation's row at seq 3 is not answered by it.
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNRELATED,
+            LegacyRelayReceipt.carryOver("sms-other", 3, 1_757_000_000_500L, "to other", store),
+        )
+        assertNull(db.relayReceiptDao().get("sms-other", 3))
+        assertTrue(db.relayReceiptDao().claim(RelayReceipt("sms-other", 3)) > 0)
+        // The legacy rows stay for later comparisons and late callbacks.
+        assertEquals("sent", db.relayReceiptDao().get(LegacyRelayReceipt.CID, 3)!!.status)
+    }
 }

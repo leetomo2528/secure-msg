@@ -118,7 +118,48 @@ class OutboxRowBudgetTest {
         }
     }
 
-    private fun ref(id: Long, bytes: Long = 100) = RelayOutboxRef(id, "mid-$id", bytes)
+    private fun ref(id: Long, bytes: Long = 100) = RelayOutboxRef(id, "mid-$id", bytes, createdAt = 1_000L + id)
+
+    /** RelayOutboxDao.pendingRefs over an in-memory pending set: key > after, oldest first. */
+    private class FakeOutbox(refs: List<RelayOutboxRef>) {
+        val pending = refs.sortedWith(compareBy({ it.createdAt }, { it.id })).toMutableList()
+        var pageCalls = 0
+
+        fun page(after: OutboxPageKey?, limit: Int): List<RelayOutboxRef> {
+            pageCalls += 1
+            return pending.filter { after == null || it.pageKey.isAfter(after) }.take(limit)
+        }
+    }
+
+    /**
+     * One flush as SmsBridgeService.flushOutbox drives it: every row handed
+     * out is passed to [handle], which returns true when the row left the
+     * pending set (acked). Returns the ids handed out and where to resume.
+     */
+    private suspend fun flush(
+        outbox: FakeOutbox,
+        start: OutboxPageKey?,
+        unreadable: Set<Long> = emptySet(),
+        skipped: MutableList<Long> = mutableListOf(),
+        handle: (Long) -> Boolean = { true },
+    ): Pair<List<Long>, OutboxPageKey?> {
+        val cursor = OutboxRowCursor(
+            page = outbox::page,
+            read = { id ->
+                if (id in unreadable) throw IllegalStateException("Row too big to fit into CursorWindow")
+                id
+            },
+            skip = { ref, _ -> skipped += ref.id },
+            start = start,
+        )
+        val handed = mutableListOf<Long>()
+        while (true) {
+            val id = cursor.next() ?: break
+            handed += id
+            if (handle(id)) outbox.pending.removeAll { it.id == id }
+        }
+        return handed to cursor.resumeAfter
+    }
 
     @Test
     fun `an unreadable or oversized row is recorded and the rest of the page still flushes`() = runBlocking {
@@ -132,7 +173,7 @@ class OutboxRowBudgetTest {
         val reads = mutableListOf<Long>()
         val skipped = mutableListOf<Pair<Long, String>>()
         val cursor = OutboxRowCursor(
-            refs = refs,
+            page = FakeOutbox(refs)::page,
             read = { id ->
                 reads += id
                 when (id) {
@@ -163,7 +204,7 @@ class OutboxRowBudgetTest {
     @Test
     fun `cancellation is not mistaken for an unreadable row`() = runBlocking {
         val cursor = OutboxRowCursor<String>(
-            refs = listOf(ref(1)),
+            page = FakeOutbox(listOf(ref(1)))::page,
             read = { throw CancellationException("flush cancelled") },
             skip = { _, _ -> fail("a cancelled flush must not record an attempt") },
         )
@@ -172,5 +213,84 @@ class OutboxRowBudgetTest {
             fail("cancellation must propagate")
         } catch (_: CancellationException) {
         }
+    }
+
+    @Test
+    fun `a hundred unreadable rows at the head do not hide the rows behind them`() = runBlocking {
+        // The review's reproduction: 100 rows that stay pending after a skip,
+        // then good rows. A fixed LIMIT 100 page returned only the 100, on
+        // every flush, forever.
+        val outbox = FakeOutbox((1L..103L).map { ref(it) })
+        val unreadable = (1L..100L).toSet()
+        var resume: OutboxPageKey? = null
+        repeat(3) { pass ->
+            val skipped = mutableListOf<Long>()
+            val (handed, next) = flush(outbox, resume, unreadable, skipped)
+            if (pass == 0) {
+                assertEquals(listOf(101L, 102L, 103L), handed)
+                assertEquals((1L..100L).toList(), skipped)
+            } else {
+                // Only the unreadable rows are left; they are still recorded
+                // on every pass, and nothing is handed out twice.
+                assertEquals(emptyList<Long>(), handed)
+                assertEquals(100, skipped.size)
+            }
+            // Every pass covered the whole set, so the next starts at the head.
+            assertNull(next)
+            resume = next
+        }
+        assertEquals((1L..100L).toList(), outbox.pending.map { it.id })
+    }
+
+    @Test
+    fun `rows that stay pending cannot fill every flush - the next flush resumes behind them`() = runBlocking {
+        // 150 readable rows, the first 100 of which are deferred on every
+        // attempt (no relay ack): they used to be the whole page each time.
+        val outbox = FakeOutbox((1L..150L).map { ref(it) })
+        val deferred = (1L..100L).toSet()
+        val (first, resume1) = flush(outbox, null) { it !in deferred }
+        assertEquals((1L..100L).toList(), first)
+        assertEquals(OutboxPageKey(1_100L, 100L), resume1)
+
+        val (second, resume2) = flush(outbox, resume1) { it !in deferred }
+        // 101..150 first, then round to the head for the rest of the budget.
+        assertEquals((101L..150L).toList() + (1L..50L).toList(), second)
+        assertEquals(OutboxPageKey(1_050L, 50L), resume2)
+
+        // The rotation carries on from 51, round the end and back up to 50,
+        // where this round began: every still-pending row got its turn, none
+        // twice, and the next flush starts at the head again.
+        val (third, resume3) = flush(outbox, resume2) { it !in deferred }
+        assertEquals((51L..100L).toList() + (1L..50L).toList(), third)
+        assertNull(resume3)
+        assertEquals((1L..100L).toList(), outbox.pending.map { it.id })
+
+        val (fourth, _) = flush(outbox, resume3)
+        assertEquals((1L..100L).toList(), fourth)
+        assertTrue(outbox.pending.isEmpty())
+    }
+
+    @Test
+    fun `the refs budget bounds one flush and the next one reaches the rest`() = runBlocking {
+        val bad = (1L..1_500L).toSet()
+        val outbox = FakeOutbox((1L..1_501L).map { ref(it) })
+        val skipped1 = mutableListOf<Long>()
+        val (first, resume1) = flush(outbox, null, bad, skipped1)
+        assertEquals(emptyList<Long>(), first)
+        assertEquals(OutboxRowCursor.MAX_REFS_PER_FLUSH, skipped1.size)
+        assertEquals(OutboxPageKey(2_000L, 1_000L), resume1)
+
+        val skipped2 = mutableListOf<Long>()
+        val (second, _) = flush(outbox, resume1, bad, skipped2)
+        assertEquals(listOf(1_501L), second)
+        assertEquals((1_001L..1_500L).toList(), skipped2.take(500))
+    }
+
+    @Test
+    fun `a round that starts mid-set stops where it began`() = runBlocking {
+        val outbox = FakeOutbox((1L..5L).map { ref(it) })
+        val (handed, resume) = flush(outbox, OutboxPageKey(1_003L, 3L)) { false }
+        assertEquals(listOf(4L, 5L, 1L, 2L, 3L), handed)
+        assertNull(resume)
     }
 }

@@ -224,6 +224,8 @@ data class RelayOutboxRef(
     val id: Long,
     val mid: String,
     val largeColumnBytes: Long,
+    /** With [id], the ref's position in the keyset order the flush pages through. */
+    val createdAt: Long,
 )
 
 /**
@@ -616,11 +618,11 @@ interface RelayReceiptDao {
 @Dao
 interface RelayOutboxDao {
     /**
-     * `relayState != 'unsendable'` is what keeps this page moving. It is a
-     * fixed-size oldest-first window, so a row that can only ever be deferred —
-     * an SMS from an alphanumeric sender has no address to relay to — is not
-     * just wasted work: a hundred of them fill the page and the outbox stops
-     * relaying anything newer, in either direction, forever.
+     * `relayState != 'unsendable'` keeps retired rows out of the walk. A row
+     * that can only ever be deferred — an SMS from an alphanumeric sender has
+     * no address to relay to — would otherwise cost work on every flush, and
+     * back when this was one fixed oldest-first window a hundred of them
+     * filled it and the outbox stopped relaying anything newer, forever.
      */
     //
     // Only the key and the byte size of the large columns are selected here;
@@ -630,8 +632,17 @@ interface RelayOutboxDao {
     // SQLiteBlobTooBigException for the whole page, on every flush, forever.
     // `length(CAST(x AS BLOB))` is the UTF-8 byte length -- what the window
     // stores -- and SQLite computes it without handing the value to a cursor.
-    @Query("SELECT id, mid, (length(CAST(payload AS BLOB)) + length(CAST(plaintext AS BLOB)) + IFNULL(length(CAST(attachmentsJson AS BLOB)), 0) + IFNULL(length(CAST(subject AS BLOB)), 0)) AS largeColumnBytes FROM relay_outbox WHERE relayState != 'unsendable' AND (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) ORDER BY createdAt ASC LIMIT :limit")
-    suspend fun pendingRefs(unknownCutoff: Long, limit: Int = 100): List<RelayOutboxRef>
+    //
+    // Keyset-paged after (afterCreatedAt, afterId): rows a flush skips or
+    // defers stay pending, and a fixed oldest-first LIMIT window would keep
+    // returning only them. OutboxRowCursor walks on past them instead.
+    @Query("SELECT id, mid, (length(CAST(payload AS BLOB)) + length(CAST(plaintext AS BLOB)) + IFNULL(length(CAST(attachmentsJson AS BLOB)), 0) + IFNULL(length(CAST(subject AS BLOB)), 0)) AS largeColumnBytes, createdAt FROM relay_outbox WHERE relayState != 'unsendable' AND (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) AND (createdAt > :afterCreatedAt OR (createdAt = :afterCreatedAt AND id > :afterId)) ORDER BY createdAt ASC, id ASC LIMIT :limit")
+    suspend fun pendingRefs(
+        unknownCutoff: Long,
+        afterCreatedAt: Long = Long.MIN_VALUE,
+        afterId: Long = Long.MIN_VALUE,
+        limit: Int = OutboxRowCursor.PAGE_SIZE,
+    ): List<RelayOutboxRef>
 
     @Query("SELECT * FROM relay_outbox WHERE id = :id")
     suspend fun getById(id: Long): RelayOutbox?
