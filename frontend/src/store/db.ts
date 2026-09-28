@@ -380,15 +380,20 @@ export async function armInitialSyncIfFresh(): Promise<void> {
  * Start a sync pass over `cids`, the conversation list as the pass sees it.
  *
  * `armed` becomes `pending`: the listed conversations with no cursor row, the
- * ones whose whole history this pass is about to import. An empty list keeps
- * the marker armed — it is also what a failed first conversation fetch looks
- * like, and disarming then would let the real list arrive unseeded. A
- * `pending` marker left by an interrupted pass is kept, narrowed to the
- * conversations still listed so one the account has left cannot hold it open
- * forever; it is deleted once nothing is left in it.
+ * ones whose whole history this pass is about to import. A `pending` marker
+ * left by an interrupted pass is kept, narrowed to the conversations still
+ * listed so one the account has left cannot hold it open forever; it is
+ * deleted once nothing is left in it.
+ *
+ * `fetched` says `cids` is what the relay just returned. Only then is an
+ * empty list the truth — an account with no conversations, whose initial pass
+ * is complete, so the marker is dropped and a thread created later badges as
+ * new. Otherwise an empty list may just be a conversation fetch that failed,
+ * and disarming on it would let the real list arrive unseeded, so the marker
+ * is left as it is.
  */
-export async function beginInitialSyncPass(cids: string[]): Promise<void> {
-  if (!cids.length) return;
+export async function beginInitialSyncPass(cids: string[], fetched = false): Promise<void> {
+  if (!cids.length && !fetched) return;
   const d = await db();
   const tx = d.transaction(["meta", "cursors"], "readwrite");
   const meta = tx.objectStore("meta");

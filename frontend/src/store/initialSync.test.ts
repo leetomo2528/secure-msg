@@ -202,6 +202,13 @@ async function login(): Promise<void> {
   expect(useStore.getState().securityLocked).toBe(false);
 }
 
+/** The socket (re)connects, which runs the whole-account sync pass again. */
+async function reconnect(): Promise<void> {
+  const handler = socket.handlers.get("connect");
+  expect(handler).toBeDefined();
+  await handler!();
+}
+
 /** The relay announces a new message the way the socket does. */
 async function messageNew(message: ServerMessage): Promise<void> {
   const handler = socket.handlers.get("message_new");
@@ -367,6 +374,37 @@ describe("initial sync after logout / on a new browser (SM-11)", () => {
     await login();
 
     expect(await summary("c-long")).toMatchObject({ lastSeq: 450, unread: 0 });
+    expect(await getInitialSync()).toBeNull();
+  });
+
+  it("ends the pass on an account with no conversations yet", async () => {
+    // New browser, empty account: the fetched list is empty, so the initial
+    // pass is over the moment it has been listed.
+    await login();
+    expect(await getInitialSync()).toBeNull();
+
+    // A thread opened while this session's socket was down arrives with the
+    // reconnect pass, not via message_new; it is new, so it badges.
+    holdThread("c-new", 3);
+    await reconnect();
+
+    expect(await summary("c-new")).toMatchObject({ lastSeq: 3, unread: 3 });
+  });
+
+  it("keeps the marker armed while the conversation list cannot be fetched", async () => {
+    holdThread("c-hist", 20);
+    const listConversations = vi.mocked(api.listConversations).getMockImplementation()!;
+    vi.mocked(api.listConversations).mockResolvedValue({ ok: false, error: "offline" } as never);
+
+    await login();
+
+    // An empty list the pass never fetched says nothing about the account.
+    expect(await getInitialSync()).toEqual({ armed: true });
+
+    vi.mocked(api.listConversations).mockImplementation(listConversations);
+    await reconnect();
+
+    expect(await summary("c-hist")).toMatchObject({ lastSeq: 20, unread: 0 });
     expect(await getInitialSync()).toBeNull();
   });
 

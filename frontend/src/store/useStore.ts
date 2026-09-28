@@ -1351,21 +1351,27 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     // post-login already loaded, before any network round trip here, so a
     // message_new racing this pass cannot pull a thread's whole history
     // unseeded first; taken again after the refresh below in case that list
-    // was empty (the call is a no-op for an empty list, and only narrows a
-    // pending set that already exists).
+    // was empty (an empty list the pass cannot vouch for leaves the marker
+    // alone; a pending set that already exists is only narrowed). When that
+    // refresh really fetched the list (it replaces the array only on
+    // success), even an empty list is the account's actual state and ends the
+    // initial pass, so a thread created later in this session, say while the
+    // socket is down, still badges as new.
     // A marker that cannot be read or written only costs the seeding, never
     // the sync itself.
-    const beginPass = () => runSessionEffect(context, () => beginInitialSyncPass(
+    const beginPass = (fetched = false) => runSessionEffect(context, () => beginInitialSyncPass(
       useStore.getState().conversations.map((conv) => conv.cid),
+      fetched,
     )).catch(() => canUseCrypto(context));
     if (!await beginPass()) return;
     await state.syncBlockRules().catch(() => undefined);
     if (!canUseCrypto(context)) return;
     await state.refreshBlocklist();
     if (!canUseCrypto(context)) return;
+    const listBefore = useStore.getState().conversations;
     await state.refreshConversations();
     if (!canUseCrypto(context)) return;
-    if (!await beginPass()) return;
+    if (!await beginPass(useStore.getState().conversations !== listBefore)) return;
     // Re-read after refresh: `state` predates the conversation reload.
     for (const conv of useStore.getState().conversations) {
       if (!canUseCrypto(context)) return;
