@@ -2,6 +2,7 @@ package com.yunjelee.securemsg.ui
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -77,6 +78,7 @@ import com.yunjelee.securemsg.DeviceSecurityController
 import com.yunjelee.securemsg.DeviceSecurityView
 import com.yunjelee.securemsg.DeviceTrustCrypto
 import com.yunjelee.securemsg.DeviceTrustRepository
+import com.yunjelee.securemsg.Diagnostics
 import com.yunjelee.securemsg.HistoryRestoreRunner
 import com.yunjelee.securemsg.HistoryShareRunner
 import com.yunjelee.securemsg.MessageSearch
@@ -1087,6 +1089,31 @@ fun SettingsPane(
                 modifier = Modifier.fillMaxWidth(),
             )
             restoreMessage?.let { Text(it, color = Sm.text3, fontSize = 12.sp) }
+        }
+
+        SmCard {
+            SectionTitle("진단 정보")
+            Caption(
+                "동기화가 끊기거나 앱이 종료된 원인을 확인할 수 있도록, 이 기기의 연결·종료 기록을 " +
+                    "텍스트로 공유합니다. 메시지 내용·전화번호·인증 토큰은 포함되지 않습니다.",
+            )
+            SmGhostButton(
+                text = "진단 정보 공유",
+                onClick = {
+                    scope.launch(Dispatchers.IO) {
+                        val report = Diagnostics.buildShareText(context)
+                        withContext(Dispatchers.Main) {
+                            val send = Intent(Intent.ACTION_SEND)
+                                .setType("text/plain")
+                                .putExtra(Intent.EXTRA_SUBJECT, "SecureMsg 진단 정보")
+                                .putExtra(Intent.EXTRA_TEXT, report)
+                            runCatching { context.startActivity(Intent.createChooser(send, "진단 정보 공유")) }
+                                .onFailure { Log.w("SettingsPane", "diagnostics share unavailable", it) }
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
 
         SmGhostButton(
