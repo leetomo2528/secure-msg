@@ -166,6 +166,11 @@ object ImageBytes {
         // truncated file, and trailing bytes past the claim are not chunks.
         val end = 8L + le32(bytes, 4)
         if (end > bytes.size) return true
+        // A RIFF size too small to hold even the VP8X chunk it starts with is a
+        // malformed container, not an empty one: without this a size of 0 or 4
+        // would skip the walk entirely and a flag-clear header followed by
+        // ANIM/ANMF chunks would read as still.
+        if (end < 20L + vp8xSize) return true
         var at = 12L
         var walked = 0
         while (at < end) {

@@ -235,6 +235,18 @@ class ImageBytesTest {
         assertTrue(ImageBytes.isAnimatedWebp(overlong))
         // An unknown first chunk.
         assertTrue(ImageBytes.isAnimatedWebp(ImageFixtures.webp(ImageFixtures.webpChunk("JUNK", ByteArray(16)))))
+        // A RIFF size (0, 4, or anything short of the VP8X chunk) that would
+        // otherwise skip the chunk walk and hide the ANIM/ANMF chunks after it.
+        val hiddenAnimation = ImageFixtures.webp(
+            ImageFixtures.vp8x(0),
+            ImageFixtures.webpChunk("ANIM", ByteArray(6)),
+            ImageFixtures.webpChunk("ANMF", ByteArray(64)),
+        )
+        for (riffSize in listOf(0, 4, 21)) {
+            val lying = hiddenAnimation.copyOf()
+            ImageFixtures.le32(riffSize).copyInto(lying, destinationOffset = 4)
+            assertTrue("RIFF size $riffSize", ImageBytes.isAnimatedWebp(lying))
+        }
     }
 
     @Test
