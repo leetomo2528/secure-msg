@@ -33,6 +33,7 @@ from rate_limit import check as rate_limit
 log = logging.getLogger("securemsg.sockets")
 
 _socketio_ref: SocketIO | None = None
+connected_at: dict[str, float] = {}
 
 
 def _parse_positive_seq(value: object) -> int | None:
@@ -126,6 +127,10 @@ def attach_socketio(app, socketio: SocketIO) -> None:
         uid, sid, device_id, expires_at, session_version = record
         if expires_at <= int(time.time()):
             clients.pop(request.sid, None)
+            log.warning(
+                "server-initiated disconnect cause=expired uid=%s sid=%s sock=%s",
+                uid, sid, request.sid,
+            )
             disconnect_client()
             return None
         device = store.get_device_by_sid(sid)
@@ -137,6 +142,10 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             or device["trust_state"] != "approved"
         ):
             clients.pop(request.sid, None)
+            log.warning(
+                "server-initiated disconnect cause=revoked uid=%s sid=%s sock=%s",
+                uid, sid, request.sid,
+            )
             # Same contract as the expiry branch above: a revoked/unknown device
             # must not keep an idle socket alive (README: revoked sockets are
             # terminated; clients keep their local keys and re-login).
@@ -185,13 +194,37 @@ def attach_socketio(app, socketio: SocketIO) -> None:
             session_version,
         )
         join_room(_device_room(sid, session_version))
-        log.info("connect uid=%s sid=%s", uid, sid)
+        connected_at[request.sid] = time.monotonic()
+        diag = auth.get("diag")
+        # A caller can put its token in diag; never echo it into server logs.
+        if isinstance(diag, str) and re.fullmatch(
+            r"[A-Za-z0-9=;._:-]{1,120}", diag, re.ASCII
+        ) and (not isinstance(token, str) or token not in diag):
+            log.info(
+                "connect uid=%s sid=%s sock=%s diag=%s",
+                uid, sid, request.sid, diag,
+            )
+        else:
+            log.info("connect uid=%s sid=%s sock=%s", uid, sid, request.sid)
 
     @socketio.on("disconnect")
-    def _disconnect():
+    def _disconnect(reason=None):
         client = clients.pop(request.sid, None)
+        started = connected_at.pop(request.sid, None)
         uid, sid = (client[0], client[1]) if client else (None, None)
-        log.info("disconnect uid=%s sid=%s", uid, sid)
+        # Flask-SocketIO 5.6.1 forwards disconnect args through _handle_event;
+        # python-socketio 5.16.3 server.py passes Engine.IO's plain-string
+        # reason constants. Older integrations may call with no reason.
+        reason_text = str(reason) if reason is not None else "-"
+        reason_text = re.sub(r"[\x00-\x1f\x7f]", " ", reason_text[:120])
+        duration = (
+            f"{max(0.0, time.monotonic() - started):.1f}"
+            if started is not None else "-"
+        )
+        log.info(
+            "disconnect uid=%s sid=%s sock=%s reason=%s dur=%s",
+            uid, sid, request.sid, reason_text, duration,
+        )
 
     @socketio.on("message_send")
     def _message_send(data: dict):
