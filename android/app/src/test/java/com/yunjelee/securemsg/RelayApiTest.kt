@@ -181,6 +181,45 @@ class RelayApiTest {
         assertEquals("n-9", body.getJSONArray("entries").getJSONObject(1).getString("n"))
     }
 
+    @Test
+    fun getResponsesCarryTheServerDateHeader() {
+        server.enqueue(
+            jsonResponse(200, "{\"ok\":true,\"cid\":\"cid-1\",\"messages\":[]}")
+                .setHeader("Date", "Sun, 28 Sep 2026 01:24:29 GMT"),
+        )
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+
+        val result = api.fetchMessages("cid-1", 0)
+
+        assertEquals(1_790_558_669_000L, result.getLong(RelayApi.SERVER_DATE_KEY))
+        assertEquals("_server_date_ms", RelayApi.SERVER_DATE_KEY)
+        assertTrue(result.getBoolean("ok"))
+        assertEquals("cid-1", result.getString("cid"))
+        assertEquals(0, result.getJSONArray("messages").length())
+        assertEquals(setOf("ok", "cid", "messages", "_server_date_ms"), result.keySet())
+    }
+
+    @Test
+    fun serverDateIsAbsentWithoutAParseableHeader() {
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"messages\":[]}"))
+        server.enqueue(jsonResponse(200, "{\"ok\":true,\"messages\":[]}").setHeader("Date", "yesterday-ish"))
+        server.enqueue(jsonResponse(503, "{\"ok\":false,\"error\":\"busy\"}"))
+        val api = RelayApi(server.url("/").toString(), OkHttpClient())
+
+        val missing = api.fetchMessages("cid-1", 0)
+        val garbled = api.fetchMessages("cid-1", 0)
+        val failed = api.fetchMessages("cid-1", 0)
+
+        assertFalse(missing.has(RelayApi.SERVER_DATE_KEY))
+        assertEquals(setOf("ok", "messages"), missing.keySet())
+        assertFalse(garbled.has(RelayApi.SERVER_DATE_KEY))
+        assertEquals(setOf("ok", "messages"), garbled.keySet())
+        // Failure metadata is unchanged.
+        assertFalse(failed.has(RelayApi.SERVER_DATE_KEY))
+        assertEquals(503, failed.getInt("_http_status"))
+        assertEquals("busy", failed.getString("error"))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun shareKeysRefusesMoreThanTheServerCap() {
         val api = RelayApi(server.url("/").toString(), OkHttpClient())

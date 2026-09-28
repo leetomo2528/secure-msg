@@ -39,7 +39,10 @@ class RelayApi(
             .apply { token?.let { addHeader("Authorization", "Bearer $it") } }
             .build()
         http.newCall(req).execute().use { resp ->
-            return parseResponse(resp.code, resp.isSuccessful, resp.body?.string().orEmpty())
+            val body = parseResponse(resp.code, resp.isSuccessful, resp.body?.string().orEmpty())
+            // The relay chain's clock at this response (see StaleSendPolicy).
+            resp.headers.getDate("Date")?.let { body.put(SERVER_DATE_KEY, it.time) }
+            return body
         }
     }
 
@@ -211,6 +214,13 @@ class RelayApi(
         post("/api/blocklist/remove", JSONObject().put("id", id))
 
     companion object {
+        /**
+         * A GET response's HTTP `Date` header in epoch ms, present only when the
+         * response had a parseable one. Underscore-prefixed like `_http_status`:
+         * RelayApi's own metadata, never a relay field.
+         */
+        const val SERVER_DATE_KEY = "_server_date_ms"
+
         /** Server cap for one share-keys call (server/conversations.py). */
         const val MAX_SHARE_ENTRIES = 200
 

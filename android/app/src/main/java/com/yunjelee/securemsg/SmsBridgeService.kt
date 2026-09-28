@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.provider.Telephony
 import android.telephony.SmsManager
 import android.util.Log
@@ -1492,6 +1493,12 @@ class SmsBridgeService : Service() {
         var cursor = thread.lastSeq
         while (true) {
             val response = a.fetchMessages(cid, cursor)
+            // Every row on this page is aged against the relay's clock at this
+            // response, not the phone's (StaleSendPolicy.referenceNowMs).
+            val clock = StaleSendPolicy.ResponseClock(
+                serverDateMs = response.optLong(RelayApi.SERVER_DATE_KEY).takeIf { it > 0 },
+                elapsedRealtimeAtResponseMs = SystemClock.elapsedRealtime(),
+            )
             if (!response.optBoolean("ok")) {
                 Log.e(TAG, "History fetch failed: ${response.optString("error")}")
                 return
@@ -1527,7 +1534,7 @@ class SmsBridgeService : Service() {
                     RelaySyncPolicy.RowAction.SKIP_ALREADY_CONSUMED -> continue
                     RelaySyncPolicy.RowAction.PROCESS -> Unit
                 }
-                if (!processRelayEnvelope(message, thread, a, c)) return
+                if (!processRelayEnvelope(message, thread, a, c, clock)) return
                 cursor = seq
                 consumed += 1
             }
@@ -1541,6 +1548,7 @@ class SmsBridgeService : Service() {
         thread: SmsThread,
         a: RelayApi,
         c: SavedCredentials,
+        clock: StaleSendPolicy.ResponseClock,
     ): Boolean {
         // Keyed by the thread being pulled, never by the row alone: a history
         // row carries no cid (the page does, and syncConversation checked it).
@@ -1629,7 +1637,8 @@ class SmsBridgeService : Service() {
         }
 
         val carrierStatus = env.optString("carrier_status", "none")
-        if (!RelaySyncPolicy.isCarrierSendRequest(trustedSender?.kind, carrierStatus)) {
+        val isSendRequest = RelaySyncPolicy.isCarrierSendRequest(trustedSender?.kind, carrierStatus)
+        if (!isSendRequest) {
             // History, not a send request. It is not rendered locally either:
             // the envelope does not say which direction a gateway uploaded it
             // in, and guessing would show an incoming SMS as one this account
@@ -1709,8 +1718,12 @@ class SmsBridgeService : Service() {
         // Claim before the irreversible carrier side effect. Repeated socket
         // events, reconnect pulls, and concurrent syncs cannot send twice.
         val claim = db.relayReceiptDao().claim(RelayReceipt(cid, seq))
+        // Null: this claim inserted the receipt. Past the block below it can
+        // only be 'claimed' (a stale pre-dispatch claim just reclaimed).
+        var priorReceiptStatus: String? = null
         if (claim == -1L) {
             val receipt = db.relayReceiptDao().get(cid, seq) ?: return false
+            priorReceiptStatus = receipt.status
             val cutoff = System.currentTimeMillis() - CLAIM_RETRY_GRACE_MS
             when (RelayReceiptRetryPolicy.action(receipt.status, receipt.claimedAt <= cutoff)) {
                 RelayReceiptRetryPolicy.Action.WAIT_FOR_ACTIVE_CLAIM -> return false
@@ -1734,6 +1747,28 @@ class SmsBridgeService : Service() {
                     return true
                 }
             }
+        }
+
+        // Only here, holding a fresh claim: every receipt that records an
+        // outcome (adopted, UNCERTAIN, sent, failed, delivered) was consumed
+        // above and keeps it, and 'attempting' still waits for its callback.
+        // Before the 'attempting' write, so a refused row can never be taken
+        // for one that may be on the carrier network.
+        val createdAtSec = env.optLong("created_at").takeIf { it > 0 }
+        val referenceNow = clock.nowMs(SystemClock.elapsedRealtime(), System.currentTimeMillis())
+        val staleVerdict = StaleSendPolicy.evaluate(isSendRequest, priorReceiptStatus, createdAtSec, referenceNow)
+        val staleError = StaleSendPolicy.errorFor(staleVerdict)
+        if (staleError != null) {
+            // The carrier API is never reached, exactly as for
+            // predispatchRejection below: the cursor moves on and the web sees
+            // the reason. Only cid, seq and age are logged.
+            val ageSec = StaleSendPolicy.ageMs(createdAtSec, referenceNow)?.div(1000L)
+            Log.w(TAG, "Web send request $cid/$seq not dispatched: $staleVerdict ageSec=$ageSec")
+            db.relayReceiptDao().markStatus(cid, seq, "failed", staleError)
+            syncReceiptStatus(cid, seq, "failed", staleError)
+            db.threadDao().advanceLastSeq(cid, seq)
+            relay?.emitDelivered(cid, seq)
+            return true
         }
 
         // Computed before the 'attempting' write, because it is the last thing
