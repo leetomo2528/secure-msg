@@ -12,6 +12,7 @@ import {
 } from "../store/helpers";
 import { ownedSmsPhone } from "../store/conversationPolicy";
 import { buildConversationExport, downloadText } from "../store/exportConversation";
+import { carrierFailureReason, carrierLabel } from "./carrierStatusText";
 
 export default function ChatView({ cid }: { cid: string }) {
   const activeMessages = useStore((s) => s.activeMessages);
@@ -214,6 +215,7 @@ export default function ChatView({ cid }: { cid: string }) {
           // side, but the carrier line below still shows, so a misplaced row
           // stays recognisable instead of hiding the evidence.
           const mine = messageDirection(m, sid, uid) === "out";
+          const failureReason = carrierFailureReason(m.carrier_status, m.carrier_error);
           return (
             <div key={`${m.cid}:${m.seq}`} className={`flex animate-rise ${mine ? "justify-end" : "justify-start"}`}>
               <div
@@ -237,6 +239,11 @@ export default function ChatView({ cid }: { cid: string }) {
                   {new Date(m.created_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
                   {m.carrier_status && m.carrier_status !== "none" && ` · ${carrierLabel(m.carrier_status)}`}
                 </div>
+                {failureReason !== null && (
+                  <div className={`mt-0.5 text-[10px] ${mine ? "text-white/80" : "text-tx-3"}`}>
+                    {failureReason}
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -372,18 +379,6 @@ function Lightbox({ attachment, onClose }: { attachment: MessageAttachment; onCl
       </div>
     </div>
   );
-}
-
-function carrierLabel(status: string): string {
-  return ({
-    queued: "대기",
-    dispatched: "발송 요청",
-    sent: "통신사 접수",
-    delivered: "전달됨",
-    failed: "발송 실패",
-    delivery_failed: "전달 실패",
-    unknown: "상태 확인 중",
-  } as Record<string, string>)[status] ?? status;
 }
 
 function dataUrl(attachment: MessageAttachment): string {
