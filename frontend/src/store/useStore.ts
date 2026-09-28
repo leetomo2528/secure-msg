@@ -2088,6 +2088,10 @@ async function reapplyBlocklist(shouldContinue: () => boolean = () => true): Pro
   }
   const cid = useStore.getState().activeCid;
   if (cid) await refreshActiveMessages(cid, shouldContinue);
+  if (!shouldContinue()) return;
+  // Closed threads render from convMeta, not from the rows: without this the
+  // sidebar keeps previewing (and badging) text a rule now hides.
+  await useStore.getState().refreshConvMeta();
 }
 
 /** Desktop notification for a freshly arrived incoming message. */

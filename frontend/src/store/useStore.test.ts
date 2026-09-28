@@ -391,3 +391,68 @@ describe("register password policy", () => {
     expect(useStore.getState().error).toBe("username already taken");
   });
 });
+
+describe("closed-thread block-rule metadata", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    api.setToken(null);
+    useStore.setState({
+      authed: false,
+      approvalPending: false,
+      securityLocked: false,
+      username: null,
+      uid: null,
+      sid: null,
+      keypair: null,
+      conversations: [],
+      activeCid: null,
+      activeMessages: [],
+      convMeta: {},
+      blockKeywords: [],
+      blockedSenders: [],
+      error: null,
+    });
+  });
+
+  it("updates a closed conversation preview and unread badge when a keyword rule changes", async () => {
+    const activeCid = "block-meta-open";
+    const closedCid = "block-meta-closed";
+    await putMessage(msg(activeCid, 1, { plaintext: "열린 대화" }));
+    await putMessage(msg(closedCid, 1, { plaintext: "안녕" }));
+    await putMessage(msg(closedCid, 2, { plaintext: "광고 쿠폰 지급" }));
+    api.setToken("active-token");
+    useStore.setState({
+      authed: true,
+      approvalPending: false,
+      securityLocked: false,
+      username: "alice",
+      uid: 81_002,
+      sid: "block-meta-web",
+      keypair: {} as any,
+      conversations: [
+        { cid: activeCid, conv_id: 81_002, name: "open", members: ["alice"], created_at: 1 },
+        { cid: closedCid, conv_id: 81_003, name: "closed", members: ["alice"], created_at: 1 },
+      ],
+      activeCid,
+    });
+    vi.spyOn(api, "addBlockRule").mockResolvedValue({ ok: false, error: "offline" });
+
+    await useStore.getState().refreshConvMeta();
+    expect(useStore.getState().convMeta[closedCid]).toMatchObject({
+      preview: "광고 쿠폰 지급", unread: 2, lastSeq: 2,
+    });
+
+    await useStore.getState().addBlock("광고");
+    expect(useStore.getState().convMeta[closedCid]).toMatchObject({
+      preview: "안녕", unread: 1, lastSeq: 1,
+    });
+
+    const rule = (await listBlockKeywords()).find((row) => row.keyword === "광고");
+    expect(rule?.id).toBeDefined();
+    expect(rule?.id.startsWith("srv:")).toBe(false);
+    await useStore.getState().removeBlock(rule!.id);
+    expect(useStore.getState().convMeta[closedCid]).toMatchObject({
+      preview: "광고 쿠폰 지급", unread: 2, lastSeq: 2,
+    });
+  });
+});
