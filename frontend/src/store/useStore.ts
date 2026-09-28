@@ -57,6 +57,7 @@ import {
   patchMessageDirections,
   highestStoredSeq,
   markConversationRead,
+  conversationSummary,
   conversationSummaries,
   getUndecryptableFloor,
   setUndecryptableFloor,
@@ -231,8 +232,8 @@ interface State {
   newSmsConversation: (phone: string) => Promise<string | null>;
   selectConversation: (cid: string) => Promise<void>;
   syncConversation: (cid: string, context?: SecurityContext) => Promise<void>;
-  /** Recompute the sidebar's arrival state from the rows on disk. */
-  refreshConvMeta: () => Promise<void>;
+  /** Recompute the sidebar's arrival state from the rows on disk: one cid, or everything when omitted. */
+  refreshConvMeta: (cid?: string) => Promise<void>;
   /** Stamp direction onto history stored before the field existed. */
   backfillDirections: () => Promise<void>;
   repairDirections: () => Promise<string>;
@@ -576,15 +577,15 @@ export const useStore = create<State>((set, get) => ({
     if (!sameContext(context)) return;
     if (r.ok && r.conversations) {
       set({ conversations: r.conversations, error: null });
+      // Login seeds all stored summaries once; later list refreshes only need
+      // to discover threads that have appeared since that first disk read.
+      for (const conv of r.conversations) {
+        if (!sameContext(context)) return;
+        if (!get().convMeta[conv.cid]) await get().refreshConvMeta(conv.cid);
+      }
     } else {
       set({ error: r.error || "대화 목록을 불러오지 못했습니다" });
     }
-    // The relay knows nothing about message bodies or read state, so the list
-    // it just returned carries no arrival information at all. Fill that in
-    // from disk on the same pass, or a reload shows every thread as if it had
-    // never received anything until each one is synced.
-    if (!sameContext(context)) return;
-    await get().refreshConvMeta();
   },
 
   newConversation: async (members) => {
@@ -637,7 +638,7 @@ export const useStore = create<State>((set, get) => ({
     if (!sameContext(context)) return;
     await markConversationRead(cid, seen);
     if (!sameContext(context)) return;
-    await get().refreshConvMeta();
+    await get().refreshConvMeta(cid);
     if (!sameContext(context)) return;
     await queueConversationSync(cid, context);
   },
@@ -860,7 +861,7 @@ export const useStore = create<State>((set, get) => ({
       if (!await runSessionEffect(context, () => markConversationRead(cid, seen))) return;
     }
     if (!canUseCrypto(context)) return;
-    await get().refreshConvMeta();
+    await get().refreshConvMeta(cid);
     if (canUseCrypto(context) && notifyIsIncoming && notifyBody != null) {
       maybeNotify(conversationDisplayName(conv, "새 메시지"), notifyBody);
     }
@@ -879,6 +880,7 @@ export const useStore = create<State>((set, get) => ({
     // on every login rather than behind a flag that can go stale.
     const context = captureSecurityContext();
     if (!canUseCrypto(context)) return;
+    const stampedCids = new Set<string>();
     for (const conv of useStore.getState().conversations) {
       if (!canUseCrypto(context)) return;
       let skip: boolean;
@@ -916,19 +918,23 @@ export const useStore = create<State>((set, get) => ({
           );
           if (direction) entries.push({ seq: sm.seq, direction });
         }
+        let patched = 0;
         const stamped = await runSessionEffect(
           context,
-          async () => { await patchMessageDirections(conv.cid, entries); },
+          async () => { patched = await patchMessageDirections(conv.cid, entries); },
         );
         if (!stamped) return;
+        if (patched > 0) stampedCids.add(conv.cid);
         if (page.messages.length < 200 || maxSeq <= cursor) { walked = true; break; }
         cursor = maxSeq;
       }
       if (!walked) continue;
       if (!await runSessionEffect(context, () => markDirectionBackfilled(conv.cid))) return;
     }
-    if (!sameContext(context)) return;
-    await get().refreshConvMeta();
+    for (const cid of stampedCids) {
+      if (!sameContext(context)) return;
+      await get().refreshConvMeta(cid);
+    }
   },
 
   /**
@@ -957,11 +963,27 @@ export const useStore = create<State>((set, get) => ({
     return `대화 ${convs.length}개 · 표시 ${cleared}개 해제 · 미분류 ${before} → ${after}`;
   },
 
-  refreshConvMeta: async () => {
+  refreshConvMeta: async (cid) => {
     const context = captureSecurityContext();
     if (!canUseCrypto(context)) return;
     const mySid = context.sid;
     if (!mySid) return;
+    if (cid !== undefined) {
+      let summary: ConversationSummary | null;
+      try {
+        summary = await conversationSummary(cid, mySid, context.uid);
+      } catch {
+        return;
+      }
+      if (!sameContext(context)) return;
+      set((s) => {
+        const next = { ...s.convMeta };
+        if (summary) next[cid] = summary;
+        else delete next[cid];
+        return { convMeta: next };
+      });
+      return;
+    }
     let summaries: Record<string, ConversationSummary>;
     try {
       summaries = await conversationSummaries(mySid, context.uid);
@@ -1304,6 +1326,10 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
   await me.syncBlockRules().catch(() => undefined);
   if (!canUseCrypto(context)) return;
   await me.refreshBlocklist();
+  if (!canUseCrypto(context)) return;
+  // Seed all previews once per login before list updates start checking only
+  // newly discovered cids. postLogin deduplicates this security generation.
+  await me.refreshConvMeta();
   if (!canUseCrypto(context)) return;
   await me.refreshConversations();
   if (!canUseCrypto(context)) return;
