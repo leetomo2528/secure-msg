@@ -86,7 +86,11 @@ class SmsBridgeService : Service() {
          * link, short enough that a row nobody can parse stops costing wakeups.
          */
         private val MMS_DEFER_RETRY_DELAYS_MS = longArrayOf(15_000L, 60_000L, 240_000L)
-        /** Ids tracked for deferred retry; a bound the provider cannot exceed in practice. */
+        /**
+         * Ids tracked for deferred retry at once. A stored or deduped id leaves
+         * the table and the least recently deferred idle one makes room
+         * ([DeferredMmsRetries]); only 512 retries queued at once fill it.
+         */
         private const val MMS_DEFER_TRACKED_MAX = 512
     }
 
@@ -776,8 +780,12 @@ class SmsBridgeService : Service() {
         val identity = ProviderIdentityResolver.resolve(
             db, ProviderIdentity.MMS, id, phone, mms.date, encodedContent,
         )
-        if (db.processedMmsDao().contains(identity.epoch, id)) return
+        if (db.processedMmsDao().contains(identity.epoch, id)) {
+            mmsRetries.settled(id)
+            return
+        }
         if (db.relayOutboxDao().getByProviderId(identity.epoch, id, "incoming_mms") != null) {
+            mmsRetries.settled(id)
             flushOutbox()
             return
         }
@@ -788,6 +796,7 @@ class SmsBridgeService : Service() {
             // this app is the default SMS app and reads nothing but Room, so
             // refusing it used to make the message unreachable everywhere.
             db.processedMmsDao().insert(ProcessedMms(identity.epoch, id, identity.fingerprint))
+            mmsRetries.settled(id)
             return
         }
         val filterText = listOfNotNull(mms.subject, mms.body).joinToString("\n")
@@ -803,6 +812,7 @@ class SmsBridgeService : Service() {
             )
             db.processedMmsDao().insert(ProcessedMms(identity.epoch, id, identity.fingerprint))
             MmsProvider.delete(this, id)
+            mmsRetries.settled(id)
             Log.i(TAG, "MMS quarantined id=$id: ${decision.reason}")
             return
         }
@@ -814,8 +824,14 @@ class SmsBridgeService : Service() {
         val material = IncomingMmsPolicy.settle(
             MmsProvider.materializeRelayParts(this, mms, ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET),
         ) {
-            scheduleDeferredMmsRetry(id, asRescan).also { scheduled ->
-                if (!scheduled) Log.w(TAG, "MMS part still unreadable, no retry possible; persisting id=$id with a notice")
+            scheduleDeferredMmsRetry(id, asRescan).also { deferral ->
+                when (deferral) {
+                    IncomingMmsPolicy.Deferral.EXHAUSTED ->
+                        Log.w(TAG, "MMS part still unreadable, retries spent; persisting id=$id with a notice")
+                    IncomingMmsPolicy.Deferral.NO_ROOM ->
+                        Log.w(TAG, "MMS part still unreadable, no retry slot; leaving id=$id for the next sweep")
+                    IncomingMmsPolicy.Deferral.RETRYING -> Unit
+                }
             }
         } ?: run {
             // A part could not be read yet. Nothing durable has been written
@@ -846,6 +862,7 @@ class SmsBridgeService : Service() {
             receivedAt = mms.date,
             payload = payloadContent,
         )
+        mmsRetries.settled(id)
         // A logout clears the processed-MMS ledger, so without the age gate the
         // next startup sweep would re-notify every inbox row it can still see.
         // The preview describes the payload: it is what the user will open.
@@ -867,9 +884,11 @@ class SmsBridgeService : Service() {
      * Two causes share one budget per id: a row that is not ready at all, and a
      * ready row with a part that cannot be read yet. Returns whether a retry
      * will come back to the row: one queued now, or one already queued that
-     * this call joined. The not-ready caller ignores it and leaves the row to
-     * the next sweep, as it always has; the pending-part caller persists with
-     * an omission notice when this says no ([IncomingMmsPolicy.settle]).
+     * this call joined ([IncomingMmsPolicy.Deferral.RETRYING]). The not-ready
+     * caller ignores it and leaves the row to the next sweep, as it always
+     * has; the pending-part caller persists with an omission notice only when
+     * the row's own retries are spent, and leaves it to the next sweep when
+     * the table had no room ([IncomingMmsPolicy.settle]).
      *
      * A queued retry is a delay() on this service's scope, and every stop of
      * the service cancels it there; nothing holds a stop back for it. So a
@@ -891,16 +910,15 @@ class SmsBridgeService : Service() {
      * first retry to run then stored the message with a missing-photo notice
      * fifteen seconds in rather than after the ~5 minutes the backoff spans.
      */
-    private fun scheduleDeferredMmsRetry(id: Long, rescan: Boolean): Boolean {
-        val ticket = when (val decision = mmsRetries.schedule(id, rescan)) {
-            DeferredMmsRetries.Decision.Joined -> return true
+    private fun scheduleDeferredMmsRetry(id: Long, rescan: Boolean): IncomingMmsPolicy.Deferral {
+        val decision = mmsRetries.schedule(id, rescan)
+        val ticket = when (decision) {
+            DeferredMmsRetries.Decision.Joined -> return decision.deferral
             is DeferredMmsRetries.Decision.Refused -> {
-                when (decision.reason) {
-                    DeferredMmsRetries.Refusal.SPENT -> Unit
-                    DeferredMmsRetries.Refusal.TABLE_FULL ->
-                        Log.w(TAG, "deferred MMS retry table full; not retrying id=$id")
+                if (decision.reason == DeferredMmsRetries.Refusal.TABLE_FULL) {
+                    Log.w(TAG, "deferred MMS retry table full; not retrying id=$id")
                 }
-                return false
+                return decision.deferral
             }
             is DeferredMmsRetries.Decision.Launch -> decision.ticket
         }
@@ -926,7 +944,7 @@ class SmsBridgeService : Service() {
                 mmsRetries.abandon(ticket)
             }
         }
-        return true
+        return decision.deferral
     }
 
     /**
@@ -2214,13 +2232,25 @@ internal object OutboxAckResume {
  * The per-id bookkeeping behind [SmsBridgeService]'s deferred MMS retries: the
  * budget, the one retry that may be queued, and whether that retry runs live.
  *
- * Budget: the delays in [delaysMs], one per retry actually queued. Entries are
- * never removed: the count *is* the "how often has this row been nudged"
- * marker, and clearing an id would let a permanently malformed row reschedule
- * itself forever -- or hold back, forever, a message whose one part never
- * becomes readable, when spending the count is what finally persists it with a
- * notice. Per service instance, so a new instance (and so a new process)
- * starts each id with a fresh budget. That never stores a message twice by
+ * Budget: the delays in [delaysMs], one per retry actually queued. The count
+ * *is* the "how often has this row been nudged" marker, so no retry, however
+ * it ended, gives it back: that would let a permanently malformed row
+ * reschedule itself forever -- or hold back, forever, a message whose one part
+ * never becomes readable, when spending the count is what finally persists it
+ * with a notice. Per service instance, so a new instance (and so a new
+ * process) starts each id with a fresh budget.
+ *
+ * Table: at most [trackedMax] ids. Entries used to stay for the life of the
+ * service, so 512 MMS that never became ready (no content at all, or a
+ * zero-length part) filled it, and every later photo still landing was
+ * refused a retry and stored at once with a missing-photo notice. Now an id
+ * leaves the table once it is stored or deduped ([settled]) -- the dedupe
+ * ledgers answer for it from then on, so its count is never needed again --
+ * and a new id takes the place of the least recently deferred id with no
+ * retry queued. That evicted id, if its row is still unready, starts over
+ * with a fresh budget the next time a sweep meets it, as it would in a new
+ * process; each such restart costs a new id's arrival, so it cannot spin.
+ * [Refusal.TABLE_FULL] is left only for [trackedMax] retries queued at once. That never stores a message twice by
  * itself: whether a stored row is stored again is decided by the dedupe
  * ledgers, never by this budget. They skip it while they hold it and it reads
  * with the identity it was stored under; [IncomingMmsPolicy.settle] says how
@@ -2254,11 +2284,21 @@ internal class DeferredMmsRetries(
     enum class Refusal {
         /** Every retry this id gets has been queued already. */
         SPENT,
-        /** A new id, and the table is at [trackedMax]. */
+        /** A new id, and all [trackedMax] tracked ids have a retry queued. */
         TABLE_FULL,
     }
 
     sealed interface Decision {
+        /** What this decision means for a message with a part still unread. */
+        val deferral: IncomingMmsPolicy.Deferral
+            get() = when (this) {
+                Joined, is Launch -> IncomingMmsPolicy.Deferral.RETRYING
+                is Refused -> when (reason) {
+                    Refusal.SPENT -> IncomingMmsPolicy.Deferral.EXHAUSTED
+                    Refusal.TABLE_FULL -> IncomingMmsPolicy.Deferral.NO_ROOM
+                }
+            }
+
         /** A retry was already queued for the id; it carries this caller too. */
         data object Joined : Decision
         /** Queue [ticket]: launch it, then [begin] it or [abandon] it. */
@@ -2266,7 +2306,8 @@ internal class DeferredMmsRetries(
         class Refused(val reason: Refusal) : Decision
     }
 
-    private val spent = HashMap<Long, Int>()
+    /** Retries queued per id, least recently deferred first (access order). */
+    private val spent = LinkedHashMap<Long, Int>(16, 0.75f, true)
     private val queued = HashMap<Long, Ticket>()
 
     /** Joins the queued retry for [id], or spends one unit of budget on a new one. */
@@ -2279,7 +2320,9 @@ internal class DeferredMmsRetries(
         }
         val used = spent[id] ?: 0
         if (used >= delaysMs.size) return Decision.Refused(Refusal.SPENT)
-        if (used == 0 && spent.size >= trackedMax) return Decision.Refused(Refusal.TABLE_FULL)
+        if (used == 0 && spent.size >= trackedMax && !evictIdle()) {
+            return Decision.Refused(Refusal.TABLE_FULL)
+        }
         spent[id] = used + 1
         val ticket = Ticket(id, delaysMs[used], rescan)
         queued[id] = ticket
@@ -2302,6 +2345,31 @@ internal class DeferredMmsRetries(
     /** Whether a retry is queued for [id] that will run live. */
     @Synchronized
     fun queuedLive(id: Long): Boolean = queued[id]?.rescan == false
+
+    /**
+     * [id] was stored or deduped: the ledgers own it now, so its budget entry
+     * goes. A retry still queued for it keeps its place and finds it deduped.
+     */
+    @Synchronized
+    fun settled(id: Long) {
+        spent.remove(id)
+    }
+
+    /** Ids tracked; for tests and logs. */
+    @Synchronized
+    fun trackedCount(): Int = spent.size
+
+    /** Drops the least recently deferred id with no retry queued; false when every id has one. */
+    private fun evictIdle(): Boolean {
+        val iterator = spent.keys.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next() !in queued) {
+                iterator.remove()
+                return true
+            }
+        }
+        return false
+    }
 }
 
 internal object MmsRowProcessor {

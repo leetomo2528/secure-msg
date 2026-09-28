@@ -80,7 +80,7 @@ class IncomingMmsPolicyTest {
         )
         var asked = 0
 
-        val settled = IncomingMmsPolicy.settle(material) { asked += 1; true }
+        val settled = IncomingMmsPolicy.settle(material) { asked += 1; IncomingMmsPolicy.Deferral.RETRYING }
 
         assertSame(material, settled)
         assertEquals(0, asked)
@@ -98,7 +98,7 @@ class IncomingMmsPolicyTest {
         // Null means: write nothing. Persisting here would claim the message
         // in the dedupe ledgers with the photo missing -- for good, for a photo
         // too big to join the identity, which no later read then changes.
-        assertNull(IncomingMmsPolicy.settle(material) { asked += 1; true })
+        assertNull(IncomingMmsPolicy.settle(material) { asked += 1; IncomingMmsPolicy.Deferral.RETRYING })
         assertEquals(1, asked)
     }
 
@@ -111,7 +111,7 @@ class IncomingMmsPolicyTest {
             pending = listOf(candidate("image/jpeg", 2_000_000), candidate("audio/amr", -1)),
         )
 
-        val settled = IncomingMmsPolicy.settle(material) { false }!!
+        val settled = IncomingMmsPolicy.settle(material) { IncomingMmsPolicy.Deferral.EXHAUSTED }!!
 
         // What did arrive is not held hostage by what did not.
         assertEquals(listOf(arrived), settled.parts)
@@ -139,7 +139,7 @@ class IncomingMmsPolicyTest {
             pending = listOf(candidate("image/jpeg", -1)),
         )
 
-        val settled = IncomingMmsPolicy.settle(material) { false }!!
+        val settled = IncomingMmsPolicy.settle(material) { IncomingMmsPolicy.Deferral.EXHAUSTED }!!
 
         assertEquals("[사진 2장은 받지 못했습니다]", IncomingOmissionNotice.appendTo("", settled.omissions))
     }
@@ -169,11 +169,9 @@ class IncomingMmsPolicyTest {
             )
             // Decision -> "will a retry come back", as scheduleDeferredMmsRetry maps it.
             IncomingMmsPolicy.settle(material) {
-                when (val decision = retries.schedule(row.id, rescan = false)) {
-                    DeferredMmsRetries.Decision.Joined -> true
-                    is DeferredMmsRetries.Decision.Launch -> true.also { queued = decision.ticket }
-                    is DeferredMmsRetries.Decision.Refused -> false
-                }
+                val decision = retries.schedule(row.id, rescan = false)
+                if (decision is DeferredMmsRetries.Decision.Launch) queued = decision.ticket
+                decision.deferral
             }
         }
 
@@ -182,6 +180,52 @@ class IncomingMmsPolicyTest {
         val persisted = outcomes.last()!!
         assertTrue(persisted.parts.isEmpty())
         assertEquals("[사진 1장은 받지 못했습니다]", IncomingOmissionNotice.appendTo(row.body, persisted.omissions))
+    }
+
+    // --- SM-7: a full retry table is not a spent budget ----------------------
+
+    @Test
+    fun aFullRetryTableLeavesAPendingPhotoForTheNextSweepInsteadOfAnOmission() {
+        val material = RelayMaterial(
+            parts = emptyList(),
+            omissions = emptyList(),
+            pending = listOf(candidate("image/jpeg", -1)),
+        )
+
+        // Nothing written: the row stays in the provider, as a not-ready one does.
+        assertNull(IncomingMmsPolicy.settle(material) { IncomingMmsPolicy.Deferral.NO_ROOM })
+    }
+
+    @Test
+    fun fiveHundredTwelveBrokenMmsNoLongerCostTheNextPhotoItsRetries() {
+        // The service's pieces, as processIncomingMms uses them: 512 MMS that
+        // never become ready (no content) spend their whole budget, then 512
+        // with a zero-length photo part spend theirs and are persisted with a
+        // notice (settled). Before, all of those ids stayed in the table for
+        // the life of the service, and the next photo still landing was
+        // refused a retry (TABLE_FULL) and stored at once as
+        // "[사진 1장은 받지 못했습니다]" -- for good.
+        val retries = DeferredMmsRetries(longArrayOf(15_000L, 60_000L, 240_000L), trackedMax = 512)
+        fun exhaust(id: Long) {
+            while (true) {
+                val decision = retries.schedule(id, rescan = true)
+                if (decision is DeferredMmsRetries.Decision.Launch) retries.begin(decision.ticket) else break
+            }
+        }
+        val pendingPhoto = RelayMaterial(emptyList(), emptyList(), pending = listOf(candidate("image/jpeg", -1)))
+        for (id in 1_000L until 1_512L) exhaust(id) // not ready: never stored, never settled
+        for (id in 2_000L until 2_512L) {
+            exhaust(id)
+            val persisted = IncomingMmsPolicy.settle(pendingPhoto) { retries.schedule(id, rescan = true).deferral }
+            assertEquals(1, persisted!!.omissions.size)
+            retries.settled(id) // persistCarrier committed
+        }
+
+        // A real photo whose bytes are still landing gets its retry.
+        val photo = IncomingMmsPolicy.settle(pendingPhoto) { retries.schedule(9_999L, rescan = false).deferral }
+        assertNull("deferred, not stored with a missing-photo notice", photo)
+        assertTrue(retries.queuedLive(9_999L))
+        assertTrue(retries.trackedCount() <= 512)
     }
 
     private fun candidate(contentType: String, declaredSize: Int) = ProviderMmsCandidate(

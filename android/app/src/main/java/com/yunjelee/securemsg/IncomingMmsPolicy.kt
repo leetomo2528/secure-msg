@@ -56,13 +56,22 @@ object IncomingMmsPolicy {
      * acceptable outcome where an empty bubble is not. Deferring still spares
      * that case the empty first copy whenever the part lands in time.
      *
-     * Once no retry can be scheduled -- the retries are spent, or the tracking
-     * table is full -- the message is persisted anyway, with one omission per
-     * part still unread. The text and every part that did arrive must not be
-     * held hostage forever by one part that never will, and the owner is told
-     * about the gap instead of being shown nothing. Those omissions never carry
-     * a size: 용량이 커서 is a claim about the cause, and a part that could not
-     * even be read was never weighed.
+     * Once this message's retries are spent ([Deferral.EXHAUSTED]) the message
+     * is persisted anyway, with one omission per part still unread. The text
+     * and every part that did arrive must not be held hostage forever by one
+     * part that never will, and the owner is told about the gap instead of
+     * being shown nothing. Those omissions never carry a size: 용량이 커서 is a
+     * claim about the cause, and a part that could not even be read was never
+     * weighed.
+     *
+     * A tracking table with no room ([Deferral.NO_ROOM]) is not that. It says
+     * nothing about this message -- its budget was never touched -- and it
+     * is not rare either: every content-less or zero-length-part MMS used to
+     * keep its entry for the life of the service, so 512 of them made the next
+     * photo whose bytes were still landing come out as "[사진 1장은 받지 못했습니다]"
+     * at once, and for good (a photo over the identity cap never changes the
+     * identity the ledgers then hold). So nothing is written, exactly as for a
+     * row that is not ready: the row stays in the provider for the next sweep.
      *
      * [tryDefer] reports whether a retry will come back to the message: one it
      * scheduled, or one already queued for it that it joined. A stop of the
@@ -71,14 +80,29 @@ object IncomingMmsPolicy {
      * only when something is pending, so a complete message never spends a
      * retry and never starts a retry chain.
      */
-    fun settle(material: RelayMaterial, tryDefer: () -> Boolean): RelayMaterial? {
+    fun settle(material: RelayMaterial, tryDefer: () -> Deferral): RelayMaterial? {
         if (material.pending.isEmpty()) return material
-        if (tryDefer()) return null
+        when (tryDefer()) {
+            Deferral.RETRYING, Deferral.NO_ROOM -> return null
+            Deferral.EXHAUSTED -> Unit
+        }
         return RelayMaterial(
             parts = material.parts,
             omissions = material.omissions + material.pending.map {
                 IncomingOmissionNotice.Omission(ImageShrinkPolicy.omissionKind(it.contentType), bytes = null)
             },
         )
+    }
+
+    /** What asking for a deferred retry of one MMS came to; see [settle]. */
+    enum class Deferral {
+        /** A retry was queued for the message, or it joined the one already queued. */
+        RETRYING,
+
+        /** Every retry this message gets has been used: persist it with a notice. */
+        EXHAUSTED,
+
+        /** The tracking table had no room for it: leave it for the next sweep. */
+        NO_ROOM,
     }
 }

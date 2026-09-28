@@ -152,6 +152,51 @@ class DeferredMmsRetriesTest {
     }
 
     @Test
+    fun `a stored or deduped id leaves the table`() {
+        val retries = DeferredMmsRetries(delays, trackedMax = 1)
+        // Its retry is still queued, so it could not be evicted to make room.
+        launched(retries.schedule(ID, rescan = false))
+
+        retries.settled(ID)
+
+        assertEquals(0, retries.trackedCount())
+        assertTrue(retries.schedule(ID + 1, rescan = false) is Decision.Launch)
+    }
+
+    @Test
+    fun `ids whose budget ran out do not fill the table for a new one`() {
+        val retries = DeferredMmsRetries(delays, trackedMax = 512)
+        for (id in 1L..512L) {
+            while (true) {
+                val decision = retries.schedule(id, rescan = true)
+                if (decision is Decision.Launch) retries.begin(decision.ticket) else break
+            }
+        }
+        assertEquals(512, retries.trackedCount())
+
+        val ticket = launched(retries.schedule(ID + 1_000, rescan = false))
+
+        assertEquals(15_000L, ticket.delayMs)
+        assertEquals(512, retries.trackedCount())
+    }
+
+    @Test
+    fun `room is made from the least recently deferred id with no retry queued`() {
+        val retries = DeferredMmsRetries(delays, trackedMax = 2)
+        launched(retries.schedule(1L, rescan = false)) // stays queued
+        retries.begin(launched(retries.schedule(2L, rescan = false)))
+
+        launched(retries.schedule(3L, rescan = false))
+
+        // 1 was older but has a retry queued; 2 made room.
+        assertSame(Decision.Joined, retries.schedule(1L, rescan = true))
+        assertEquals(2, retries.trackedCount())
+        // Back later, 2 starts over, as it would in a new process.
+        retries.settled(3L)
+        assertEquals(15_000L, launched(retries.schedule(2L, rescan = false)).delayMs)
+    }
+
+    @Test
     fun `the budget is never given back`() {
         // A permanently unreadable part must end with a notice, not reschedule
         // itself forever, however its retries ended.
