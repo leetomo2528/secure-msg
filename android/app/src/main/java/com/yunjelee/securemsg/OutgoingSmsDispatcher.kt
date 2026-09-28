@@ -138,10 +138,12 @@ object OutgoingSmsDispatcher {
      * a failed badge. Reading, shrinking and budgeting the photos is exactly
      * such a refusal, so all of it runs first.
      *
-     * Never throws. A refusal is a returned value, and the catches below cover
-     * the two framework boundaries that can still surprise us, because this is
-     * called from a Compose handler on a phone that installs its own updates
-     * unattended.
+     * A refusal is a returned value, and the catches below cover the two
+     * framework boundaries that can still surprise us, because this is called
+     * from a Compose handler on a phone that installs its own updates
+     * unattended. Once the row is written every exit is a returned [MmsSend.Failed]
+     * (see [OutgoingMmsCommit]), so anything that does escape a photo send was
+     * thrown before the transaction committed and left nothing on disk.
      */
     suspend fun queueAndSendMms(
         context: Context,
@@ -215,7 +217,14 @@ object OutgoingSmsDispatcher {
         // row and the durable outbox row must appear or fail together, and the
         // thread get-or-create belongs inside because sms_threads is keyed on
         // cid alone.
-        val (cid, localId, outboxId) = db.withTransaction {
+        //
+        // Named here and run inside OutgoingMmsCommit, which holds the write,
+        // the carrier call and the carrier marking under NonCancellable: a
+        // photo send outlives the screen that started it, and a cancellation
+        // between the dispatch and its marker would leave the row 'unknown'
+        // for the outbox drain to send a second time. The `suspend { ... }`
+        // wrapper keeps this block where it was instead of re-indenting it.
+        val persist = suspend { db.withTransaction {
             val thread = db.threadDao().getByPhone(phone) ?: SmsThread(
                 cid = SmsThread.newLocalCid(),
                 phoneNumber = phone,
@@ -258,44 +267,63 @@ object OutgoingSmsDispatcher {
                 ),
             )
             Triple(thread.cid, localId, outboxId)
-        }
+        } }
 
-        // Past this point the message is the owner's, visible in the thread and
+        // Past the persist the message is the owner's, visible in the thread and
         // bound for their other devices; every exit below resolves it rather
-        // than pretending it never happened.
-        val ready = when (val fit = MmsSender.fit(context, content)) {
-            is MmsSender.Fit.TooLarge -> {
-                // The planner sized these bytes to this same ceiling, so this is
-                // a disagreement between the two, not an over-large photo. It is
-                // still resolved the way the relay path resolves it: the carrier
-                // API is never called, so no callback can ever finish this row.
-                Log.e(TAG, "Carrier refused outgoing MMS mid=$mid: ${fit.reason}")
-                db.relayOutboxDao().markCarrierState(outboxId, "failed", fit.reason)
-                db.messageDao().setCarrierStatusById(localId, "failed", fit.reason)
-                return MmsSend.Failed(fit.reason)
-            }
-            is MmsSender.Fit.Ready -> fit
-        }
-        val dispatched = MmsSender.send(context, phone, content, ready, mid, cid, 0)
-        if (!dispatched) {
-            // The same marker string the text path and the outbox drain write,
+        // than pretending it never happened, so each one is a Failed, never a
+        // Refused.
+        val committed = OutgoingMmsCommit.run(
+            persist = persist,
+            fit = {
+                when (val fit = MmsSender.fit(context, content)) {
+                    // The planner sized these bytes to this same ceiling, so this
+                    // is a disagreement between the two, not an over-large photo.
+                    // It is still resolved the way the relay path resolves it: the
+                    // carrier API is never called, so no callback can ever finish
+                    // this row.
+                    is MmsSender.Fit.TooLarge -> OutgoingMmsCommit.Fit.TooLarge(fit.reason)
+                    is MmsSender.Fit.Ready -> OutgoingMmsCommit.Fit.Ready(fit)
+                }
+            },
+            dispatch = { (cid, _, _), ready ->
+                MmsSender.send(context, phone, content, ready, mid, cid, 0)
+            },
+            // The same marker strings the text path and the outbox drain write,
             // so one carrier state means one thing across all three.
-            db.relayOutboxDao().markCarrierState(outboxId, "failed", "carrier dispatch rejected")
-            db.messageDao().setCarrierStatusById(localId, "failed", "carrier dispatch rejected")
-            return MmsSend.Failed(CARRIER_REJECTED_KO)
+            markFailed = { (_, localId, outboxId), reason ->
+                db.relayOutboxDao().markCarrierState(outboxId, "failed", reason)
+                db.messageDao().setCarrierStatusById(localId, "failed", reason)
+            },
+            markDispatched = { (_, localId, outboxId) ->
+                // A very fast carrier callback may already have advanced this
+                // row. Only replace the unknown pre-call marker and mirror the
+                // resulting state.
+                db.relayOutboxDao().markCarrierDispatchedIfUnknown(outboxId)
+                val current = db.relayOutboxDao().getByMid(mid)
+                val state = current?.carrierState ?: "dispatched"
+                db.messageDao().advanceCarrierStatus(localId, state, current?.lastError)
+            },
+        )
+        return when (committed) {
+            OutgoingMmsCommit.Result.Dispatched -> {
+                Log.i(TAG, "Queued encrypted relay for carrier MMS mid=$mid parts=${attachments.size}")
+                MmsSend.Sent
+            }
+            is OutgoingMmsCommit.Result.TooLarge -> {
+                Log.e(TAG, "Carrier refused outgoing MMS mid=$mid: ${committed.reason}")
+                MmsSend.Failed(committed.reason)
+            }
+            OutgoingMmsCommit.Result.Rejected -> MmsSend.Failed(CARRIER_REJECTED_KO)
+            is OutgoingMmsCommit.Result.Crashed -> {
+                Log.e(TAG, "Outgoing MMS mid=$mid failed after persistence", committed.error)
+                MmsSend.Failed(SEND_FAILED_KO)
+            }
         }
-
-        // A very fast carrier callback may already have advanced this row. Only
-        // replace the unknown pre-call marker and mirror the resulting state.
-        db.relayOutboxDao().markCarrierDispatchedIfUnknown(outboxId)
-        val current = db.relayOutboxDao().getByMid(mid)
-        val state = current?.carrierState ?: "dispatched"
-        db.messageDao().advanceCarrierStatus(localId, state, current?.lastError)
-        Log.i(TAG, "Queued encrypted relay for carrier MMS mid=$mid parts=${attachments.size}")
-        return MmsSend.Sent
     }
 
     private const val CARRIER_REJECTED_KO = "통신사가 메시지를 받지 않았습니다"
+    private const val SEND_FAILED_KO = "사진 메시지를 보내지 못했습니다"
 
     /**
      * What the resolver says this pick is.
