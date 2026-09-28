@@ -931,6 +931,10 @@ class MainActivity : ComponentActivity() {
      * on: either way the send did not happen and the owner is shown why, and a
      * persisted failure additionally carries its own failed badge in the thread.
      *
+     * Runs on the application scope, not the pane's: [applicationContext] is
+     * what the dispatcher gets, so a send in flight does not need this
+     * Activity alive (swipe from recents destroys it mid-send).
+     *
      * An empty [sources] takes the unchanged SMS path inside the dispatcher, so
      * a photoless send through this function behaves exactly as [sendNewSms].
      */
@@ -943,7 +947,7 @@ class MainActivity : ComponentActivity() {
     ): String? {
         return try {
             val result = OutgoingSmsDispatcher.queueAndSendMms(
-                this,
+                applicationContext,
                 creds,
                 phone,
                 text,
@@ -960,6 +964,9 @@ class MainActivity : ComponentActivity() {
                 is OutgoingSmsDispatcher.MmsSend.Refused -> result.reason
                 is OutgoingSmsDispatcher.MmsSend.Failed -> result.reason
             }
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            // Not a failed send: whoever cancelled is gone and wants no answer.
+            throw e
         } catch (e: LinkageError) {
             Log.e("MainActivity", "MMS crypto module unavailable", e)
             "보안 모듈을 불러오지 못해 사진을 보내지 못했습니다"

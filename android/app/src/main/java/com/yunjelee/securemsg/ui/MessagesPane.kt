@@ -79,10 +79,13 @@ import com.yunjelee.securemsg.MessageRow
 import com.yunjelee.securemsg.MessageSearch
 import com.yunjelee.securemsg.PhoneNumberNormalizer
 import com.yunjelee.securemsg.PinnedConversations
+import com.yunjelee.securemsg.SecureMsgApp
 import com.yunjelee.securemsg.SmsNotifier
 import com.yunjelee.securemsg.SmsThread
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -733,6 +736,13 @@ fun ColumnScope.MessagesPane(
      * and a second copy of this logic is how the two would drift apart. A
      * blank composer returns without a word; a refusal says why and dispatches
      * nothing.
+     *
+     * The send itself runs on [SecureMsgApp.appScope], not this pane's scope: a
+     * photo send reads and shrinks for seconds, and leaving the pane in that
+     * window (a tab switch, a swipe from recents that destroys the Activity)
+     * disposes this composition. The pane only awaits the answer, so disposal
+     * cancels the wait and never the send; the status line still gets the
+     * failure, since the shell shows it where the pane no longer can.
      */
     fun submit(
         phone: String,
@@ -750,9 +760,9 @@ fun ColumnScope.MessagesPane(
         val sources = photos.map { it.uri }
         sending = true
         sendNotice = null
-        scope.launch(Dispatchers.IO) {
-            // Nothing below may escape: this coroutine outlives the click that
-            // started it, and an uncaught throw here takes the process with it.
+        val work = SecureMsgApp.appScope.async {
+            // Nothing below may escape: nobody may be left to await this, and
+            // a send that answers nothing is exactly the silence being fixed.
             // sendSms already swallows its own failures; the MMS handler is
             // another module's and is treated as if it does not.
             val failure = try {
@@ -778,16 +788,24 @@ fun ColumnScope.MessagesPane(
                 Log.e(TAG, "Send failed", e)
                 if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
             }
-            withContext(Dispatchers.Main) {
-                if (failure != null) {
-                    sendNotice = SendNotice(failure, failed = true)
-                    setStatus(failure)
-                }
-                // After the failure line, so a surface that has more to say
-                // (the composer's queued notice) writes last.
-                onResult(failure)
-                sending = false
+            failure?.let { withContext(Dispatchers.Main) { setStatus(it) } }
+            failure
+        }
+        scope.launch {
+            val failure = try {
+                work.await()
+            } catch (e: CancellationException) {
+                // This pane left composition: rethrow, the send carries on.
+                ensureActive()
+                // Otherwise the send itself was cancelled, which nothing here
+                // does; answer it like a throw rather than leave 보내기 closed.
+                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
             }
+            if (failure != null) sendNotice = SendNotice(failure, failed = true)
+            // After the failure line, so a surface that has more to say
+            // (the composer's queued notice) writes last.
+            onResult(failure)
+            sending = false
         }
     }
 
