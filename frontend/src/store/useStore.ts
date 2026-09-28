@@ -49,6 +49,11 @@ import {
   setCarrierStatus,
   getCursor,
   setCursor,
+  setCursorSeedingRead,
+  armInitialSyncIfFresh,
+  beginInitialSyncPass,
+  isInitialSyncPending,
+  completeInitialSync,
   hasUnclassifiedMessages,
   clearDirectionBackfill,
   countUnclassified,
@@ -689,6 +694,14 @@ export const useStore = create<State>((set, get) => ({
     const pageSize = 200;
     const deliveredCursor = await getCursor(cid);
     if (!canUseCrypto(context)) return;
+    // Read once: a conversation the session's initial pass is importing has
+    // its history acked as read (see InitialSyncState in db.ts). Membership,
+    // not "no cursor row", is the test, so a click that already created the
+    // row (markConversationRead) or a first page written before a reload
+    // still counts. Any other thread — one first seen via message_new, or a
+    // login with no marker — seeds from the pre-advance cursor as always.
+    const importingHistory = await isInitialSyncPending(cid);
+    if (!canUseCrypto(context)) return;
     const previousFloor = await getUndecryptableFloor(cid);
     if (!canUseCrypto(context)) return;
     // A cursor ahead of the rows actually held here hides them permanently:
@@ -831,7 +844,10 @@ export const useStore = create<State>((set, get) => ({
         if (!wrote) return;
       }
       if (!canUseCrypto(context)) return;
-      if (!await runSessionEffect(context, () => setCursor(cid, maxSeq))) return;
+      if (!await runSessionEffect(
+        context,
+        () => importingHistory ? setCursorSeedingRead(cid, maxSeq) : setCursor(cid, maxSeq),
+      )) return;
       if (!canUseCrypto(context)) return;
       const socket = liveSocket();
       if (socket?.connected) {
@@ -840,6 +856,14 @@ export const useStore = create<State>((set, get) => ({
       }
       if (fr.messages.length < pageSize || maxSeq <= cursor) break;
       cursor = maxSeq;
+    }
+    // Only a pull that reached the end covers the conversation, a 0-row one
+    // included (it will never get a cursor row to key off). A failed page
+    // (network error, 429) returned above and leaves it pending, so the next
+    // pass — this session's reconnect or the next login — still imports the
+    // rest as read.
+    if (importingHistory) {
+      if (!await runSessionEffect(context, () => completeInitialSync(cid))) return;
     }
     // A pass that started at the floor covers every gap; one that skipped the
     // re-read only learned about gaps above the stored cursor, so the older
@@ -1320,12 +1344,28 @@ async function runPostLogin(context: SecurityContext): Promise<void> {
     if (!canUseCrypto(context)) return;
     const state = useStore.getState();
     useStore.setState({ error: null });
+    // An armed initial-sync marker (logout, or a store with no read state)
+    // becomes the set of listed conversations without a cursor row, whose
+    // history is then imported as read; conversations that appear later, via
+    // message_new, are not in it and badge as usual. Taken first from the list
+    // post-login already loaded, before any network round trip here, so a
+    // message_new racing this pass cannot pull a thread's whole history
+    // unseeded first; taken again after the refresh below in case that list
+    // was empty (the call is a no-op for an empty list, and only narrows a
+    // pending set that already exists).
+    // A marker that cannot be read or written only costs the seeding, never
+    // the sync itself.
+    const beginPass = () => runSessionEffect(context, () => beginInitialSyncPass(
+      useStore.getState().conversations.map((conv) => conv.cid),
+    )).catch(() => canUseCrypto(context));
+    if (!await beginPass()) return;
     await state.syncBlockRules().catch(() => undefined);
     if (!canUseCrypto(context)) return;
     await state.refreshBlocklist();
     if (!canUseCrypto(context)) return;
     await state.refreshConversations();
     if (!canUseCrypto(context)) return;
+    if (!await beginPass()) return;
     // Re-read after refresh: `state` predates the conversation reload.
     for (const conv of useStore.getState().conversations) {
       if (!canUseCrypto(context)) return;
@@ -1684,6 +1724,12 @@ async function installSession(
   const installed = await sessionCoordinator.exclusive(async () => {
     if (useStore.getState().securityGeneration !== attemptGeneration) return false;
     await setMeta(meta);
+    // A store with no cursor rows at all (new browser, or one wiped with
+    // clearAllData) is about to import the whole history: mark it so the
+    // first pass does not badge all of it unread. A reload of a store that
+    // already has cursors is not initial and is left alone.
+    // Best effort: a failed marker write costs the seeding, not the login.
+    await armInitialSyncIfFresh().catch(() => undefined);
     if (useStore.getState().securityGeneration !== attemptGeneration) return false;
     api.setToken(token);
     // Listed field by field rather than spread: `meta` is the persisted device

@@ -30,6 +30,30 @@ interface MetaRow {
   };
 }
 
+/**
+ * Marker for the first sync of a session that starts with no read state.
+ *
+ * Logout clears messages and cursors but keeps the device key, so the next
+ * login pulls every thread again from seq 0. Without this, the first
+ * setCursor on each thread seeds read_seq from a cursor that does not exist
+ * yet (0) and the whole history — dozens of threads — comes back unread. A
+ * brand-new browser's first login is the same situation.
+ *
+ * `armed` means "the next syncAll pass is an initial one"; that pass turns it
+ * into `pending`, the conversations it found without a cursor row. Only those
+ * are seeded read, and each leaves the list once a sync of it runs to the end,
+ * so a reload mid-pass resumes where it stopped. Stored in `meta` under its own
+ * key so it needs no schema version bump.
+ */
+export type InitialSyncState = { armed: true } | { pending: string[] };
+
+interface InitialSyncRow {
+  key: "initial_sync";
+  value: InitialSyncState;
+}
+
+const INITIAL_SYNC_KEY = "initial_sync";
+
 export interface AccountTrustRow {
   uid: number;
   identity_sig_pub: string;
@@ -184,7 +208,7 @@ export interface SenderRow {
 }
 
 interface SecureMsgDB extends DBSchema {
-  meta: { key: "current"; value: MetaRow };
+  meta: { key: "current" | "initial_sync"; value: MetaRow | InitialSyncRow };
   messages: {
     key: string; // `${cid}:${seq}`
     value: MessageRow;
@@ -300,18 +324,115 @@ export async function setMeta(meta: MetaRow["value"]): Promise<void> {
 
 export async function getMeta(): Promise<MetaRow["value"] | null> {
   const d = await db();
-  const row = await d.get("meta", "current");
+  const row = (await d.get("meta", "current")) as MetaRow | undefined;
   return row?.value ?? null;
 }
 
-/** Clear account content while retaining this browser's device keypair. */
+/**
+ * Clear account content while retaining this browser's device keypair.
+ *
+ * Arms the initial-sync marker in the same transaction: the next login pulls
+ * the whole history back, and none of it may land as unread.
+ */
 export async function clearSessionData(): Promise<void> {
   const d = await db();
-  const tx = d.transaction(["messages", "cursors"], "readwrite");
+  const tx = d.transaction(["meta", "messages", "cursors"], "readwrite");
+  const marker: InitialSyncRow = { key: INITIAL_SYNC_KEY, value: { armed: true } };
   await Promise.all([
     tx.objectStore("messages").clear(),
     tx.objectStore("cursors").clear(),
+    tx.objectStore("meta").put(marker, INITIAL_SYNC_KEY),
   ]);
+  await tx.done;
+}
+
+/** The initial-sync marker, or null when no initial pass is outstanding. */
+export async function getInitialSync(): Promise<InitialSyncState | null> {
+  const row = (await (await db()).get("meta", INITIAL_SYNC_KEY)) as InitialSyncRow | undefined;
+  return row?.value ?? null;
+}
+
+/**
+ * Arm the initial-sync marker for a store that holds no read state at all.
+ *
+ * A fresh browser profile, or one wiped by clearAllData /
+ * clearDeviceForReregistration (which drop `meta` and the marker with it).
+ * Every page load is a login here — the token is not persisted — so a store
+ * that already has cursor rows is an ordinary reload and is left alone; an
+ * existing marker (armed, or pending from an interrupted pass) is kept.
+ */
+export async function armInitialSyncIfFresh(): Promise<void> {
+  const d = await db();
+  const tx = d.transaction(["meta", "cursors"], "readwrite");
+  const meta = tx.objectStore("meta");
+  const [existing, cursorCount] = await Promise.all([
+    meta.get(INITIAL_SYNC_KEY),
+    tx.objectStore("cursors").count(),
+  ]);
+  if (!existing && cursorCount === 0) {
+    const marker: InitialSyncRow = { key: INITIAL_SYNC_KEY, value: { armed: true } };
+    await meta.put(marker, INITIAL_SYNC_KEY);
+  }
+  await tx.done;
+}
+
+/**
+ * Start a sync pass over `cids`, the conversation list as the pass sees it.
+ *
+ * `armed` becomes `pending`: the listed conversations with no cursor row, the
+ * ones whose whole history this pass is about to import. An empty list keeps
+ * the marker armed — it is also what a failed first conversation fetch looks
+ * like, and disarming then would let the real list arrive unseeded. A
+ * `pending` marker left by an interrupted pass is kept, narrowed to the
+ * conversations still listed so one the account has left cannot hold it open
+ * forever; it is deleted once nothing is left in it.
+ */
+export async function beginInitialSyncPass(cids: string[]): Promise<void> {
+  if (!cids.length) return;
+  const d = await db();
+  const tx = d.transaction(["meta", "cursors"], "readwrite");
+  const meta = tx.objectStore("meta");
+  const row = (await meta.get(INITIAL_SYNC_KEY)) as InitialSyncRow | undefined;
+  if (row) {
+    let pending: string[];
+    if ("armed" in row.value) {
+      const cursors = tx.objectStore("cursors");
+      const known = await Promise.all(cids.map((cid) => cursors.getKey(cid)));
+      pending = cids.filter((_, index) => known[index] === undefined);
+    } else {
+      const listed = new Set(cids);
+      pending = row.value.pending.filter((cid) => listed.has(cid));
+    }
+    if (pending.length) {
+      const next: InitialSyncRow = { key: INITIAL_SYNC_KEY, value: { pending } };
+      await meta.put(next, INITIAL_SYNC_KEY);
+    } else {
+      await meta.delete(INITIAL_SYNC_KEY);
+    }
+  }
+  await tx.done;
+}
+
+/** True while `cid` still owes the current initial pass a complete sync. */
+export async function isInitialSyncPending(cid: string): Promise<boolean> {
+  const state = await getInitialSync();
+  return state != null && "pending" in state && state.pending.includes(cid);
+}
+
+/** `cid` was synced to the end; drop it, and the marker once it is empty. */
+export async function completeInitialSync(cid: string): Promise<void> {
+  const d = await db();
+  const tx = d.transaction("meta", "readwrite");
+  const row = (await tx.store.get(INITIAL_SYNC_KEY)) as InitialSyncRow | undefined;
+  if (row && "pending" in row.value && row.value.pending.includes(cid)) {
+    const pending = row.value.pending.filter((item) => item !== cid);
+    if (pending.length) {
+      const next: InitialSyncRow = { key: INITIAL_SYNC_KEY, value: { pending } };
+      await tx.store.put(next, INITIAL_SYNC_KEY);
+    } else {
+      await tx.store.delete(INITIAL_SYNC_KEY);
+    }
+  }
   await tx.done;
 }
 
@@ -656,6 +777,27 @@ export async function setCursor(cid: string, last_seq: number): Promise<void> {
     // every delivery, so no message could ever be unread; seeding it from the
     // post-advance value would swallow the very rows this call is acking.
     read_seq: existing?.read_seq ?? existing?.last_seq ?? 0,
+    dir_backfilled: existing?.dir_backfilled ?? false,
+  });
+  await tx.done;
+}
+
+/**
+ * setCursor for a conversation the initial pass is importing: the rows this
+ * advance acks are history the user already had before this session, so they
+ * are marked read in the same transaction instead of seeding from the
+ * pre-advance cursor. Called once per page, so every page of a long thread
+ * ends up read, not only the first.
+ */
+export async function setCursorSeedingRead(cid: string, last_seq: number): Promise<void> {
+  const d = await db();
+  const tx = d.transaction("cursors", "readwrite");
+  const existing = await tx.store.get(cid);
+  await tx.store.put({
+    cid,
+    last_seq: Math.max(existing?.last_seq ?? 0, last_seq),
+    retry_from: existing?.retry_from ?? null,
+    read_seq: Math.max(existing?.read_seq ?? 0, last_seq),
     dir_backfilled: existing?.dir_backfilled ?? false,
   });
   await tx.done;
