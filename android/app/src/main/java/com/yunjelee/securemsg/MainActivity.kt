@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -59,6 +60,13 @@ class MainActivity : ComponentActivity() {
          * stall (issue #5) does not read as a hang.
          */
         const val INSTALL_CONFIRM_WATCHDOG_MS = 25_000L
+
+        /**
+         * elapsedRealtime of the last bridge start this process issued; see
+         * [startBridgeService]. Process-wide so an activity recreation does
+         * not reopen the window. Main thread only.
+         */
+        var lastBridgeStartElapsed: Long? = null
     }
 
     private var smsRoleHeld by mutableStateOf(false)
@@ -157,6 +165,7 @@ class MainActivity : ComponentActivity() {
         // in front, and treating that as "on screen" swallowed the alerts of
         // the visible conversation entirely.
         SmsNotifier.setAppForeground(false)
+        Diagnostics.updateStateSummary(vis = false)
         super.onPause()
     }
 
@@ -165,6 +174,9 @@ class MainActivity : ComponentActivity() {
         // An open conversation only suppresses its own notifications while it
         // is actually in front; see onPause.
         SmsNotifier.setAppForeground(true)
+        // Before the bridge start below, so a relay client it creates already
+        // reports vis=1 in its diag.
+        Diagnostics.updateStateSummary(vis = true)
         smsRoleHeld = isDefaultSmsApp()
         smsPermissionsGranted = hasSmsPerms()
         notificationPermissionGranted = hasNotificationPermission()
@@ -553,12 +565,16 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(Unit) {
             Credentials.observeDevice(this@MainActivity).collectLatest { localDevice ->
+                // The first emission is the stored session onResume has just
+                // started the bridge for; only a later null -> session change
+                // is a login, which must not wait out the debounce.
+                val signedIn = !loading && creds == null
                 localDeviceUsername = localDevice?.username
                 creds = localDevice?.takeIf { it.token.isNotBlank() }
                 loading = false
                 // This also reacts when the bridge clears an expired/revoked
                 // token, returning the visible activity to the login screen.
-                if (creds != null) startBridgeService()
+                if (creds != null) startBridgeService(urgent = signedIn)
             }
         }
 
@@ -614,7 +630,7 @@ class MainActivity : ComponentActivity() {
             ) { saved ->
                 localDeviceUsername = saved.username
                 creds = saved
-                startBridgeService()
+                startBridgeService(urgent = true)
             }
         } else {
             val current = creds!!
@@ -764,12 +780,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startBridgeService() {
+    /**
+     * Starts the bridge, at most once per [BridgeLifecyclePolicy.START_DEBOUNCE_MS]
+     * unless [urgent]. Every app open called this twice (onResume and the
+     * credentials collector), and each start could race the other into a
+     * second relay client. [urgent] is for a login and for a just-queued send,
+     * which have work the previous start may already have missed.
+     */
+    private fun startBridgeService(urgent: Boolean = false) {
         // remoteMessaging foreground services are rejected by Android when the
         // app has not yet received the SMS role/runtime permissions. Login must
         // still work in that state so the user can grant them from MainScreen,
-        // so [BridgeGate.start] returning without doing anything is normal here.
+        // so returning without doing anything is normal here. A closed gate
+        // does not open the debounce window: the grant callback that follows
+        // must get through.
+        if (!BridgeGate.canRun(this)) return
+        val now = SystemClock.elapsedRealtime()
+        if (!BridgeLifecyclePolicy.shouldStartBridge(now, lastBridgeStartElapsed, urgent)) return
+        lastBridgeStartElapsed = now
         BridgeGate.start(this) { e ->
+            // A refused start did not happen; let the next caller retry.
+            lastBridgeStartElapsed = null
             Log.e("MainActivity", "Bridge service start rejected", e)
         }
     }
@@ -909,7 +940,8 @@ class MainActivity : ComponentActivity() {
             val dispatched = OutgoingSmsDispatcher.queueAndSend(this, creds, phone, text)
             // Relay preparation is durable and may complete immediately or after a
             // later reconnect; carrier SMS itself does not depend on Oracle uptime.
-            startBridgeService()
+            // Urgent: the row just queued needs a flush the debounce would skip.
+            startBridgeService(urgent = true)
             dispatched
         } catch (e: LinkageError) {
             Log.e("MainActivity", "SMS crypto module unavailable", e)
@@ -954,7 +986,7 @@ class MainActivity : ComponentActivity() {
             // preparation is durable and may complete immediately or after a
             // later reconnect, and a refusal here does not mean the outbox is
             // empty of earlier rows waiting for the same service.
-            startBridgeService()
+            startBridgeService(urgent = true)
             when (result) {
                 OutgoingSmsDispatcher.MmsSend.Sent -> null
                 is OutgoingSmsDispatcher.MmsSend.Refused -> result.reason

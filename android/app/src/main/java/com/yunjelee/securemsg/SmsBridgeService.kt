@@ -36,7 +36,18 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class SmsBridgeService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Without the handler an Exception escaping any launch child reached the
+    // thread's uncaught handler and killed the default SMS app's process. Only
+    // a VirtualMachineError (OOM, stack overflow) is still allowed to.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, t ->
+            Log.e(TAG, "uncaught in bridge", t)
+            Diagnostics.record("scope_uncaught", t)
+            if (t is VirtualMachineError) {
+                Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(Thread.currentThread(), t)
+            }
+        },
+    )
     private val bridgeMutex = Mutex()
     private val incomingMutex = Mutex()
     private val syncMutex = Mutex()
@@ -49,6 +60,8 @@ class SmsBridgeService : Service() {
     private val outboxLoopStarted = AtomicBoolean(false)
     private val sessionInvalidated = AtomicBoolean(false)
     private val lastTrustRefreshAt = AtomicLong(0L)
+    /** elapsedRealtime of the last watchdog-driven [ensureBridgeReady]; see [startOutboxLoop]. */
+    @Volatile private var lastWatchdogKickAt: Long? = null
     /** Budget and queue of the deferred MMS retries; see [scheduleDeferredMmsRetry]. */
     private val mmsRetries = DeferredMmsRetries(MMS_DEFER_RETRY_DELAYS_MS, MMS_DEFER_TRACKED_MAX)
 
@@ -91,17 +104,28 @@ class SmsBridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A null intent is a START_STICKY restart after the platform killed
+        // the process. The line prefix already carries the pid; it is repeated
+        // here so the start reads on its own.
+        Diagnostics.record(
+            "svc_start",
+            "pid=${android.os.Process.myPid()} action=${DiagnosticsFormat.actionLabel(intent?.action)} " +
+                "null_intent=${if (intent == null) 1 else 0} flags=$flags id=$startId",
+        )
         try {
             startForeground()
+            Diagnostics.updateStateSummary(fgs = true)
         } catch (e: SecurityException) {
             // Do not take down the process when the user has not completed the
             // default-SMS role or runtime permission flow yet. MainActivity
             // will retry after the permission/role result callback.
             Log.e(TAG, "Cannot start bridge foreground service; permissions/role incomplete", e)
+            recordStop("fgs_security", e)
             stopSelfResult(startId)
             return START_NOT_STICKY
         } catch (e: RuntimeException) {
             Log.e(TAG, "Cannot start bridge foreground service", e)
+            recordStop("fgs_rejected", e)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
@@ -168,10 +192,12 @@ class SmsBridgeService : Service() {
                             ensureBridgeReady()
                         } else {
                             SmsSender.send(this@SmsBridgeService, phone, body)
+                            recordStop("quick_reply_no_session")
                             stopSelfResult(startId)
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "System quick-reply send failed", e)
+                        recordStop("quick_reply_failed", e)
                         stopSelfResult(startId)
                     }
                 }
@@ -235,28 +261,72 @@ class SmsBridgeService : Service() {
     private fun startOutboxLoop() {
         if (!outboxLoopStarted.compareAndSet(false, true)) return
         scope.launch {
-            while (true) {
-                // Unattended self-update rides the same heartbeat, relay or
-                // not — launched, never awaited: a multi-minute APK download
-                // must not stall the 30s durable retries this loop exists
-                // for, and maybeRun's single-flight guard keeps successive
-                // ticks from stacking downloads. Ticked before the first
-                // delay so a deferred commit gets its chance even in a
-                // process whose bridge start is about to fail and stop the
-                // service.
-                launch { AutoUpdate.maybeRun(applicationContext) }
-                delay(30_000L)
-                if (relay?.isConnected == true) {
-                    try {
-                        syncFromServer()
-                        flushOutbox()
-                        flushReceiptStatuses()
-                    } catch (e: Exception) {
-                        // One malformed row or transient provider failure must not
-                        // permanently terminate the durable retry loop.
-                        Log.e(TAG, "Periodic bridge recovery failed", e)
+            // Whatever ends this loop (an Error the catches below do not take,
+            // or the scope's cancellation), the flag must drop with it, or
+            // every later startOutboxLoop() would see "already running" and the
+            // service would live on with no durable retries at all.
+            try {
+                while (true) {
+                    // Unattended self-update rides the same heartbeat, relay or
+                    // not — launched, never awaited: a multi-minute APK download
+                    // must not stall the 30s durable retries this loop exists
+                    // for, and maybeRun's single-flight guard keeps successive
+                    // ticks from stacking downloads. Ticked before the first
+                    // delay so a deferred commit gets its chance even in a
+                    // process whose bridge start is about to fail and stop the
+                    // service.
+                    launch {
+                        try {
+                            AutoUpdate.maybeRun(applicationContext)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "Auto-update tick failed", t)
+                            Diagnostics.record("autoupdate_failed", t)
+                        }
+                    }
+                    delay(30_000L)
+                    if (relay?.isConnected == true) {
+                        try {
+                            syncFromServer()
+                            flushOutbox()
+                            flushReceiptStatuses()
+                        } catch (e: Exception) {
+                            // One malformed row or transient provider failure must not
+                            // permanently terminate the durable retry loop.
+                            Log.e(TAG, "Periodic bridge recovery failed", e)
+                        }
+                    }
+                    // Watchdog. socket.io-client 2.1.0 never reconnects after
+                    // 'io server disconnect' (the server dropped us, e.g. on an
+                    // expired session), so without this a relay the server
+                    // closed stayed dark until the next SMS or app open.
+                    val current = relay
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (current != null &&
+                        BridgeLifecyclePolicy.shouldKickRelay(
+                            nowElapsed = now,
+                            disconnectedSinceElapsed = current.disconnectedSinceElapsed,
+                            lastKickElapsed = lastWatchdogKickAt,
+                            gateOpen = { BridgeGate.canRun(this@SmsBridgeService) },
+                        )
+                    ) {
+                        lastWatchdogKickAt = now
+                        val downSeconds = (now - (current.disconnectedSinceElapsed ?: now)) / 1000
+                        Log.w(TAG, "Relay down for ${downSeconds}s; watchdog restarting the bridge")
+                        Diagnostics.record("watchdog_kick", "down_s=$downSeconds n=${current.ordinal}")
+                        try {
+                            ensureBridgeReady()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Watchdog bridge restart failed", e)
+                            Diagnostics.record("watchdog_failed", e)
+                        }
                     }
                 }
+            } finally {
+                outboxLoopStarted.set(false)
             }
         }
     }
@@ -273,11 +343,13 @@ class SmsBridgeService : Service() {
                 "SecureMsg is not the default SMS app; bridge remains idle " +
                     "(legacy default=${Telephony.Sms.getDefaultSmsPackage(this)})",
             )
+            recordStop("not_default_sms")
             stopSelf()
             return
         }
         val loaded = Credentials.load(this) ?: run {
             Log.w(TAG, "No credentials — bridge idle")
+            recordStop("no_credentials")
             stopSelf()
             return
         }
@@ -307,6 +379,16 @@ class SmsBridgeService : Service() {
             invalidateSession("REST authentication rejected")
             return
         }
+        if (authCheck == null && relay != null) {
+            // Relay unreachable, but a client already exists and Socket.IO is
+            // retrying it on its own. Falling through would fail the trust
+            // refresh below with the same outage and stopSelf() the bridge —
+            // which the reconnect watchdog would otherwise do after every 90s
+            // of server downtime. Keep the client; the next kick retries.
+            Log.w(TAG, "Relay unreachable; keeping the existing client")
+            Diagnostics.record("bridge_start_skipped", "cause=unreachable n=${relay?.ordinal}")
+            return
+        }
         val trustView = DeviceSecurityController(
             RelayTrustedDeviceApi(relayApi),
             loaded,
@@ -314,13 +396,43 @@ class SmsBridgeService : Service() {
         ).refresh()
         if (trustView.blocksDirectoryUse) {
             Log.e(TAG, "Bridge blocked by device trust: $trustView")
+            recordStop("trust_blocked")
             stopSelf()
             return
         }
+        // The two REST round trips above take seconds, and a concurrent start
+        // (app open + credentials collector + an incoming SMS) may have been
+        // served meanwhile. Replacing a live or still-connecting client is
+        // what left the relay one silent (no FIN) socket per app open.
+        if (relay?.isConnected == true) return
+        val existing = relay
+        if (existing != null) {
+            val ageMs = android.os.SystemClock.elapsedRealtime() - existing.createdAtElapsed
+            if (!BridgeLifecyclePolicy.shouldReplaceRelay(
+                    connected = existing.isConnected,
+                    ageMs = ageMs,
+                    hadConnectError = existing.hadConnectError,
+                )
+            ) {
+                Log.i(TAG, "Keeping relay client #${existing.ordinal} (${ageMs / 1000}s old, still connecting)")
+                return
+            }
+            Diagnostics.record(
+                "relay_replace",
+                "n=${existing.ordinal} age_s=${ageMs / 1000} connect_error=${if (existing.hadConnectError) 1 else 0}",
+            )
+        }
         relay?.disconnect()
+        Diagnostics.updateStateSummary(relay = "connecting")
         relay = RelayClient(serverUrl).also { client ->
+            // Failed attempts repeat every few seconds while the relay is
+            // unreachable; only the 1st, 2nd, 4th, … of a run are recorded.
+            val connectErrors = java.util.concurrent.atomic.AtomicInteger(0)
             client.onConnect = {
                 Log.i(TAG, "Relay connected")
+                connectErrors.set(0)
+                Diagnostics.record("relay_connect", "n=${client.ordinal}")
+                Diagnostics.updateStateSummary(relay = "connected")
                 startOutboxLoop()
                 scope.launch {
                     try {
@@ -338,9 +450,26 @@ class SmsBridgeService : Service() {
                     }
                 }
             }
-            client.onDisconnect = { Log.w(TAG, "Relay disconnected — will auto-reconnect") }
+            client.onDisconnect = { reason ->
+                // 'io server disconnect' is the one reason Socket.IO does not
+                // retry by itself; the watchdog in startOutboxLoop covers it.
+                Log.w(TAG, "Relay disconnected ($reason)")
+                Diagnostics.record("relay_disconnect", "reason=${DiagnosticsFormat.token(reason)} n=${client.ordinal}")
+                Diagnostics.updateStateSummary(relay = "disconnected")
+            }
+            client.onTrace = { trace ->
+                Log.i(TAG, "Relay $trace")
+                Diagnostics.record("relay_trace", "$trace n=${client.ordinal}")
+            }
             client.onConnectError = { message ->
                 Log.w(TAG, "Relay connection error: $message")
+                // The server's message is not recorded: only the fact, and
+                // whether it was a stable-coded auth refusal.
+                val count = connectErrors.incrementAndGet()
+                if (DiagnosticsFormat.isLoggedAttempt(count)) {
+                    val auth = if (message.startsWith("auth_rejected", ignoreCase = true)) 1 else 0
+                    Diagnostics.record("relay_connect_error", "n=${client.ordinal} count=$count auth=$auth")
+                }
                 // Servers >= v0.10.8 prefix refusals with a stable
                 // "auth_rejected:" code. Fall back to the legacy prose match
                 // for older servers instead of re-connecting forever with a
@@ -433,6 +562,7 @@ class SmsBridgeService : Service() {
                 sessionInvalidated.set(false)
             } finally {
                 relay?.disconnect()
+                recordStop("session_invalidated")
                 stopSelf()
             }
         }
@@ -2004,9 +2134,20 @@ class SmsBridgeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        Diagnostics.record("svc_destroy", "relay_connected=${if (relay?.isConnected == true) 1 else 0}")
+        Diagnostics.updateStateSummary(fgs = false, relay = "none")
         relay?.disconnect()
         scope.cancel()
         super.onDestroy()
+    }
+
+    /** One line per stopSelf branch, so the log says why the bridge went idle. */
+    private fun recordStop(reason: String, error: Throwable? = null) {
+        if (error == null) {
+            Diagnostics.record("svc_stop", "reason=$reason")
+        } else {
+            Diagnostics.record("svc_stop", "reason=$reason ${DiagnosticsFormat.throwableSummary(error)}")
+        }
     }
 }
 
