@@ -132,6 +132,33 @@ class ImageShrinkPolicyTest {
     }
 
     @Test
+    fun anAnimatedWebpIsReservedWholeLikeTheGifOfTheSameSize() {
+        // Three photos and a 150 KB animation against the 512 KiB cap: an even
+        // share would be 131 072 bytes -- too small for an animation that can
+        // never be re-encoded, and a GIF of the same size would be reserved in
+        // full. The pass-through flag gives the WebP the GIF's answer.
+        val photos = List(3) { Candidate("image/jpeg", 3_000_000) }
+        val asGif = ImageShrinkPolicy.allocate(
+            listOf(Candidate("image/gif", 150_000)) + photos,
+            ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
+        )
+        val asWebp = ImageShrinkPolicy.allocate(
+            listOf(Candidate("image/webp", 150_000, passThrough = true)) + photos,
+            ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
+        )
+        assertEquals(150_000, asWebp[0])
+        assertEquals(asGif, asWebp)
+        // And a still WebP is still just a photo that takes an even share.
+        val still = ImageShrinkPolicy.allocate(
+            listOf(Candidate("image/webp", 150_000)) + photos,
+            ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET,
+        )
+        assertEquals(ImageShrinkPolicy.INCOMING_ATTACHMENT_BUDGET / 4, still[0])
+        assertTrue(ImageShrinkPolicy.isWebp("IMAGE/WEBP; name=s.webp"))
+        assertFalse(ImageShrinkPolicy.isWebp("image/gif"))
+    }
+
+    @Test
     fun incomingBudgetSplitsAcrossTwoImagesAndNeverExceedsTheWireCap() {
         // The budget IS the wire cap. A reserve below it would only refuse
         // files that fit, and materialize's accept() is what actually bounds

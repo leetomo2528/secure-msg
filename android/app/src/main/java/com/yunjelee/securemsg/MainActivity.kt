@@ -717,7 +717,6 @@ class MainActivity : ComponentActivity() {
                 // pictures need.
                 sendPhotos = { phone, text, sources ->
                     sendNewMms(current, phone, text, null, sources)
-                        ?.let { MmsSendOutcome.Failed(it) } ?: MmsSendOutcome.Sent
                 },
                 onLogout = {
                     lifecycleScope.launch(Dispatchers.IO) {
@@ -953,15 +952,18 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The photo sibling of [sendNewSms]: null when the message was sent,
-     * otherwise a Korean reason to put in front of the owner.
+     * The photo sibling of [sendNewSms], adapted into the composer's own
+     * [MmsSendOutcome] so nothing in `ui/` has to know about RelayContent, Room
+     * or the carrier at all.
      *
-     * A String? rather than the dispatcher's own result type so nothing in
-     * `ui/` has to know about RelayContent, Room or the carrier at all. The
-     * distinction the sealed type draws -- refused with nothing written, versus
-     * persisted and then refused by the carrier -- is not one the composer acts
-     * on: either way the send did not happen and the owner is shown why, and a
-     * persisted failure additionally carries its own failed badge in the thread.
+     * The refused/failed split is kept, because the composer acts on it: a
+     * refusal wrote nothing, so the number-entry composer must stay up with
+     * its caption and photos, while a persisted failure already sits in the
+     * thread with its own failed badge and the composer moves there.
+     *
+     * Runs on the application scope, not the pane's: [applicationContext] is
+     * what the dispatcher gets, so a send in flight does not need this
+     * Activity alive (swipe from recents destroys it mid-send).
      *
      * An empty [sources] takes the unchanged SMS path inside the dispatcher, so
      * a photoless send through this function behaves exactly as [sendNewSms].
@@ -972,36 +974,28 @@ class MainActivity : ComponentActivity() {
         text: String,
         subject: String?,
         sources: List<Uri>,
-    ): String? {
-        return try {
-            val result = OutgoingSmsDispatcher.queueAndSendMms(
-                this,
-                creds,
-                phone,
-                text,
-                subject,
-                sources,
-            )
-            // Unconditional, exactly as the SMS path starts it: relay
-            // preparation is durable and may complete immediately or after a
-            // later reconnect, and a refusal here does not mean the outbox is
-            // empty of earlier rows waiting for the same service.
-            startBridgeService(urgent = true)
-            when (result) {
-                OutgoingSmsDispatcher.MmsSend.Sent -> null
-                is OutgoingSmsDispatcher.MmsSend.Refused -> result.reason
-                is OutgoingSmsDispatcher.MmsSend.Failed -> result.reason
-            }
-        } catch (e: LinkageError) {
-            Log.e("MainActivity", "MMS crypto module unavailable", e)
-            "보안 모듈을 불러오지 못해 사진을 보내지 못했습니다"
-        } catch (e: Exception) {
-            Log.e("MainActivity", "MMS send/sync failed", e)
-            "사진 메시지를 보내지 못했습니다"
-        }
+    ): MmsSendOutcome {
+        return NewMmsSend.run(
+            hasPhotos = sources.isNotEmpty(),
+            send = {
+                OutgoingSmsDispatcher.queueAndSendMms(
+                    applicationContext,
+                    creds,
+                    phone,
+                    text,
+                    subject,
+                    sources,
+                )
+            },
+            // Isolated inside NewMmsSend: a throw here comes after the
+            // dispatcher answered and must not rewrite that answer. Urgent,
+            // exactly as the SMS path starts it: relay preparation is durable
+            // and must not wait out the 2 s start debounce.
+            startBridge = { startBridgeService(urgent = true) },
+            log = { message, e -> Log.e("MainActivity", message, e) },
+        )
     }
 }
-
 
 /**
  * The `sms:` / `smsto:` link the system hands this activity through the
