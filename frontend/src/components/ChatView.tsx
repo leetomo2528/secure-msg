@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/useStore";
-import { b64u } from "../crypto/keys";
 import type { MessageAttachment } from "../store/db";
+import { buildAttachment } from "../store/imageMetadata";
 import { Avatar } from "./ChatList";
 import {
   conversationDisplayName,
@@ -111,12 +111,7 @@ export default function ChatView({ cid }: { cid: string }) {
         setAttachmentError(`'${file.name}' 파일을 읽지 못했습니다`);
         break;
       }
-      next.push({
-        name: file.name.slice(0, 120) || "attachment",
-        content_type: file.type || "application/octet-stream",
-        data: b64u(new Uint8Array(bytes)),
-        size: file.size,
-      });
+      next.push(buildAttachment(file.name, file.type, new Uint8Array(bytes)));
     }
     setAttachments((current) => [...current, ...next]);
   };
