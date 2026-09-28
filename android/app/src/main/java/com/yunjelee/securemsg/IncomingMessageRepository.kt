@@ -37,8 +37,8 @@ class IncomingMessageRepository(
      * owner's entire recent history; the APK installs itself unattended within
      * twelve hours of a release, so that is a certainty rather than a risk. The
      * only columns allowed to follow [payload] are the ones the relay re-reads
-     * but never re-hashes: the outbox plaintext, the attachment rows, and the
-     * locally rendered message body.
+     * but never re-hashes: the outbox plaintext, the visible row's attachment
+     * rows, and the locally rendered message body.
      */
     private suspend fun persist(
         direction: String,
@@ -92,33 +92,16 @@ class IncomingMessageRepository(
                 ),
             )
             val outboxId = db.relayOutboxDao().insert(
-                RelayOutbox(
+                outboxRow(
                     mid = mid,
                     cid = thread.cid,
-                    payload = "",
-                    // Deliberately NOT `encoded`: the relayed body carries the
-                    // sealed direction and the payload's own text and
-                    // attachments, while the identity above must keep hashing
-                    // the direction-less encoding of `content`. Feeding either
-                    // into the mid would re-key every incoming message at the
-                    // upgrade boundary and let an in-flight one relay twice.
-                    // Nothing downstream re-hashes this column — it is read
-                    // only to encrypt (SmsBridgeService) and to re-read the
-                    // content for a carrier send — so the two may diverge.
-                    plaintext = RelayContentCodec.encode(
-                        payload.copy(direction = RelayContentCodec.DIR_IN),
-                    ),
-                    contentType = content.type,
-                    subject = content.subject,
-                    attachmentsJson = attachmentsJson,
-                    phoneNumber = phone,
-                    providerEpoch = providerIdentity.epoch,
-                    providerId = providerIdentity.id,
-                    sourceFingerprint = providerIdentity.fingerprint,
-                    sourceEventKey = providerIdentity.eventKey,
+                    phone = phone,
+                    content = content,
+                    payload = payload,
+                    providerIdentity = providerIdentity,
                     localMessageId = localMessageId,
                     direction = direction,
-                    createdAt = receivedAt,
+                    receivedAt = receivedAt,
                 ),
             )
             val outbox = db.relayOutboxDao().getByMid(mid)
@@ -215,6 +198,57 @@ class IncomingMessageRepository(
         conversation = ConversationTarget(row.cid, row.phoneNumber),
         newlyCreated = false,
     )
+
+    companion object {
+        /**
+         * The outbox half of [persist]'s visible/outbox pair.
+         *
+         * Pure so the row's size can be pinned on the JVM (OutboxRowBudgetTest):
+         * every byte written here is read back through a CursorWindow on each
+         * flush, and a row that outgrows it stops the whole outbox.
+         */
+        internal fun outboxRow(
+            mid: String,
+            cid: String,
+            phone: String,
+            content: RelayContent,
+            payload: RelayContent,
+            providerIdentity: ProviderIdentity,
+            localMessageId: Long?,
+            direction: String,
+            receivedAt: Long,
+        ): RelayOutbox = RelayOutbox(
+            mid = mid,
+            cid = cid,
+            payload = "",
+            // Deliberately NOT `encoded`: the relayed body carries the sealed
+            // direction and the payload's own text and attachments, while the
+            // identity in [persist] must keep hashing the direction-less
+            // encoding of `content`. Feeding either into the mid would re-key
+            // every incoming message at the upgrade boundary and let an
+            // in-flight one relay twice. Nothing downstream re-hashes this
+            // column — it is read only to encrypt (SmsBridgeService) and to
+            // re-read the content for a carrier send — so the two may diverge.
+            plaintext = RelayContentCodec.encode(
+                payload.copy(direction = RelayContentCodec.DIR_IN),
+            ),
+            contentType = content.type,
+            subject = content.subject,
+            // Never a second copy of the attachments: they already ride in
+            // `plaintext`, and the duplicate is what pushed a near-cap MMS row
+            // past the 2 MiB CursorWindow once the envelope was added, wedging
+            // the outbox (OutboxRowBudget). The visible row keeps its own copy.
+            attachmentsJson = null,
+            phoneNumber = phone,
+            providerEpoch = providerIdentity.epoch,
+            providerId = providerIdentity.id,
+            sourceFingerprint = providerIdentity.fingerprint,
+            sourceEventKey = providerIdentity.eventKey,
+            localMessageId = localMessageId,
+            direction = direction,
+            createdAt = receivedAt,
+        )
+    }
 }
 
 /** One-shot destination carried from an SMS notification into Compose. */

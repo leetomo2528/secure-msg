@@ -171,7 +171,15 @@ data class RelayReceipt(
 )
 
 /** Durable bridge work item. The payload is encrypted; plaintext is retained only
- * for local presentation after a relay ACK and never leaves the device in clear. */
+ * for local presentation after a relay ACK and never leaves the device in clear.
+ *
+ * [attachmentsJson] is always written NULL. The attachment rows already ride
+ * inside [plaintext] (the relay content encoding), and the flush rebuilds
+ * everything it needs from there; a second copy made an MMS near the 512 KiB
+ * attachment cap outgrow Android's 2 MiB CursorWindow once markPrepared added
+ * [payload], and a row no cursor can read stopped the whole outbox. The column
+ * stays only because dropping it would need a table rebuild. See
+ * [OutboxRowBudget]. */
 @Entity(
     tableName = "relay_outbox",
     indices = [
@@ -204,6 +212,18 @@ data class RelayOutbox(
     val attempts: Int = 0,
     val lastError: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
+)
+
+/**
+ * One pending outbox row as [RelayOutboxDao.pendingRefs] lists it: small enough
+ * that a page of them can never outgrow a CursorWindow, however large the rows
+ * they name. [largeColumnBytes] is the UTF-8 size of payload + plaintext +
+ * attachmentsJson + subject.
+ */
+data class RelayOutboxRef(
+    val id: Long,
+    val mid: String,
+    val largeColumnBytes: Long,
 )
 
 @Entity(tableName = "processed_mms", primaryKeys = ["providerEpoch", "providerId"])
@@ -579,8 +599,19 @@ interface RelayOutboxDao {
      * just wasted work: a hundred of them fill the page and the outbox stops
      * relaying anything newer, in either direction, forever.
      */
-    @Query("SELECT * FROM relay_outbox WHERE relayState != 'unsendable' AND (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) ORDER BY createdAt ASC LIMIT :limit")
-    suspend fun pending(unknownCutoff: Long, limit: Int = 100): List<RelayOutbox>
+    //
+    // Only the key and the byte size of the large columns are selected here;
+    // the flush loads each full row by id on its own (see [OutboxRowCursor]).
+    // A `SELECT *` page used to be read through one CursorWindow row at a
+    // time, so a single row larger than the 2 MiB window threw
+    // SQLiteBlobTooBigException for the whole page, on every flush, forever.
+    // `length(CAST(x AS BLOB))` is the UTF-8 byte length -- what the window
+    // stores -- and SQLite computes it without handing the value to a cursor.
+    @Query("SELECT id, mid, (length(CAST(payload AS BLOB)) + length(CAST(plaintext AS BLOB)) + IFNULL(length(CAST(attachmentsJson AS BLOB)), 0) + IFNULL(length(CAST(subject AS BLOB)), 0)) AS largeColumnBytes FROM relay_outbox WHERE relayState != 'unsendable' AND (relayState != 'sent' OR (direction LIKE 'outgoing_%' AND carrierState = 'unknown' AND createdAt <= :unknownCutoff) OR (direction LIKE 'outgoing_%' AND carrierStatusPending = 1 AND serverSeq IS NOT NULL)) AND (direction NOT LIKE 'outgoing_%' OR carrierState != 'unknown' OR createdAt <= :unknownCutoff) ORDER BY createdAt ASC LIMIT :limit")
+    suspend fun pendingRefs(unknownCutoff: Long, limit: Int = 100): List<RelayOutboxRef>
+
+    @Query("SELECT * FROM relay_outbox WHERE id = :id")
+    suspend fun getById(id: Long): RelayOutbox?
 
     @Query("SELECT * FROM relay_outbox WHERE mid = :mid LIMIT 1")
     suspend fun getByMid(mid: String): RelayOutbox?
@@ -728,7 +759,7 @@ interface CarrierPartResultDao {
         CarrierProviderState::class,
         ProcessedCarrierEvent::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -766,6 +797,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_10_11,
                     MIGRATION_11_12,
                     MIGRATION_12_13,
+                    MIGRATION_13_14,
                 ).build()
                     .also { INSTANCE = it }
             }
@@ -1047,6 +1079,20 @@ abstract class AppDatabase : RoomDatabase() {
                 // the pin store on a live phone and silently re-TOFU the account;
                 // the added column stays NULL, i.e. "no mode pinned yet".
                 db.execSQL("ALTER TABLE trust_directory_state ADD COLUMN securityMode TEXT")
+            }
+        }
+
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Releases a gateway whose outbox is already stuck. Up to v0.23.1
+                // every relay_outbox row kept a second copy of its attachments
+                // here, and an MMS near the 512 KiB cap outgrew the 2 MiB
+                // CursorWindow once markPrepared added the envelope, so every
+                // later pending() read threw and nothing was relayed again.
+                // Nothing reads this column (the flush decodes `plaintext`),
+                // and an UPDATE never passes a row through a cursor, so it
+                // succeeds on exactly the row no query could read.
+                db.execSQL("UPDATE relay_outbox SET attachmentsJson = NULL WHERE attachmentsJson IS NOT NULL")
             }
         }
     }

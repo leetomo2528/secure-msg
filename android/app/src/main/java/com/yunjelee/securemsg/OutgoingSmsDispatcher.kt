@@ -247,7 +247,9 @@ object OutgoingSmsDispatcher {
                     plaintext = contentJson,
                     contentType = content.type,
                     subject = content.subject,
-                    attachmentsJson = attachmentsJson,
+                    // The photo is already in `plaintext`; a second copy here
+                    // made the row outgrow the CursorWindow (OutboxRowBudget).
+                    attachmentsJson = null,
                     phoneNumber = phone,
                     localMessageId = localId,
                     // Every outbox query keys on `direction LIKE 'outgoing_%'`,

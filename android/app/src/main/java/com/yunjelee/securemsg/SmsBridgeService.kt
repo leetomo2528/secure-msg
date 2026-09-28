@@ -806,16 +806,51 @@ class SmsBridgeService : Service() {
         outboxMutex.withLock {
             val client = relay ?: return@withLock
             if (!client.isConnected) return@withLock
-            val rows = db.relayOutboxDao().pending(System.currentTimeMillis() - 30_000L)
-            for (queuedRow in rows) {
+            // Keys and sizes first, each full row on its own: one row no
+            // CursorWindow can hold is recorded and stepped over instead of
+            // failing the page -- and with it every later row and the
+            // receipt-status flush -- on every pass (OutboxRowCursor).
+            val rows = OutboxRowCursor(
+                refs = db.relayOutboxDao().pendingRefs(System.currentTimeMillis() - 30_000L),
+                read = { id -> db.relayOutboxDao().getById(id) },
+                skip = { ref, reason ->
+                    // Sizes and ids only: the row holds a message body and a
+                    // phone number, and neither belongs in a log.
+                    Log.w(
+                        TAG,
+                        "Outbox row skipped id=${ref.id} mid=${ref.mid} " +
+                            "largeColumnBytes=${ref.largeColumnBytes}: $reason",
+                    )
+                    db.relayOutboxDao().recordAttempt(ref.id, reason)
+                },
+            )
+            while (true) {
+                val queuedRow = rows.next() ?: break
                 val content = RelayContentCodec.decode(queuedRow.plaintext)
                 var row = queuedRow
                 if (row.payload.isBlank() || row.cid.startsWith(SmsThread.LOCAL_CID_PREFIX)) {
+                    var tooLarge: OutboxRowTooLargeException? = null
                     val prepared = try {
                         prepareRelayOutbox(row)
+                    } catch (e: OutboxRowTooLargeException) {
+                        tooLarge = e
+                        null
                     } catch (e: Exception) {
                         Log.w(TAG, "Outgoing relay preparation deferred mid=${row.mid}", e)
                         null
+                    }
+                    if (tooLarge != null) {
+                        // The oversized payload was never written, so the row
+                        // stays readable. It stays pending like any deferred
+                        // preparation -- not unsendable, which would also end an
+                        // outgoing row's carrier retry -- with the reason on record.
+                        Log.w(
+                            TAG,
+                            "Outbox row not prepared id=${row.id} mid=${row.mid} " +
+                                "largeColumnBytes=${tooLarge.largeColumnBytes}: ${tooLarge.message}",
+                        )
+                        db.relayOutboxDao().recordAttempt(row.id, OutboxRowCursor.OVERSIZED)
+                        continue
                     }
                     if (prepared == null) {
                         val terminal = terminalOutboxRejection(row)
@@ -885,9 +920,16 @@ class SmsBridgeService : Service() {
                         continue
                     }
                     db.relayOutboxDao().markCarrierDispatchedIfUnknown(row.id)
-                    row = db.relayOutboxDao().getByMid(row.mid) ?: row.copy(
-                        carrierState = "dispatched",
-                    )
+                    // The carrier call has already happened: a failed re-read
+                    // must not abort the flush and retry it.
+                    row = try {
+                        db.relayOutboxDao().getById(row.id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Outbox re-read failed id=${row.id}: ${e.javaClass.simpleName}")
+                        null
+                    } ?: row.copy(carrierState = "dispatched")
                     row.localMessageId?.let { localId ->
                         db.messageDao().advanceCarrierStatus(
                             localId,
@@ -1111,9 +1153,14 @@ class SmsBridgeService : Service() {
         if (recipients.isEmpty()) return null
         val payload = CryptoUtil.envelopeToJson(
             CryptoUtil.encryptMessage(row.plaintext, recipients, c.keypair),
-        )
-        db.relayOutboxDao().markPrepared(row.id, resolvedThread.cid, payload.toString())
-        return db.relayOutboxDao().getByMid(row.mid)
+        ).toString()
+        // Checked before the write, not after: a payload that pushes the row
+        // past the CursorWindow would make it unreadable for good, and the
+        // re-read below (and every later flush) would throw on it.
+        val preparedBytes = OutboxRowBudget.largeColumnBytes(row.copy(payload = payload))
+        if (!OutboxRowBudget.fits(preparedBytes)) throw OutboxRowTooLargeException(preparedBytes)
+        db.relayOutboxDao().markPrepared(row.id, resolvedThread.cid, payload)
+        return db.relayOutboxDao().getById(row.id)
     }
 
     /**
