@@ -37,10 +37,14 @@ internal object StaleSendPolicy {
      * the history response that carried the row is the same relay chain's
      * clock (gunicorn, Caddy and Cloudflare all send one, so this needs no
      * server change and works with relays already deployed), advanced by the
-     * monotonic time since that response arrived; its only error is the
-     * header's one-second resolution. Without the header the phone's wall
-     * clock is used: on a phone with automatic time (NITZ/NTP) it is normally
-     * within seconds of the relay, far inside the one-hour window.
+     * monotonic time since that response arrived. Its error is the header's
+     * one-second resolution, the transfer and parse time between the header
+     * being stamped and the elapsed-time capture (which makes the age read
+     * slightly low), and any skew between the host that stamped `Date` and
+     * the one that stamped created_at (NTP-synced, normally well under a
+     * second) -- seconds at worst, far inside the one-hour window. Without
+     * the header the phone's wall clock is used: on a phone with automatic
+     * time (NITZ/NTP) it is normally within seconds of the relay too.
      *
      * @param serverDateMs the response's parsed `Date` header, or null.
      * @param elapsedSinceResponseMs monotonic time since the response arrived.
