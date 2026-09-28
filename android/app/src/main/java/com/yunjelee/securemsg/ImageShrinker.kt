@@ -82,13 +82,20 @@ object ImageShrinker {
         // A budget of zero is ImageShrinkPolicy.allocate saying this part has no
         // room at all, not an invitation to encode something tiny.
         if (bytes.isEmpty() || budget <= 0) return null
-        // The type decides, never the bytes. An animated GIF decodes perfectly
+        // The type decides first. An animated GIF decodes perfectly
         // well here and would come back as its first frame with the animation
         // gone -- a silent loss dressed up as a success, which is worse than the
         // omission notice the policy's pass-through rule earns it.
         if (!ImageShrinkPolicy.isShrinkable(contentType)) return null
+        // And then the bytes must agree with it. ImageDecoder picks its codec by
+        // sniffing, not by the declared type, so without this a part declared
+        // image/jpeg whose bytes are a DNG, TIFF, ICO, WBMP or AVIF reaches that
+        // parser here -- on the incoming path with no user action at all, in
+        // the process that holds the E2E keys. A mismatch is an omission, never
+        // a decode.
+        if (!ImageBytes.matchesDeclared(bytes, contentType)) return null
         return try {
-            walkLadder(bytes, budget)
+            walkLadder(bytes, contentType, budget)
         } catch (t: Throwable) {
             // No part name, no dimensions, no bytes: this runs over the default
             // SMS app's own inbox and logcat is readable by the user's other
@@ -111,12 +118,12 @@ object ImageShrinker {
      * multi-megapixel bitmap, so the prediction is the difference between a
      * photo costing two passes and eight.
      */
-    private fun walkLadder(bytes: ByteArray, budget: Int): Shrunk? {
+    private fun walkLadder(bytes: ByteArray, contentType: String, budget: Int): Shrunk? {
         // The probe is decoded before the ladder is known, because the source
         // dimensions the ladder clamps to are only readable from the header
         // pass. targetSize clamps the same way rungsFor does, so the bitmap this
         // produces is the one rungs[0] describes.
-        var decoded = decodeAt(bytes, ImageShrinkPolicy.SHRINK_RUNGS.first().edge) ?: return null
+        var decoded = decodeAt(bytes, contentType, ImageShrinkPolicy.SHRINK_RUNGS.first().edge) ?: return null
         try {
             val rungs = ImageShrinkPolicy.rungsFor(decoded.sourceLongEdge)
             val probe = compress(decoded.bitmap, rungs.first().quality) ?: return null
@@ -137,7 +144,7 @@ object ImageShrinker {
                     // second recycle in the finally is a no-op, so an abandoned
                     // reference here costs nothing.
                     decoded.bitmap.recycle()
-                    decoded = decodeAt(bytes, rung.edge) ?: return null
+                    decoded = decodeAt(bytes, contentType, rung.edge) ?: return null
                 }
                 val encoded = compress(decoded.bitmap, rung.quality)
                 if (encoded != null && encoded.size <= budget) return shrunkOf(encoded, decoded.bitmap)
@@ -158,12 +165,27 @@ object ImageShrinker {
      * ImageDecoder.Source: a Source over a ByteBuffer reads through the buffer's
      * own position, and re-using one across the ladder's decodes makes the
      * second decode depend on where the first left it.
+     *
+     * The byte gate is repeated here, immediately in front of createSource, so
+     * no future caller of this function can reach a codec around it; [shrink]
+     * checks first only to skip the try. The header callback then holds the
+     * decoder to the same answer: the codec it actually chose must be the
+     * declared format, and the source must be inside
+     * [ImageBytes.MAX_DECODE_PIXELS]. Throwing there aborts the decode before
+     * any pixel is read, and lands in [shrink]'s Throwable catch as a null.
      */
-    private fun decodeAt(bytes: ByteArray, edge: Int): Decoded? {
+    private fun decodeAt(bytes: ByteArray, contentType: String, edge: Int): Decoded? {
+        if (!ImageBytes.matchesDeclared(bytes, contentType)) return null
         var sourceLongEdge = 0
         val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
         val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             val size = info.size
+            if (!ImageBytes.decoderMimeMatches(contentType, info.mimeType)) {
+                throw DecodeRefused("decoder chose a codec the declared type does not name")
+            }
+            if (!ImageBytes.withinPixelCap(size.width, size.height)) {
+                throw DecodeRefused("source exceeds the decode pixel cap")
+            }
             sourceLongEdge = maxOf(size.width, size.height)
             val target = ImageShrinkPolicy.targetSize(size.width, size.height, edge)
             // setTargetSize, not setTargetSampleSize: the sample size only
@@ -199,6 +221,13 @@ object ImageShrinker {
         }
         return Decoded(opaque, sourceLongEdge)
     }
+
+    /**
+     * A decode this app declined from inside the header callback. Its own type
+     * so the one log line [shrink] writes names the refusal rather than a
+     * generic exception, without logging anything about the part.
+     */
+    private class DecodeRefused(message: String) : IllegalStateException(message)
 
     private fun flattenOntoWhite(source: Bitmap): Bitmap {
         val flat = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
