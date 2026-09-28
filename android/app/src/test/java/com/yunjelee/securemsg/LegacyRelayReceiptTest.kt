@@ -13,14 +13,21 @@ import org.junit.Test
  *
  * [pull] replays processRelayEnvelope's receipt steps for one send-request
  * row with the production pieces -- [RelaySyncPolicy.rowConversation],
- * [LegacyRelayReceipt.carryOver], the INSERT OR IGNORE claim and
- * [RelayReceiptRetryPolicy] -- over a store that mirrors the DAO SQL.
+ * [LegacyRelayReceipt.carryOver], the INSERT OR IGNORE claim,
+ * [RelayReceiptRetryPolicy] and [StaleSendPolicy], in that order -- over a
+ * store that mirrors the DAO SQL.
  */
 class LegacyRelayReceiptTest {
     private class Store : LegacyRelayReceipt.Store {
         val receipts = linkedMapOf<Pair<String, Int>, RelayReceipt>()
         val rendered = mutableMapOf<String, LegacyRelayReceipt.Rendered>()
         val carrier = mutableListOf<String>()
+
+        /** threadDao().advanceLastSeq, per conversation. */
+        val cursor = mutableMapOf<String, Int>()
+
+        /** syncReceiptStatus: what the relay was told, "cid/seq:status:error". */
+        val reports = mutableListOf<String>()
 
         /** The system SMS store's sent-direction rows: (address, body, date). */
         val sentBox = mutableListOf<Triple<String, String, Long>>()
@@ -81,7 +88,7 @@ class LegacyRelayReceiptTest {
             LegacyRelayReceipt.Rendered(createdAtMs, text, type, subject, sender)
     }
 
-    private enum class Outcome { DISPATCHED, CONSUMED, WAITS, REFUSED }
+    private enum class Outcome { DISPATCHED, CONSUMED, WAITS, REFUSED, STALE }
 
     private data class Row(
         val threadCid: String,
@@ -94,7 +101,17 @@ class LegacyRelayReceiptTest {
         val sender: String = WEB,
     )
 
-    private suspend fun pull(store: Store, row: Row, now: Long = 9_000_000L): Outcome {
+    /**
+     * @param serverNow the reference clock of the page the row came on
+     *   ([StaleSendPolicy.referenceNowMs]); by default the moment the relay
+     *   received it.
+     */
+    private suspend fun pull(
+        store: Store,
+        row: Row,
+        now: Long = 9_000_000L,
+        serverNow: Long = row.createdAtMs,
+    ): Outcome {
         val cid = RelaySyncPolicy.rowConversation(row.threadCid, row.rowCid) ?: return Outcome.REFUSED
         val decision = LegacyRelayReceipt.carryOver(
             cid, row.seq, phoneOf(row.threadCid),
@@ -104,12 +121,30 @@ class LegacyRelayReceiptTest {
         if (store.claim(RelayReceipt(cid, row.seq, claimedAt = now)) == -1L) {
             val receipt = store.receipt(cid, row.seq)!!
             return when (RelayReceiptRetryPolicy.action(receipt.status, false)) {
-                RelayReceiptRetryPolicy.Action.CONSUME_RESOLVED -> Outcome.CONSUMED
+                RelayReceiptRetryPolicy.Action.CONSUME_RESOLVED -> {
+                    store.reports += "$cid/${row.seq}:${receipt.status}:${receipt.lastError}"
+                    store.cursor[cid] = row.seq
+                    Outcome.CONSUMED
+                }
                 else -> Outcome.WAITS
             }
         }
+        val verdict = StaleSendPolicy.evaluate(
+            isCarrierSendRequest = true,
+            priorReceiptStatus = null,
+            createdAtSec = row.createdAtMs / 1000,
+            referenceNowMs = serverNow,
+        )
+        StaleSendPolicy.errorFor(verdict)?.let { error ->
+            store.receipts[cid to row.seq] =
+                store.receipts.getValue(cid to row.seq).copy(status = "failed", lastError = error)
+            store.reports += "$cid/${row.seq}:failed:$error"
+            store.cursor[cid] = row.seq
+            return Outcome.STALE
+        }
         store.carrier += "$cid/${row.seq}:${row.text}"
         store.receipts[cid to row.seq] = store.receipts.getValue(cid to row.seq).copy(status = "sent")
+        store.cursor[cid] = row.seq
         return Outcome.DISPATCHED
     }
 
@@ -319,5 +354,57 @@ class LegacyRelayReceiptTest {
         val rendered = rendering("to A", 1_000_000L)
         assertEquals(LegacyRelayReceipt.Decision.UNCERTAIN, LegacyRelayReceipt.decide(legacy, rendered, rendering("to B", null)))
         assertEquals(LegacyRelayReceipt.Decision.UNRELATED, LegacyRelayReceipt.decide(null, rendered, rendering("to B", null)))
+    }
+
+    @Test
+    fun `a web send request received over an hour ago is recorded failed, never sent, and the cursor moves on`() = runBlocking {
+        val store = Store()
+        val createdAt = 1_790_000_000_000L
+        val row = Row("sms_a", 20, "late", createdAtMs = createdAt)
+        assertEquals(Outcome.STALE, pull(store, row, serverNow = createdAt + 2 * 24 * 3_600_000L))
+        val receipt = store.receipts.getValue("sms_a" to 20)
+        assertEquals("failed", receipt.status)
+        assertEquals("오래된 요청이라 보내지 않았습니다(접수 후 1시간 초과). 필요하면 다시 보내세요.", receipt.lastError)
+        assertEquals(listOf("sms_a/20:failed:${StaleSendPolicy.STALE_ERROR}"), store.reports)
+        assertEquals(20, store.cursor["sms_a"])
+        assertEquals(emptyList<String>(), store.carrier)
+
+        // Walked again (cursor reset by a re-login), on a fresher-looking clock
+        // too: the failed receipt answers, nothing is sent.
+        store.cursor.clear()
+        assertEquals(Outcome.CONSUMED, pull(store, row, serverNow = createdAt))
+        assertEquals(20, store.cursor["sms_a"])
+        assertEquals("failed", store.receipts.getValue("sms_a" to 20).status)
+        assertEquals(emptyList<String>(), store.carrier)
+    }
+
+    @Test
+    fun `a web send request within the hour is sent as before`() = runBlocking {
+        val store = Store()
+        val createdAt = 1_790_000_000_000L
+        assertEquals(Outcome.DISPATCHED, pull(store, Row("sms_a", 21, "now", createdAt), serverNow = createdAt + 3_600_000L))
+        assertEquals(Outcome.STALE, pull(store, Row("sms_b", 21, "late", createdAt), serverNow = createdAt + 3_600_001L))
+        assertEquals(listOf("sms_a/21:now"), store.carrier)
+        assertEquals(21, store.cursor["sms_a"])
+        assertEquals(21, store.cursor["sms_b"])
+    }
+
+    @Test
+    fun `a stale row the pre-update build already sent keeps its sent receipt, an uncertain one its own reason`() = runBlocking {
+        val store = Store()
+        val createdAt = 1_790_000_000_000L
+        val days = createdAt + 3 * 24 * 3_600_000L
+        store.legacyDispatch(seq = 22, text = "to A", createdAtMs = createdAt, claimedAt = createdAt + 1_000L, to = "sms_a")
+        assertEquals(Outcome.CONSUMED, pull(store, Row("sms_a", 22, "to A", createdAt), serverNow = days))
+        assertEquals("sent", store.receipts.getValue("sms_a" to 22).status)
+        assertEquals(listOf("sms_a/22:sent:null"), store.reports)
+
+        store.legacyDispatch(seq = 23, text = "to A", createdAtMs = createdAt, claimedAt = createdAt + 1_000L, to = "sms_a")
+        store.rendered.clear() // logout cleared `messages`: UNCERTAIN
+        assertEquals(Outcome.CONSUMED, pull(store, Row("sms_a", 23, "to A", createdAt), serverNow = days))
+        val uncertain = store.receipts.getValue("sms_a" to 23)
+        assertEquals("failed", uncertain.status)
+        assertEquals(LegacyRelayReceipt.UNCERTAIN_ERROR, uncertain.lastError)
+        assertEquals(emptyList<String>(), store.carrier)
     }
 }
