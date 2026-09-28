@@ -701,7 +701,6 @@ class MainActivity : ComponentActivity() {
                 // pictures need.
                 sendPhotos = { phone, text, sources ->
                     sendNewMms(current, phone, text, null, sources)
-                        ?.let { MmsSendOutcome.Failed(it) } ?: MmsSendOutcome.Sent
                 },
                 onLogout = {
                     lifecycleScope.launch(Dispatchers.IO) {
@@ -921,15 +920,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The photo sibling of [sendNewSms]: null when the message was sent,
-     * otherwise a Korean reason to put in front of the owner.
+     * The photo sibling of [sendNewSms], adapted into the composer's own
+     * [MmsSendOutcome] so nothing in `ui/` has to know about RelayContent, Room
+     * or the carrier at all.
      *
-     * A String? rather than the dispatcher's own result type so nothing in
-     * `ui/` has to know about RelayContent, Room or the carrier at all. The
-     * distinction the sealed type draws -- refused with nothing written, versus
-     * persisted and then refused by the carrier -- is not one the composer acts
-     * on: either way the send did not happen and the owner is shown why, and a
-     * persisted failure additionally carries its own failed badge in the thread.
+     * The refused/failed split is kept, because the composer acts on it: a
+     * refusal wrote nothing, so the number-entry composer must stay up with
+     * its caption and photos, while a persisted failure already sits in the
+     * thread with its own failed badge and the composer moves there.
      *
      * Runs on the application scope, not the pane's: [applicationContext] is
      * what the dispatcher gets, so a send in flight does not need this
@@ -944,7 +942,7 @@ class MainActivity : ComponentActivity() {
         text: String,
         subject: String?,
         sources: List<Uri>,
-    ): String? {
+    ): MmsSendOutcome {
         return try {
             val result = OutgoingSmsDispatcher.queueAndSendMms(
                 applicationContext,
@@ -960,23 +958,34 @@ class MainActivity : ComponentActivity() {
             // empty of earlier rows waiting for the same service.
             startBridgeService()
             when (result) {
-                OutgoingSmsDispatcher.MmsSend.Sent -> null
-                is OutgoingSmsDispatcher.MmsSend.Refused -> result.reason
-                is OutgoingSmsDispatcher.MmsSend.Failed -> result.reason
+                OutgoingSmsDispatcher.MmsSend.Sent -> MmsSendOutcome.Sent
+                is OutgoingSmsDispatcher.MmsSend.Refused -> MmsSendOutcome.Refused(result.reason)
+                is OutgoingSmsDispatcher.MmsSend.Failed -> MmsSendOutcome.Failed(result.reason)
             }
         } catch (e: kotlin.coroutines.cancellation.CancellationException) {
             // Not a failed send: whoever cancelled is gone and wants no answer.
             throw e
         } catch (e: LinkageError) {
             Log.e("MainActivity", "MMS crypto module unavailable", e)
-            "보안 모듈을 불러오지 못해 사진을 보내지 못했습니다"
+            unsentOutcome(sources, "보안 모듈을 불러오지 못해 사진을 보내지 못했습니다")
         } catch (e: Exception) {
             Log.e("MainActivity", "MMS send/sync failed", e)
-            "사진 메시지를 보내지 못했습니다"
+            unsentOutcome(sources, "사진 메시지를 보내지 못했습니다")
         }
     }
-}
 
+    /**
+     * What a throw out of [sendNewMms] means for what is on disk.
+     *
+     * A photo send resolves every post-write failure into a returned Failed
+     * (OutgoingMmsCommit), so anything thrown there happened before or inside
+     * the rolled-back transaction: nothing was written, and the composer keeps
+     * its draft. The photoless path delegates to queueAndSend, which can throw
+     * after its own write, so that one is reported as possibly persisted.
+     */
+    private fun unsentOutcome(sources: List<Uri>, message: String): MmsSendOutcome =
+        if (sources.isNotEmpty()) MmsSendOutcome.Refused(message) else MmsSendOutcome.Failed(message)
+}
 
 /**
  * The `sms:` / `smsto:` link the system hands this activity through the

@@ -57,16 +57,27 @@ private const val TAG = "ComposerAttachments"
 /**
  * What an MMS send reported back to the composer.
  *
- * The UI-facing shape, deliberately not the dispatcher's own result type: the
- * only thing this pane can do with a failure is print it, so the contract is
- * "queued, or here is the Korean line to show". MainActivity adapts the
- * dispatcher's result into this in one expression.
+ * The UI-facing shape, deliberately not the dispatcher's own result type, so
+ * nothing in `ui/` knows about Room or the carrier. It still keeps the one
+ * distinction the composer acts on — whether a message row was written —
+ * because that decides whether the number-entry composer may move into the
+ * thread or must keep the draft (see [SendResultPolicy]). MainActivity adapts
+ * the dispatcher's result into this in one expression.
  */
 sealed interface MmsSendOutcome {
     /** Handed to the carrier and recorded for the relay, exactly like an SMS. */
     data object Sent : MmsSendOutcome
 
-    /** Refused or failed. [message] is Korean and is shown above the composer. */
+    /**
+     * Nothing was written: no row, no outbox entry, no carrier call. [message]
+     * is Korean and is shown above the composer, whose draft stays put.
+     */
+    data class Refused(val message: String) : MmsSendOutcome
+
+    /**
+     * A row was written and then failed; it carries its own failed badge in
+     * the thread. [message] is Korean and is shown above the composer.
+     */
     data class Failed(val message: String) : MmsSendOutcome
 }
 

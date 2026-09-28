@@ -272,9 +272,10 @@ fun ColumnScope.MessagesPane(
     var sendNotice by remember { mutableStateOf<SendNotice?>(null) }
     // Normalized number of a composer send whose thread has not shown up in
     // [threads] yet; the dispatcher upserts it before returning, so the next
-    // Room emission opens it. Set on failure too: the dispatcher records the
-    // failed row in that thread, and leaving the composer up would only breed
-    // duplicate failed rows per retry.
+    // Room emission opens it. Set on a persisted failure too: the dispatcher
+    // records the failed row in that thread, and leaving the composer up would
+    // only breed duplicate failed rows per retry. Never on a refusal, which
+    // wrote nothing (see SendResultPolicy).
     var openAfterSend by remember { mutableStateOf<String?>(null) }
     // Sender-block state for the open conversation, from the two sources
     // BlocklistManager.evaluate reads: the Room rows and the prefs snapshot of
@@ -728,8 +729,8 @@ fun ColumnScope.MessagesPane(
 
     /**
      * Runs the send [PhotoStaging.plan] chose for what is on screen and reports
-     * the outcome to [onResult] on the main thread — null for a send that went
-     * out, otherwise the Korean line already shown above the composer.
+     * the outcome to [onResult] on the main thread, after the failure line (if
+     * any) is already shown above the composer.
      *
      * Both surfaces come through here so the SMS and MMS paths share one
      * in-flight flag: [sending] is what closes the send button and the picker,
@@ -748,7 +749,7 @@ fun ColumnScope.MessagesPane(
         phone: String,
         text: String,
         photos: List<StagedPhoto>,
-        onResult: (String?) -> Unit,
+        onResult: (SendResult) -> Unit,
     ) {
         if (sending) return
         val plan = PhotoStaging.plan(text, photos.size, sendPhotos != null) ?: return
@@ -764,18 +765,16 @@ fun ColumnScope.MessagesPane(
             // Nothing below may escape: nobody may be left to await this, and
             // a send that answers nothing is exactly the silence being fixed.
             // sendSms already swallows its own failures; the MMS handler is
-            // another module's and is treated as if it does not.
-            val failure = try {
+            // another module's and is treated as if it does not. A throw is
+            // read as "may have written", the answer the composer gave before
+            // it could tell a refusal apart.
+            val result = try {
                 when (plan) {
-                    SendPlan.Text -> if (sendSms(phone, text)) null else SEND_FAILED
-                    SendPlan.Photos -> when (val outcome = sendPhotos?.invoke(phone, text, sources)) {
-                        MmsSendOutcome.Sent -> null
-                        is MmsSendOutcome.Failed -> PhotoStaging.failureLine(outcome.message)
-                        null -> PhotoStaging.PHOTOS_UNSUPPORTED
-                    }
+                    SendPlan.Text -> SendResultPolicy.fromText(sendSms(phone, text), SEND_FAILED)
+                    SendPlan.Photos -> SendResultPolicy.fromPhotos(sendPhotos?.invoke(phone, text, sources))
                     // Answered above; the branch exists so a new plan cannot be
                     // added without deciding what it dispatches.
-                    is SendPlan.Refused -> plan.message
+                    is SendPlan.Refused -> SendResult.Refused(plan.message)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -783,28 +782,28 @@ fun ColumnScope.MessagesPane(
                 // Same shape as MainActivity's own guard: the crypto module is
                 // on this path and a missing native library is an Error.
                 Log.e(TAG, "Send failed: module unavailable", e)
-                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
+                SendResult.Failed(if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED)
             } catch (e: Exception) {
                 Log.e(TAG, "Send failed", e)
-                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
+                SendResult.Failed(if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED)
             }
-            failure?.let { withContext(Dispatchers.Main) { setStatus(it) } }
-            failure
+            result.failure?.let { failure -> withContext(Dispatchers.Main) { setStatus(failure) } }
+            result
         }
         scope.launch {
-            val failure = try {
+            val result = try {
                 work.await()
             } catch (e: CancellationException) {
                 // This pane left composition: rethrow, the send carries on.
                 ensureActive()
                 // Otherwise the send itself was cancelled, which nothing here
                 // does; answer it like a throw rather than leave 보내기 closed.
-                if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED
+                SendResult.Failed(if (plan == SendPlan.Photos) PhotoStaging.PHOTO_SEND_FAILED else SEND_FAILED)
             }
-            if (failure != null) sendNotice = SendNotice(failure, failed = true)
+            result.failure?.let { sendNotice = SendNotice(it, failed = true) }
             // After the failure line, so a surface that has more to say
             // (the composer's queued notice) writes last.
-            onResult(failure)
+            onResult(result)
             sending = false
         }
     }
@@ -1027,8 +1026,11 @@ fun ColumnScope.MessagesPane(
                         canSend = canSend,
                         sending = sending,
                         onSend = {
-                            submit(thread.phoneNumber, reply.trim(), replyPhotos) { failure ->
-                                if (failure == null) {
+                            submit(thread.phoneNumber, reply.trim(), replyPhotos) { result ->
+                                // Refused and failed both keep the draft here:
+                                // the thread is already open, only a send that
+                                // went out spends the text and the photos.
+                                if (SendResultPolicy.afterSend(result).clearDraft) {
                                     reply = ""
                                     replyPhotos = emptyList()
                                 }
@@ -1090,12 +1092,18 @@ fun ColumnScope.MessagesPane(
                             val phone = newPhone.trim()
                             if (phone.isBlank()) return@SmComposer
                             val photoCount = newPhotos.size
-                            submit(phone, newMsg.trim(), newPhotos) { failure ->
-                                // Either way the thread (if the dispatcher got as
-                                // far as creating it) is where the result shows:
-                                // a queued bubble or a failed one.
-                                openAfterSend = PhoneNumberNormalizer.normalize(phone)
-                                if (failure == null) {
+                            submit(phone, newMsg.trim(), newPhotos) { result ->
+                                val after = SendResultPolicy.afterSend(result)
+                                // Only when a row was written is the thread where
+                                // the result shows: a queued bubble or a failed
+                                // one. A refusal wrote nothing, so the composer
+                                // stays up with the number, caption and photos
+                                // under its notice instead of opening an existing
+                                // thread and stranding the draft behind it.
+                                if (after.openThread) {
+                                    openAfterSend = PhoneNumberNormalizer.normalize(phone)
+                                }
+                                if (after.clearDraft) {
                                     newMsg = ""
                                     newPhotos = emptyList()
                                     val queued = composerQueuedNotice(photoCount)
