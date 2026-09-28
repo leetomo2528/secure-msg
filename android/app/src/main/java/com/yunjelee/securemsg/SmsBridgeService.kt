@@ -1674,11 +1674,14 @@ class SmsBridgeService : Service() {
         }
 
         // A row this gateway may already have dispatched under the blank cid
-        // (up to v0.23.1) must not reach the carrier a second time.
+        // (up to v0.23.1) must not reach the carrier a second time, nor be
+        // marked sent unless the system SMS store shows it went to this
+        // thread's number.
         when (
             LegacyRelayReceipt.carryOver(
                 cid = cid,
                 seq = seq,
+                phoneNumber = thread.phoneNumber,
                 // Exactly what the rendered row below stores.
                 row = LegacyRelayReceipt.Rendered(
                     createdAt = env.optLong("created_at").takeIf { it > 0 }?.times(1000),
@@ -1687,7 +1690,9 @@ class SmsBridgeService : Service() {
                     subject = content.subject,
                     senderSid = senderSid,
                 ),
-                store = RoomLegacyReceiptStore(db),
+                store = RoomLegacyReceiptStore(db) { phone, text, from, until ->
+                    SmsProvider.hasSentTo(this@SmsBridgeService, phone, text, from, until)
+                },
             )
         ) {
             LegacyRelayReceipt.Decision.WAIT -> {

@@ -125,6 +125,46 @@ object SmsProvider {
         }
     }
 
+    /**
+     * Whether a sent-direction row (sent, outbox, failed or queued) with
+     * exactly [body], dated [from]..[until], is stored for an address that
+     * normalizes to [address]'s -- the record [insertSent] leaves for every
+     * SMS this app hands to the carrier. False when the store cannot be read.
+     * See LegacyRelayReceipt.
+     */
+    fun hasSentTo(context: Context, address: String, body: String, from: Long, until: Long): Boolean {
+        val wanted = PhoneNumberNormalizer.normalize(address)
+        if (wanted.isEmpty()) return false
+        return try {
+            context.contentResolver.query(
+                Telephony.Sms.CONTENT_URI,
+                arrayOf(Telephony.Sms.ADDRESS),
+                "${Telephony.Sms.BODY} = ? AND ${Telephony.Sms.DATE} BETWEEN ? AND ? AND " +
+                    "${Telephony.Sms.TYPE} IN (?, ?, ?, ?)",
+                arrayOf(
+                    body,
+                    from.toString(),
+                    until.toString(),
+                    Telephony.Sms.MESSAGE_TYPE_SENT.toString(),
+                    Telephony.Sms.MESSAGE_TYPE_OUTBOX.toString(),
+                    Telephony.Sms.MESSAGE_TYPE_FAILED.toString(),
+                    Telephony.Sms.MESSAGE_TYPE_QUEUED.toString(),
+                ),
+                null,
+            )?.use { cursor ->
+                val addressCol = cursor.getColumnIndex(Telephony.Sms.ADDRESS)
+                var found = false
+                while (!found && addressCol >= 0 && cursor.moveToNext()) {
+                    found = PhoneNumberNormalizer.normalize(cursor.getString(addressCol).orEmpty()) == wanted
+                }
+                found
+            } ?: false
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to read sent SMS", e)
+            false
+        }
+    }
+
     fun recentInbox(context: Context, limit: Int = 200): List<ProviderSms> {
         val out = mutableListOf<ProviderSms>()
         val safeLimit = limit.coerceIn(1, 500)

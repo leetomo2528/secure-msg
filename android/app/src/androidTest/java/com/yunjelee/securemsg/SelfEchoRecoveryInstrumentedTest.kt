@@ -155,12 +155,19 @@ class SelfEchoRecoveryInstrumentedTest {
                 serverKey = LegacyRelayReceipt.serverKey(3),
             ),
         )
-        val store = RoomLegacyReceiptStore(db)
+        // The system SMS store as SmsSender left it: the dispatch went to
+        // sms-live's number (the test process is not the default SMS app, so
+        // SmsProvider.hasSentTo itself cannot be exercised here).
+        val live = "010-1234-0001"
+        val store = RoomLegacyReceiptStore(db) { phone, text, from, until ->
+            PhoneNumberNormalizer.normalize(phone) == PhoneNumberNormalizer.normalize(live) &&
+                text == "to live" && 1_757_000_001_150L in from..until
+        }
 
         assertEquals(
             LegacyRelayReceipt.Decision.ADOPT,
             LegacyRelayReceipt.carryOver(
-                cid, 3, LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
+                cid, 3, live, LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
             ),
         )
         // The pull's own claim then finds the adopted receipt: no second send.
@@ -174,18 +181,27 @@ class SelfEchoRecoveryInstrumentedTest {
         assertEquals(
             LegacyRelayReceipt.Decision.UNRELATED,
             LegacyRelayReceipt.carryOver(
-                "sms-other", 3, LegacyRelayReceipt.Rendered(1_757_000_000_500L, "to other", "text", null, "web-sid"), store,
+                "sms-other", 3, "010-1234-0002", LegacyRelayReceipt.Rendered(1_757_000_000_500L, "to other", "text", null, "web-sid"), store,
             ),
         )
         assertNull(db.relayReceiptDao().get("sms-other", 3))
         assertTrue(db.relayReceiptDao().claim(RelayReceipt("sms-other", 3)) > 0)
-        // A third conversation matching the rendered row exactly cannot adopt
-        // it again (hasCopyElsewhere): recorded as failed, not consumed as sent.
+        // A conversation matching the rendered row exactly whose number the
+        // sent box does not name is failed, never consumed as sent.
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNCERTAIN,
+            LegacyRelayReceipt.carryOver(
+                "sms-stranger", 3, "010-1234-0003",
+                LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
+            ),
+        )
+        assertEquals("failed", db.relayReceiptDao().get("sms-stranger", 3)!!.status)
+        // One with the same number cannot adopt it again (hasCopyElsewhere).
         assertTrue(db.relayReceiptDao().hasCopyElsewhere("sms-twin", 3, 1_757_000_001_000L))
         assertEquals(
             LegacyRelayReceipt.Decision.UNCERTAIN,
             LegacyRelayReceipt.carryOver(
-                "sms-twin", 3, LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
+                "sms-twin", 3, "+821012340001", LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
             ),
         )
         assertEquals("failed", db.relayReceiptDao().get("sms-twin", 3)!!.status)
