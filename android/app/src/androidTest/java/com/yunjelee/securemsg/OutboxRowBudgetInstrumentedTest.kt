@@ -143,7 +143,7 @@ class OutboxRowBudgetInstrumentedTest {
      * migration on open and validates every table against the entities.
      */
     @Test
-    fun migrationThirteenToFourteenNullsTheAttachmentCopyAndKeepsEveryRow() {
+    fun migrationThirteenToFourteenNullsTheAttachmentCopyKeepsEveryRowAndSeedsAckEvidence() {
         val name = "outbox-migration-${System.nanoTime()}.db"
         try {
             Room.databaseBuilder(context, AppDatabase::class.java, name).build().apply {
@@ -163,6 +163,28 @@ class OutboxRowBudgetInstrumentedTest {
                             "0,42,'fp','ek',9,'incoming_mms','not_applicable',0,'pending',NULL,3,'offline',333)",
                         arrayOf<Any?>(big, big, big),
                     )
+                    // Ack evidence as v13 kept it: an acknowledged outgoing
+                    // row, and visible rows' serverKeys -- one of them the
+                    // blank-cid key a history row used to be stored under.
+                    execSQL(
+                        "INSERT INTO relay_outbox(id,mid,cid,payload,plaintext,contentType,phoneNumber," +
+                            "providerEpoch,direction,carrierState,carrierStatusPending,relayState,serverSeq," +
+                            "attempts,createdAt) VALUES (8,'sent-outgoing-mid-0001','sms-live','',''," +
+                            "'text','+821012345678',0,'outgoing_sms','delivered',0,'sent',460,0,444)",
+                    )
+                    for ((id, key, seq) in listOf(
+                        Triple(1, "sms-live:12", 12),
+                        Triple(2, "sms:with:colons:13", 13),
+                        Triple(3, ":5", 5),
+                        Triple(4, "sms-live:99", 98),
+                    )) {
+                        execSQL(
+                            "INSERT INTO messages(id,cid,seq,senderSid,plaintext,createdAt,mine,blocked," +
+                                "contentType,serverKey,carrierStatus) VALUES (?,'sms-live',?,'',''," +
+                                "555,0,0,'text',?,'none')",
+                            arrayOf<Any?>(id, seq, key),
+                        )
+                    }
                 }
                 close()
             }
@@ -181,6 +203,16 @@ class OutboxRowBudgetInstrumentedTest {
                     assertEquals(3, row.attempts)
                     assertEquals("pending", row.relayState)
                     assertEquals(42L, row.providerId)
+
+                    // relay_acked exists (Room validated it against RelayAck on
+                    // open) and is seeded from exactly the parseable evidence.
+                    assertTrue(migrated.relayAckDao().contains("sms-live", 460))
+                    assertTrue(migrated.relayAckDao().contains("sms-live", 12))
+                    assertTrue(migrated.relayAckDao().contains("sms:with:colons", 13))
+                    assertFalse(migrated.relayAckDao().contains("", 5))
+                    assertFalse(migrated.relayAckDao().contains("sms-live", 98))
+                    assertFalse(migrated.relayAckDao().contains("sms-live", 99))
+                    assertEquals(4, migrated.messageDao().getForCid("sms-live").size)
                 }
             } finally {
                 migrated.close()
@@ -192,6 +224,7 @@ class OutboxRowBudgetInstrumentedTest {
 
     /** Undo what 13 -> 14 adds so the file reads as a v13 install. */
     private fun stepBackToThirteen(db: SupportSQLiteDatabase) {
+        db.execSQL("DROP TABLE relay_acked")
         db.version = 13
     }
 

@@ -69,11 +69,21 @@ class RelaySyncPolicyTest {
         assertEquals(RelaySyncPolicy.RowAction.RETRY_BATCH, serverRowAction(foreign))
     }
 
+    private fun echo(
+        serverKey: Boolean = false,
+        ackedOutbox: Boolean = false,
+        durableAck: Boolean = false,
+        unackedUpload: Boolean = true,
+    ) = RelaySyncPolicy.canConsumeSelfEcho(
+        RelaySyncPolicy.SelfEchoEvidence(serverKey, ackedOutbox, durableAck, unackedUpload),
+    )
+
     @Test
-    fun `self echo requires durable local acknowledgement evidence`() {
-        assertFalse(RelaySyncPolicy.canConsumeSelfEcho(false, false))
-        assertTrue(RelaySyncPolicy.canConsumeSelfEcho(true, false))
-        assertTrue(RelaySyncPolicy.canConsumeSelfEcho(false, true))
+    fun `self echo waits for a pending upload unless ack evidence exists`() {
+        assertFalse(echo())
+        assertTrue(echo(serverKey = true))
+        assertTrue(echo(ackedOutbox = true))
+        assertTrue(echo(durableAck = true))
     }
 
     @Test

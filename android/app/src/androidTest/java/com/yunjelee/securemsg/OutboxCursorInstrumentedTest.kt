@@ -130,8 +130,13 @@ class OutboxCursorInstrumentedTest {
         assertEquals(
             true,
             RelaySyncPolicy.canConsumeSelfEcho(
-                hasLocalServerKey = false,
-                hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(cid, 460),
+                RelaySyncPolicy.SelfEchoEvidence(
+                    hasLocalServerKey = false,
+                    hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(cid, 460),
+                    hasDurableAck = false,
+                    // Deliberately true: this pins the outbox evidence alone.
+                    hasUnackedUpload = true,
+                ),
             ),
         )
     }

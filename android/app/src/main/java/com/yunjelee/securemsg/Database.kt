@@ -226,6 +226,29 @@ data class RelayOutboxRef(
     val largeColumnBytes: Long,
 )
 
+/**
+ * Durable evidence that the relay acknowledged one of this device's own
+ * uploads at (cid, seq): written in the same transaction as markRelaySent.
+ *
+ * The other evidence does not last. An incoming row is deleted by
+ * acknowledgeIncoming in that same transaction, which leaves only the visible
+ * row's `serverKey` -- and logout clears `messages` and `sms_threads`. A
+ * re-login with the same sid then pulls from seq 0 and meets its own upload
+ * with no trace of the ack. This table is cid + seq only (no body, no phone
+ * number), so logout keeps it. Pruned by age and count (RelayAckRetention):
+ * RelaySyncPolicy.canConsumeSelfEcho does not need it for old history.
+ */
+@Entity(
+    tableName = "relay_acked",
+    primaryKeys = ["cid", "seq"],
+    indices = [Index(value = ["ackedAt"])],
+)
+data class RelayAck(
+    val cid: String,
+    val seq: Int,
+    val ackedAt: Long = System.currentTimeMillis(),
+)
+
 @Entity(tableName = "processed_mms", primaryKeys = ["providerEpoch", "providerId"])
 data class ProcessedMms(
     val providerEpoch: Long = 0,
@@ -623,6 +646,16 @@ interface RelayOutboxDao {
     @Query("SELECT EXISTS(SELECT 1 FROM relay_outbox WHERE cid = :cid AND serverSeq = :seq AND relayState = 'sent')")
     suspend fun hasAcknowledgedSequence(cid: String, seq: Int): Boolean
 
+    /**
+     * Whether this device may still have an un-acked upload in [cid]: a row
+     * that is neither acknowledged ('sent') nor retired before it could ever
+     * be prepared ('unsendable'). Every row that reached the relay was
+     * prepared under the cid it was sent to, so this is what a self echo
+     * without ack evidence must wait for (RelaySyncPolicy.canConsumeSelfEcho).
+     */
+    @Query("SELECT EXISTS(SELECT 1 FROM relay_outbox WHERE cid = :cid AND relayState NOT IN ('sent', 'unsendable'))")
+    suspend fun hasUnackedUpload(cid: String): Boolean
+
     @Query("SELECT * FROM relay_outbox WHERE providerEpoch = :providerEpoch AND providerId = :providerId AND direction = :direction LIMIT 1")
     suspend fun getByProviderId(providerEpoch: Long, providerId: Long, direction: String): RelayOutbox?
 
@@ -674,6 +707,22 @@ interface RelayOutboxDao {
 
     @Query("DELETE FROM relay_outbox WHERE id = :id")
     suspend fun delete(id: Long)
+}
+
+@Dao
+interface RelayAckDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun record(ack: RelayAck): Long
+
+    @Query("SELECT EXISTS(SELECT 1 FROM relay_acked WHERE cid = :cid AND seq = :seq)")
+    suspend fun contains(cid: String, seq: Int): Boolean
+
+    @Query("DELETE FROM relay_acked WHERE ackedAt < :cutoff")
+    suspend fun pruneOlderThan(cutoff: Long): Int
+
+    /** Keep only the newest [keep] records. */
+    @Query("DELETE FROM relay_acked WHERE rowid IN (SELECT rowid FROM relay_acked ORDER BY ackedAt DESC, rowid DESC LIMIT -1 OFFSET :keep)")
+    suspend fun pruneBeyond(keep: Int): Int
 }
 
 @Dao
@@ -758,6 +807,7 @@ interface CarrierPartResultDao {
         TrustDirectoryState::class,
         CarrierProviderState::class,
         ProcessedCarrierEvent::class,
+        RelayAck::class,
     ],
     version = 14,
     exportSchema = false,
@@ -777,6 +827,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun deviceTrustDao(): DeviceTrustDao
     abstract fun carrierProviderStateDao(): CarrierProviderStateDao
     abstract fun processedCarrierEventDao(): ProcessedCarrierEventDao
+    abstract fun relayAckDao(): RelayAckDao
 
     companion object {
         @Volatile private var INSTANCE: AppDatabase? = null
@@ -1093,6 +1144,40 @@ abstract class AppDatabase : RoomDatabase() {
                 // and an UPDATE never passes a row through a cursor, so it
                 // succeeds on exactly the row no query could read.
                 db.execSQL("UPDATE relay_outbox SET attachmentsJson = NULL WHERE attachmentsJson IS NOT NULL")
+
+                // Ack evidence that logout does not clear (RelayAck). Same
+                // column set, order-independent, and index name Room generates
+                // for the entity, or its schema validation fails on open.
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS relay_acked (" +
+                        "cid TEXT NOT NULL," +
+                        "seq INTEGER NOT NULL," +
+                        "ackedAt INTEGER NOT NULL," +
+                        "PRIMARY KEY(cid, seq))",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_relay_acked_ackedAt ON relay_acked(ackedAt)",
+                )
+                // Seeded from the evidence that exists today, so a logout after
+                // this upgrade does not erase the acks taken before it: the
+                // acknowledged outbox rows, and every serverKey "<cid>:<seq>"
+                // (the key the self-echo check has always accepted). A key with
+                // an empty cid, or one that does not end in its own seq, is
+                // skipped rather than parsed into a wrong pair.
+                db.execSQL(
+                    "INSERT OR IGNORE INTO relay_acked(cid, seq, ackedAt) " +
+                        "SELECT cid, serverSeq, createdAt FROM relay_outbox " +
+                        "WHERE relayState = 'sent' AND serverSeq IS NOT NULL AND serverSeq > 0 AND cid != ''",
+                )
+                db.execSQL(
+                    "INSERT OR IGNORE INTO relay_acked(cid, seq, ackedAt) " +
+                        "SELECT substr(serverKey, 1, length(serverKey) - length(CAST(seq AS TEXT)) - 1), " +
+                        "seq, createdAt FROM messages " +
+                        "WHERE serverKey IS NOT NULL AND seq > 0 " +
+                        "AND length(serverKey) > length(CAST(seq AS TEXT)) + 1 " +
+                        "AND serverKey = substr(serverKey, 1, length(serverKey) - length(CAST(seq AS TEXT)) - 1) " +
+                        "|| ':' || CAST(seq AS TEXT)",
+                )
             }
         }
     }

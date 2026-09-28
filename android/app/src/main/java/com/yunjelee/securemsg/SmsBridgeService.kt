@@ -1049,15 +1049,12 @@ class SmsBridgeService : Service() {
                     //
                     // The row is not lost by leaving the cursor alone: the pull
                     // reaches it in order and processRelayEnvelope consumes it
-                    // as a self echo, which markRelaySent below is the durable
-                    // evidence for (RelaySyncPolicy.canConsumeSelfEcho).
-                    db.relayOutboxDao().markRelaySent(row.id, seq)
-                    if (isIncoming) {
-                        // Tombstone + optional provider ledger + deletion are
-                        // one transaction, so a crash cannot forget a
-                        // provider-less event after its relay ACK.
-                        incomingRepository.acknowledgeIncoming(row)
-                    }
+                    // as a self echo. The relay_acked record UploadAck writes
+                    // here is the durable evidence for that; markRelaySent's
+                    // row is deleted right away for an incoming message, and
+                    // the serverKey above does not survive logout
+                    // (RelaySyncPolicy.canConsumeSelfEcho).
+                    UploadAck.commit(row, seq, RoomUploadAckWrites(db, incomingRepository))
                 }
                 // Only now, with markRelaySent committed: a pull resumed before
                 // the commit would stop at the same unacknowledged echo again.
@@ -1077,6 +1074,19 @@ class SmsBridgeService : Service() {
                 }
                 Log.i(TAG, "Relay outbox delivered mid=${row.mid} seq=$seq")
             }
+            if (acked.isNotEmpty()) pruneRelayAcks()
+        }
+    }
+
+    /** Bounds relay_acked (RelayAckRetention); a failure here must not fail the flush. */
+    private suspend fun pruneRelayAcks() {
+        try {
+            db.relayAckDao().pruneOlderThan(RelayAckRetention.cutoff(System.currentTimeMillis()))
+            db.relayAckDao().pruneBeyond(RelayAckRetention.MAX_ROWS)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "relay_acked prune deferred: ${e.javaClass.simpleName}")
         }
     }
 
@@ -1346,14 +1356,29 @@ class SmsBridgeService : Service() {
         val senderSid = env.optString("sender_sid")
         val seq = env.optInt("seq", -1)
         if (senderSid == c.sid) {
-            val hasLocalServerKey = db.messageDao().hasServerKey("$cid:$seq")
-            val hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(cid, seq)
-            if (!RelaySyncPolicy.canConsumeSelfEcho(hasLocalServerKey, hasAcknowledgedOutbox)) {
-                Log.w(TAG, "Unacknowledged self echo for $cid/$seq; retrying batch")
+            // Keyed by the thread being pulled, never by the row: a history
+            // row carries no cid (the page does, and syncConversation checked
+            // it), so `cid` is blank here. Keyed by that blank, no ack
+            // evidence -- all of it written under the real cid -- was ever
+            // found, and the pull stopped at this phone's first own upload in
+            // every conversation. The carrier path below still reads `cid`
+            // from the row, and so keys its relay_receipts by the blank value;
+            // re-keying those re-dispatches every row already sent under the
+            // blank key, so that change needs its own transition and is
+            // deliberately not made here.
+            val echoCid = thread.cid
+            val evidence = RelaySyncPolicy.SelfEchoEvidence(
+                hasLocalServerKey = db.messageDao().hasServerKey("$echoCid:$seq"),
+                hasAcknowledgedOutbox = db.relayOutboxDao().hasAcknowledgedSequence(echoCid, seq),
+                hasDurableAck = db.relayAckDao().contains(echoCid, seq),
+                hasUnackedUpload = db.relayOutboxDao().hasUnackedUpload(echoCid),
+            )
+            if (!RelaySyncPolicy.canConsumeSelfEcho(evidence)) {
+                Log.w(TAG, "Self echo for $echoCid/$seq waits for a pending upload ack; retrying batch")
                 return false
             }
             val status = env.optString("carrier_status", "none")
-            val local = db.messageDao().getByServerKey("$cid:$seq")
+            val local = db.messageDao().getByServerKey("$echoCid:$seq")
             // The history page is fetched from a cursor captured before
             // flushOutbox ACKed this row, so it can carry a carrier status
             // older than the SENT/DELIVERED callback already applied locally,
@@ -1362,7 +1387,7 @@ class SmsBridgeService : Service() {
                 CarrierState.canAdvance(local.carrierStatus, status)
             ) {
                 db.messageDao().setCarrierStatus(
-                    cid,
+                    echoCid,
                     seq,
                     status,
                     // optString over a JSON null returns "null" on the
@@ -1374,8 +1399,8 @@ class SmsBridgeService : Service() {
                         ?: System.currentTimeMillis(),
                 )
             }
-            db.threadDao().advanceLastSeq(cid, seq)
-            relay?.emitDelivered(cid, seq)
+            db.threadDao().advanceLastSeq(echoCid, seq)
+            relay?.emitDelivered(echoCid, seq)
             return true
         }
 
