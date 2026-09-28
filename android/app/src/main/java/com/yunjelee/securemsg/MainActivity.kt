@@ -943,48 +943,24 @@ class MainActivity : ComponentActivity() {
         subject: String?,
         sources: List<Uri>,
     ): MmsSendOutcome {
-        return try {
-            val result = OutgoingSmsDispatcher.queueAndSendMms(
-                applicationContext,
-                creds,
-                phone,
-                text,
-                subject,
-                sources,
-            )
-            // Unconditional, exactly as the SMS path starts it: relay
-            // preparation is durable and may complete immediately or after a
-            // later reconnect, and a refusal here does not mean the outbox is
-            // empty of earlier rows waiting for the same service.
-            startBridgeService()
-            when (result) {
-                OutgoingSmsDispatcher.MmsSend.Sent -> MmsSendOutcome.Sent
-                is OutgoingSmsDispatcher.MmsSend.Refused -> MmsSendOutcome.Refused(result.reason)
-                is OutgoingSmsDispatcher.MmsSend.Failed -> MmsSendOutcome.Failed(result.reason)
-            }
-        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
-            // Not a failed send: whoever cancelled is gone and wants no answer.
-            throw e
-        } catch (e: LinkageError) {
-            Log.e("MainActivity", "MMS crypto module unavailable", e)
-            unsentOutcome(sources, "보안 모듈을 불러오지 못해 사진을 보내지 못했습니다")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "MMS send/sync failed", e)
-            unsentOutcome(sources, "사진 메시지를 보내지 못했습니다")
-        }
+        return NewMmsSend.run(
+            hasPhotos = sources.isNotEmpty(),
+            send = {
+                OutgoingSmsDispatcher.queueAndSendMms(
+                    applicationContext,
+                    creds,
+                    phone,
+                    text,
+                    subject,
+                    sources,
+                )
+            },
+            // Isolated inside NewMmsSend: a throw here comes after the
+            // dispatcher answered and must not rewrite that answer.
+            startBridge = { startBridgeService() },
+            log = { message, e -> Log.e("MainActivity", message, e) },
+        )
     }
-
-    /**
-     * What a throw out of [sendNewMms] means for what is on disk.
-     *
-     * A photo send resolves every post-write failure into a returned Failed
-     * (OutgoingMmsCommit), so anything thrown there happened before or inside
-     * the rolled-back transaction: nothing was written, and the composer keeps
-     * its draft. The photoless path delegates to queueAndSend, which can throw
-     * after its own write, so that one is reported as possibly persisted.
-     */
-    private fun unsentOutcome(sources: List<Uri>, message: String): MmsSendOutcome =
-        if (sources.isNotEmpty()) MmsSendOutcome.Refused(message) else MmsSendOutcome.Failed(message)
 }
 
 /**

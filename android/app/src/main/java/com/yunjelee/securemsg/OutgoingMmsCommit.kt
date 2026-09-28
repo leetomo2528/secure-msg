@@ -17,11 +17,18 @@ import kotlin.coroutines.cancellation.CancellationException
  * process died between the insert and the carrier call. A cancellation that
  * landed after [dispatch] returned but before [markDispatched] ran would leave
  * exactly that state on a row the carrier already has, and the drain would send
- * the same MMS a second time. Run to completion, every path out of here moves
- * the row off 'unknown' (dispatched, or failed) in the same block that made the
- * carrier call, so the drain only ever retries a row whose process really did
- * die before the call. Cancelling before [persist] commits writes nothing; the
- * caller's refusal phase before this stays cancellable.
+ * the same MMS a second time. What this guarantees is narrower than "no
+ * duplicate ever": a caller's cancellation cannot cut between [dispatch] and
+ * the write that records it. When the DAO calls succeed, the dispatched,
+ * too-large and rejected paths all leave 'unknown' in the same block that made
+ * (or skipped) the carrier call. Cancelling before [persist] commits writes
+ * nothing; the caller's refusal phase before this stays cancellable.
+ *
+ * Not covered, and unchanged by this: a DAO call throwing after a successful
+ * dispatch ([Result.Crashed] leaves the row 'unknown'), the process dying
+ * between [dispatch] and [markDispatched], and the drain racing an in-process
+ * send that takes longer than 30 s. All three are the drain's existing
+ * at-least-once window, not something a cancellation can open.
  */
 internal object OutgoingMmsCommit {
     /** What [fit] decided: carrier-ready material, or a reason it cannot go. */
