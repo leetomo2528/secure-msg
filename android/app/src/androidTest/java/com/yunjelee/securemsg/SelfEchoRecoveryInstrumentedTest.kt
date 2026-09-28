@@ -159,7 +159,9 @@ class SelfEchoRecoveryInstrumentedTest {
 
         assertEquals(
             LegacyRelayReceipt.Decision.ADOPT,
-            LegacyRelayReceipt.carryOver(cid, 3, 1_757_000_000_000L, "to live", store),
+            LegacyRelayReceipt.carryOver(
+                cid, 3, LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
+            ),
         )
         // The pull's own claim then finds the adopted receipt: no second send.
         assertEquals(-1L, db.relayReceiptDao().claim(RelayReceipt(cid, 3)))
@@ -171,10 +173,22 @@ class SelfEchoRecoveryInstrumentedTest {
         // Another conversation's row at seq 3 is not answered by it.
         assertEquals(
             LegacyRelayReceipt.Decision.UNRELATED,
-            LegacyRelayReceipt.carryOver("sms-other", 3, 1_757_000_000_500L, "to other", store),
+            LegacyRelayReceipt.carryOver(
+                "sms-other", 3, LegacyRelayReceipt.Rendered(1_757_000_000_500L, "to other", "text", null, "web-sid"), store,
+            ),
         )
         assertNull(db.relayReceiptDao().get("sms-other", 3))
         assertTrue(db.relayReceiptDao().claim(RelayReceipt("sms-other", 3)) > 0)
+        // A third conversation matching the rendered row exactly cannot adopt
+        // it again (hasCopyElsewhere): recorded as failed, not consumed as sent.
+        assertTrue(db.relayReceiptDao().hasCopyElsewhere("sms-twin", 3, 1_757_000_001_000L))
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNCERTAIN,
+            LegacyRelayReceipt.carryOver(
+                "sms-twin", 3, LegacyRelayReceipt.Rendered(1_757_000_000_000L, "to live", "text", null, "web-sid"), store,
+            ),
+        )
+        assertEquals("failed", db.relayReceiptDao().get("sms-twin", 3)!!.status)
         // The legacy rows stay for later comparisons and late callbacks.
         assertEquals("sent", db.relayReceiptDao().get(LegacyRelayReceipt.CID, 3)!!.status)
     }

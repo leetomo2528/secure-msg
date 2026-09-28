@@ -1661,9 +1661,14 @@ class SmsBridgeService : Service() {
             LegacyRelayReceipt.carryOver(
                 cid = cid,
                 seq = seq,
-                // Exactly what the rendered row below stores as createdAt.
-                rowCreatedAtMs = env.optLong("created_at").takeIf { it > 0 }?.times(1000),
-                rowText = content.text,
+                // Exactly what the rendered row below stores.
+                row = LegacyRelayReceipt.Rendered(
+                    createdAt = env.optLong("created_at").takeIf { it > 0 }?.times(1000),
+                    plaintext = content.text,
+                    contentType = content.type,
+                    subject = content.subject,
+                    senderSid = senderSid,
+                ),
                 store = RoomLegacyReceiptStore(db),
             )
         ) {

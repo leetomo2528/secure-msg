@@ -25,19 +25,31 @@ package com.yunjelee.securemsg
  * - The rendered legacy row (serverKey ":seq") exists. It was written by the
  *   one dispatch that holds the legacy receipt (the insert REPLACEs on
  *   serverKey, and a second dispatch under the same key never happened: a
- *   collision was consumed before it reached the insert). Its createdAt is
- *   the relay's created_at of the dispatched row, the same value computed
- *   here, and its text is the dispatched text. Equal on both: this very row
- *   was dispatched, so [Decision.ADOPT] its outcome. Different: the legacy
- *   receipt is another conversation's, so this row is [Decision.UNRELATED]
- *   and is claimed and sent now -- it is a message the collision dropped.
- * - No rendered row (logout clears `messages`; the insert may have failed).
- *   A receipt claimed more than [CLOCK_SKEW_MS] before the relay created
- *   this row cannot be this row's: [Decision.UNRELATED]. Otherwise nothing
- *   local tells the two apart, and an automatic send could be a duplicate:
- *   [Decision.UNCERTAIN] records the row as failed with [UNCERTAIN_ERROR],
- *   which the relay shows the web instead of a silent drop, and the user can
- *   resend it.
+ *   collision was consumed before it reached the insert). It records what
+ *   was dispatched: the relay's created_at (the same value computed here),
+ *   the text, content type, subject and web sender. Any of them different:
+ *   the legacy receipt is another conversation's, so this row is
+ *   [Decision.UNRELATED] and is claimed and sent now -- it is a message the
+ *   collision dropped. All of them equal: [Decision.ADOPT] its outcome.
+ * - A match is not proof of the conversation: nothing written before the
+ *   update names it. Two conversations whose rows share the seq, the second,
+ *   the text, the type, the subject and the web device would both match. The
+ *   web composes one conversation at a time, so that takes the same message
+ *   typed into two threads within one second at the same seq; the case is
+ *   still bounded: a legacy receipt is adopted at most once
+ *   ([Store.adoptedElsewhere], the adopted copy keeps the legacy claimedAt),
+ *   and a second match is [Decision.UNCERTAIN] -- shown as failed, never
+ *   silently consumed as sent. Requiring more than this would mark every
+ *   web message the update re-walks as failed, and invite the owner to send
+ *   each of them a second time by hand.
+ * - No rendered row (logout clears `messages`; the insert may have failed):
+ *   nothing local tells this row apart from the legacy dispatch. The legacy
+ *   claim time is the phone's clock and created_at the relay's, so comparing
+ *   them would stake a possible duplicate SMS on the two clocks agreeing;
+ *   they are not compared. A resolved legacy outcome makes this row
+ *   [Decision.UNCERTAIN]: recorded as failed with [UNCERTAIN_ERROR], which
+ *   the relay shows the web instead of a silent drop, and the owner can
+ *   resend it. An unresolved one makes it [Decision.WAIT].
  * - An unresolved legacy outcome ('attempting', or a status this build does
  *   not know) that is or may be this row's: [Decision.WAIT], exactly as the
  *   receipt itself would make the pull wait. Its carrier callback still
@@ -50,9 +62,6 @@ package com.yunjelee.securemsg
 internal object LegacyRelayReceipt {
     const val CID = ""
 
-    /** Phone and relay clocks; a legacy claim this much older than the row is not its own. */
-    const val CLOCK_SKEW_MS = 10 * 60_000L
-
     const val UNCERTAIN_ERROR =
         "Not sent again: a pre-update relay receipt for this sequence cannot be told apart " +
             "from this message. Resend it if it did not arrive."
@@ -64,39 +73,55 @@ internal object LegacyRelayReceipt {
     /** The legacy ("", seq) receipt. */
     data class Dispatch(val status: String, val claimedAt: Long)
 
-    /** The rendered legacy row (serverKey ":seq"). */
-    data class Rendered(val createdAt: Long, val plaintext: String)
+    /**
+     * What a row says about itself: the rendered legacy row (serverKey ":seq")
+     * as the dispatch path stored it, or the row being pulled, computed the
+     * same way. [createdAt] is the relay's created_at in ms; null when the
+     * pulled row has none.
+     */
+    data class Rendered(
+        val createdAt: Long?,
+        val plaintext: String,
+        val contentType: String,
+        val subject: String?,
+        val senderSid: String,
+    )
 
     /**
-     * @param rowCreatedAtMs the relay's created_at of the row being pulled, in
-     *   ms, computed exactly as the dispatch path stores it; null when absent.
-     * @param rowText the decoded text of the row being pulled.
+     * @param row the row being pulled, in the rendered row's terms.
+     * @param adoptedElsewhere whether another conversation already adopted
+     *   this legacy receipt.
      */
     fun decide(
         legacy: Dispatch?,
         rendered: Rendered?,
-        rowCreatedAtMs: Long?,
-        rowText: String,
+        row: Rendered,
+        adoptedElsewhere: Boolean = false,
     ): Decision {
         if (legacy == null || legacy.status == "claimed") return Decision.UNRELATED
         val resolved = RelayReceiptRetryPolicy.action(legacy.status, claimIsStale = false) ==
             RelayReceiptRetryPolicy.Action.CONSUME_RESOLVED
         val undecided = if (resolved) Decision.UNCERTAIN else Decision.WAIT
-        // The relay always sends created_at; without it neither test applies.
-        if (rowCreatedAtMs == null) return undecided
-        if (rendered != null) {
-            val same = rendered.createdAt == rowCreatedAtMs && rendered.plaintext == rowText
-            if (!same) return Decision.UNRELATED
-            return if (resolved) Decision.ADOPT else Decision.WAIT
-        }
-        if (rowCreatedAtMs > legacy.claimedAt + CLOCK_SKEW_MS) return Decision.UNRELATED
-        return undecided
+        // The relay always sends created_at; without it, or without the
+        // rendered row, nothing tells the two apart.
+        if (row.createdAt == null || rendered == null) return undecided
+        if (rendered != row) return Decision.UNRELATED
+        if (adoptedElsewhere) return undecided
+        return if (resolved) Decision.ADOPT else Decision.WAIT
     }
 
     /** What [carryOver] reads and writes; Room in production, a map in tests. */
     interface Store {
         suspend fun receipt(cid: String, seq: Int): RelayReceipt?
         suspend fun rendered(serverKey: String): Rendered?
+
+        /**
+         * Whether a conversation other than [cid] already holds the adopted
+         * copy of the legacy receipt at [seq]: a receipt there with the
+         * legacy [claimedAt], which only [carryOver] writes (a fresh claim
+         * takes the current time).
+         */
+        suspend fun adoptedElsewhere(cid: String, seq: Int, claimedAt: Long): Boolean
 
         /** INSERT OR IGNORE, as RelayReceiptDao.claim. */
         suspend fun claim(receipt: RelayReceipt): Long
@@ -112,8 +137,7 @@ internal object LegacyRelayReceipt {
     suspend fun carryOver(
         cid: String,
         seq: Int,
-        rowCreatedAtMs: Long?,
-        rowText: String,
+        row: Rendered,
         store: Store,
         now: Long = System.currentTimeMillis(),
     ): Decision {
@@ -122,13 +146,15 @@ internal object LegacyRelayReceipt {
         val decision = decide(
             Dispatch(legacy.status, legacy.claimedAt),
             store.rendered(serverKey(seq)),
-            rowCreatedAtMs,
-            rowText,
+            row,
+            store.adoptedElsewhere(cid, seq, legacy.claimedAt),
         )
         when (decision) {
             Decision.ADOPT -> store.claim(
                 // Unsynced: the relay has never seen this outcome under a
                 // cid it accepts, and the web still shows the row as pending.
+                // claimedAt stays the legacy one: it marks the copy as the
+                // adoption (Store.adoptedElsewhere).
                 legacy.copy(cid = cid, statusSynced = false),
             )
             Decision.UNCERTAIN -> store.claim(
@@ -144,7 +170,10 @@ internal class RoomLegacyReceiptStore(private val db: AppDatabase) : LegacyRelay
     override suspend fun receipt(cid: String, seq: Int) = db.relayReceiptDao().get(cid, seq)
 
     override suspend fun rendered(serverKey: String) = db.messageDao().getByServerKey(serverKey)
-        ?.let { LegacyRelayReceipt.Rendered(it.createdAt, it.plaintext) }
+        ?.let { LegacyRelayReceipt.Rendered(it.createdAt, it.plaintext, it.contentType, it.subject, it.senderSid) }
+
+    override suspend fun adoptedElsewhere(cid: String, seq: Int, claimedAt: Long) =
+        db.relayReceiptDao().hasCopyElsewhere(cid, seq, claimedAt)
 
     override suspend fun claim(receipt: RelayReceipt) = db.relayReceiptDao().claim(receipt)
 }

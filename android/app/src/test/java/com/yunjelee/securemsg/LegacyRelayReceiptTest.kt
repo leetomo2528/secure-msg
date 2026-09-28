@@ -24,6 +24,10 @@ class LegacyRelayReceiptTest {
 
         override suspend fun receipt(cid: String, seq: Int) = receipts[cid to seq]
         override suspend fun rendered(serverKey: String) = rendered[serverKey]
+
+        // Mirrors RelayReceiptDao.hasCopyElsewhere.
+        override suspend fun adoptedElsewhere(cid: String, seq: Int, claimedAt: Long) =
+            receipts.values.any { it.seq == seq && it.cid != cid && it.cid.isNotEmpty() && it.claimedAt == claimedAt }
         override suspend fun claim(receipt: RelayReceipt): Long {
             val key = receipt.cid to receipt.seq
             if (key in receipts) return -1
@@ -35,17 +39,35 @@ class LegacyRelayReceiptTest {
         fun legacyDispatch(seq: Int, text: String, createdAtMs: Long, claimedAt: Long, status: String = "sent") {
             receipts[LegacyRelayReceipt.CID to seq] =
                 RelayReceipt(LegacyRelayReceipt.CID, seq, claimedAt = claimedAt, status = status)
-            rendered[LegacyRelayReceipt.serverKey(seq)] = LegacyRelayReceipt.Rendered(createdAtMs, text)
+            rendered[LegacyRelayReceipt.serverKey(seq)] = rendering(text, createdAtMs)
         }
+    }
+
+    private companion object {
+        const val WEB = "web-sid"
+
+        fun rendering(text: String, createdAtMs: Long?, type: String = "text", subject: String? = null, sender: String = WEB) =
+            LegacyRelayReceipt.Rendered(createdAtMs, text, type, subject, sender)
     }
 
     private enum class Outcome { DISPATCHED, CONSUMED, WAITS, REFUSED }
 
-    private data class Row(val threadCid: String, val seq: Int, val text: String, val createdAtMs: Long, val rowCid: String = "")
+    private data class Row(
+        val threadCid: String,
+        val seq: Int,
+        val text: String,
+        val createdAtMs: Long,
+        val rowCid: String = "",
+        val type: String = "text",
+        val subject: String? = null,
+        val sender: String = WEB,
+    )
 
     private suspend fun pull(store: Store, row: Row, now: Long = 9_000_000L): Outcome {
         val cid = RelaySyncPolicy.rowConversation(row.threadCid, row.rowCid) ?: return Outcome.REFUSED
-        val decision = LegacyRelayReceipt.carryOver(cid, row.seq, row.createdAtMs, row.text, store, now)
+        val decision = LegacyRelayReceipt.carryOver(
+            cid, row.seq, rendering(row.text, row.createdAtMs, row.type, row.subject, row.sender), store, now,
+        )
         if (decision == LegacyRelayReceipt.Decision.WAIT) return Outcome.WAITS
         if (store.claim(RelayReceipt(cid, row.seq, claimedAt = now)) == -1L) {
             val receipt = store.receipt(cid, row.seq)!!
@@ -104,22 +126,73 @@ class LegacyRelayReceiptTest {
     }
 
     @Test
-    fun `without the rendered row only a receipt older than the row is ruled out`() = runBlocking {
+    fun `without the rendered row nothing is sent again, whatever the two clocks say`() = runBlocking {
         val store = Store()
-        store.legacyDispatch(seq = 4, text = "to A", createdAtMs = 1_000_000L, claimedAt = 1_001_000L)
+        // Dispatched by v0.23.1 on a phone whose clock ran 11 minutes slow:
+        // claimed "before" the relay even created the row.
+        val createdAt = 1_000_000_000L
+        store.legacyDispatch(seq = 4, text = "to A", createdAtMs = createdAt, claimedAt = createdAt - 11 * 60_000L)
         store.rendered.clear() // logout cleared `messages`
 
-        // Created long after the legacy claim: that receipt cannot be this row's.
-        val later = Row("sms_b", 4, "to B", createdAtMs = 1_001_000L + LegacyRelayReceipt.CLOCK_SKEW_MS + 1)
-        assertEquals(Outcome.DISPATCHED, pull(store, later))
-
-        // Could be the legacy dispatch itself: recorded as failed, never re-sent.
-        val maybe = Row("sms_a", 4, "to A", createdAtMs = 1_000_000L)
-        assertEquals(Outcome.CONSUMED, pull(store, maybe))
+        // The very row it dispatched: not sent a second time, shown as failed.
+        assertEquals(Outcome.CONSUMED, pull(store, Row("sms_a", 4, "to A", createdAtMs = createdAt)))
         val receipt = store.receipts.getValue("sms_a" to 4)
         assertEquals("failed", receipt.status)
         assertEquals(LegacyRelayReceipt.UNCERTAIN_ERROR, receipt.lastError)
-        assertEquals(listOf("sms_b/4:to B"), store.carrier)
+
+        // A row created days after the legacy claim is not told apart by time
+        // either: failed and visible, never an automatic send.
+        val later = Row("sms_b", 4, "to B", createdAtMs = createdAt + 3 * 24 * 3_600_000L)
+        assertEquals(Outcome.CONSUMED, pull(store, later))
+        assertEquals("failed", store.receipts.getValue("sms_b" to 4).status)
+        assertEquals(emptyList<String>(), store.carrier)
+    }
+
+    @Test
+    fun `two conversations whose rows match the rendered row adopt the legacy receipt once`() = runBlocking {
+        val store = Store()
+        // Same seq, same second, same text, same web device, two threads: the
+        // rendered row cannot say which of them v0.23.1 dispatched.
+        store.legacyDispatch(seq = 8, text = "on my way", createdAtMs = 2_000_000L, claimedAt = 2_001_000L)
+        val a = Row("sms_a", 8, "on my way", createdAtMs = 2_000_000L)
+        val b = Row("sms_b", 8, "on my way", createdAtMs = 2_000_000L)
+
+        assertEquals(Outcome.CONSUMED, pull(store, a))
+        assertEquals("sent", store.receipts.getValue("sms_a" to 8).status)
+        // The second match is not consumed as sent: it is shown as failed.
+        assertEquals(Outcome.CONSUMED, pull(store, b))
+        val second = store.receipts.getValue("sms_b" to 8)
+        assertEquals("failed", second.status)
+        assertEquals(LegacyRelayReceipt.UNCERTAIN_ERROR, second.lastError)
+        assertEquals(emptyList<String>(), store.carrier)
+        // Re-walks keep both answers.
+        assertEquals(Outcome.CONSUMED, pull(store, a))
+        assertEquals(Outcome.CONSUMED, pull(store, b))
+        assertEquals("sent", store.receipts.getValue("sms_a" to 8).status)
+        assertEquals("failed", store.receipts.getValue("sms_b" to 8).status)
+    }
+
+    @Test
+    fun `a rendered row that differs in type, subject or sender is another message`() {
+        val legacy = LegacyRelayReceipt.Dispatch("sent", claimedAt = 3_001_000L)
+        val rendered = rendering("hi", 3_000_000L)
+        assertEquals(LegacyRelayReceipt.Decision.ADOPT, LegacyRelayReceipt.decide(legacy, rendered, rendering("hi", 3_000_000L)))
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNRELATED,
+            LegacyRelayReceipt.decide(legacy, rendered, rendering("hi", 3_000_000L, type = "mms")),
+        )
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNRELATED,
+            LegacyRelayReceipt.decide(legacy, rendered, rendering("hi", 3_000_000L, subject = "s")),
+        )
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNRELATED,
+            LegacyRelayReceipt.decide(legacy, rendered, rendering("hi", 3_000_000L, sender = "other-web")),
+        )
+        assertEquals(
+            LegacyRelayReceipt.Decision.UNCERTAIN,
+            LegacyRelayReceipt.decide(legacy, rendered, rendering("hi", 3_000_000L), adoptedElsewhere = true),
+        )
     }
 
     @Test
@@ -144,8 +217,8 @@ class LegacyRelayReceiptTest {
     @Test
     fun `a row without created_at is never matched away from a legacy dispatch`() {
         val legacy = LegacyRelayReceipt.Dispatch("sent", claimedAt = 1_001_000L)
-        val rendered = LegacyRelayReceipt.Rendered(1_000_000L, "to A")
-        assertEquals(LegacyRelayReceipt.Decision.UNCERTAIN, LegacyRelayReceipt.decide(legacy, rendered, null, "to B"))
-        assertEquals(LegacyRelayReceipt.Decision.UNRELATED, LegacyRelayReceipt.decide(null, rendered, null, "to B"))
+        val rendered = rendering("to A", 1_000_000L)
+        assertEquals(LegacyRelayReceipt.Decision.UNCERTAIN, LegacyRelayReceipt.decide(legacy, rendered, rendering("to B", null)))
+        assertEquals(LegacyRelayReceipt.Decision.UNRELATED, LegacyRelayReceipt.decide(null, rendered, rendering("to B", null)))
     }
 }

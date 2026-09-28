@@ -597,6 +597,10 @@ interface RelayReceiptDao {
     @Query("SELECT * FROM relay_receipts WHERE cid = :cid AND seq = :seq")
     suspend fun get(cid: String, seq: Int): RelayReceipt?
 
+    /** A non-blank conversation other than [cid] holding a receipt at [seq] claimed at [claimedAt]; see LegacyRelayReceipt. */
+    @Query("SELECT EXISTS(SELECT 1 FROM relay_receipts WHERE seq = :seq AND cid != :cid AND cid != '' AND claimedAt = :claimedAt)")
+    suspend fun hasCopyElsewhere(cid: String, seq: Int, claimedAt: Long): Boolean
+
     @Query("UPDATE relay_receipts SET claimedAt = :now, status = 'claimed', lastError = NULL WHERE cid = :cid AND seq = :seq AND status = 'claimed' AND claimedAt <= :cutoff")
     suspend fun reclaimStale(
         cid: String,
